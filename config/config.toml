@@ -50,9 +50,20 @@ iterations = 30000
 resolution = 1600
 sh_degree = 3
 data_device = "cuda"
-cap_max = 1500000
+cap_max = 600000
 eval = true
 fp16 = false
+seed = 42
+densify_from = 500
+densify_until = 15000
+densify_interval = 100
+densify_quantile = 0.75
+densify_grad_threshold = 0.00015
+densify_grad_max = 0.005
+split_scale_ratio = 1.0
+prune_opacity = 0.005
+opacity_reset_interval = 3000
+mask_loss_until = 0.25
 extra_args = ""
 
 [export]

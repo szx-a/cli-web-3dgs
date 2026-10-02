@@ -525,23 +525,54 @@ def train(cfg: TrainConfig, ctx) -> dict:
             loss_log.append({"step": step, "loss": round(ema_loss, 5), "gaussians": int(means.shape[0])})
 
         if cfg.eval and cfg.eval_interval and (step % cfg.eval_interval == 0 or step == cfg.iterations):
+            # 全部用关键字传参：位置传参曾因顺序写错而静默失效（形状恰好兼容）
             psnr = evaluate(
-                rasterization, means, quats, current_scales(), current_opacities(), shs,
-                imgs, masks, ks, viewmats, sorted(eval_idx), cfg.sh_degree, background, device, max_side,
+                rasterization=rasterization,
+                means=means,
+                quats=quats,
+                scales=current_scales(),
+                opacities=current_opacities(),
+                shs=shs,
+                imgs=imgs,
+                masks=masks,
+                ks=ks,
+                viewmats=viewmats,
+                eval_idx=sorted(eval_idx),
+                sh_degree=cfg.sh_degree,
+                background=background,
+                device=device,
+                max_side=max_side,
             )
             psnr_log.append({"step": step, "psnr": round(psnr, 3)})
-            ctx.info(f"step {step} 评估 PSNR={psnr:.2f} dB", progress=step / cfg.iterations)
+            lvl = "info"
+            ctx.emit(f"step {step} 评估 PSNR={psnr:.2f} dB", level=lvl, progress=step / cfg.iterations)
 
         if step % 5000 == 0 or step == cfg.iterations:
-            save_ply(gs_dir / f"iteration_{step}" / "point_cloud.ply", means, current_scales(), quats,
-                     current_opacities(), shs, cfg.sh_degree)
+            # 关键字传参：位置传参出过一次静默错位（evaluate 的 PSNR 因此恒为 0）
+            save_ply(
+                path=gs_dir / f"iteration_{step}" / "point_cloud.ply",
+                means=means,
+                scales=current_scales(),
+                quats=quats,
+                opacities=current_opacities(),
+                shs=shs,
+                sh_degree=cfg.sh_degree,
+            )
             ctx.info(f"已保存检查点 iteration_{step}")
 
     # ---- 收尾：保存最终模型与指标 ----
     final_dir = gs_dir / f"iteration_{cfg.iterations}"
     final_dir.mkdir(parents=True, exist_ok=True)
     final_ply = final_dir / "point_cloud.ply"
-    save_ply(final_ply, means, current_scales(), quats, current_opacities(), shs, cfg.sh_degree)
+    save_ply(
+        path=final_ply,
+        means=means,
+        scales=current_scales(),
+        quats=quats,
+        opacities=current_opacities(),
+        shs=shs,
+        sh_degree=cfg.sh_degree,
+    )
 
     metrics = {
         "iterations": cfg.iterations,
@@ -694,6 +725,12 @@ def _swap_param(name: str, new_tensor, params: dict, optimizers: dict, optimizer
 
 def evaluate(rasterization, means, quats, scales, opacities, shs, imgs, masks, ks, viewmats,
              eval_idx, sh_degree, background, device, max_side):
+    """在评估视图上算 PSNR（dB）。
+
+    踩坑：调用方曾用位置参数按错误顺序传入（opacities 落到 scales 上、
+    background 落到 masks 上），因为各张量形状恰好兼容，**不会报错**，
+    只会让 PSNR 恒为 0。所以这里改为关键字调用，并把顺序写清楚。
+    """
     import torch
 
     if not eval_idx:
@@ -706,7 +743,7 @@ def evaluate(rasterization, means, quats, scales, opacities, shs, imgs, masks, k
                 means=means,
                 quats=quats / (quats.norm(dim=-1, keepdim=True) + 1e-8),
                 scales=scales,
-                opacities=opacities.squeeze(-1),
+                opacities=torch.clamp(opacities.squeeze(-1), 0.0, 1.0),
                 colors=shs,
                 viewmats=viewmats[i][None].to(device),
                 Ks=ks[i][None].to(device),

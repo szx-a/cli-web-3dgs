@@ -87,9 +87,23 @@ DEFAULTS: dict[str, Any] = {
         "resolution": 1600,       # 长边；0 = 原图
         "sh_degree": 3,
         "data_device": "cuda",
-        "cap_max": 1500000,       # 高斯数量上限，8GB 显存守护
+        # 高斯数量上限（显存守护）。实测：8GB 卡上 557k 高斯训练正常，
+        # 1.5M 会明显吃紧；真实大场景可上调，小场景可下调。
+        "cap_max": 600000,
         "eval": True,
         "fp16": False,
+        "seed": 42,
+        # 密度控制（对齐官方 gsplat DefaultStrategy 的语义）
+        "densify_from": 500,
+        "densify_until": 15000,
+        "densify_interval": 100,
+        "densify_quantile": 0.75,      # 取梯度范数的 (1-q) 分位作为自适应阈值
+        "densify_grad_threshold": 1.5e-4,
+        "densify_grad_max": 5e-3,
+        "split_scale_ratio": 1.0,      # 大于"中位尺度×该倍数"的走分裂，否则克隆
+        "prune_opacity": 0.005,
+        "opacity_reset_interval": 3000,
+        "mask_loss_until": 0.25,       # 前 25% 迭代只在掩码内算损失
         "extra_args": "",
     },
     "export": {

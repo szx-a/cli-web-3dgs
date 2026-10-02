@@ -72,8 +72,19 @@ class GsplatBackend:
             resolution=int(ctx.cfg("resolution", 1600) or 0),
             sh_degree=int(ctx.cfg("sh_degree", 3)),
             data_device=str(ctx.cfg("data_device", "cuda")),
-            cap_max=int(ctx.cfg("cap_max", 1_500_000) or 0),
+            cap_max=int(ctx.cfg("cap_max", 600000) or 0),
             eval=bool(ctx.cfg("eval", True)),
             seed=int(ctx.cfg("seed", 42) or 42),
+            # 密度控制参数（对齐官方 gsplat DefaultStrategy 的语义）
+            densify_from=int(ctx.cfg("densify_from", 500) or 500),
+            densify_until=int(ctx.cfg("densify_until", 15000) or 15000),
+            densify_interval=int(ctx.cfg("densify_interval", 100) or 100),
+            densify_quantile=float(ctx.cfg("densify_quantile", 0.75) or 0.75),
+            densify_grad_threshold=float(ctx.cfg("densify_grad_threshold", 1.5e-4) or 1.5e-4),
+            densify_grad_max=float(ctx.cfg("densify_grad_max", 5e-3) or 5e-3),
+            split_scale_ratio=float(ctx.cfg("split_scale_ratio", 1.0) or 1.0),
+            prune_opacity=float(ctx.cfg("prune_opacity", 0.005) or 0.005),
+            opacity_reset_interval=int(ctx.cfg("opacity_reset_interval", 3000) or 3000),
+            mask_loss_until=float(ctx.cfg("mask_loss_until", 0.25) or 0.25),
         )
         return train(cfg, ctx)
