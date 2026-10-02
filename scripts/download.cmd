@@ -1,6 +1,8 @@
 @echo off
-REM 兜底下载器：Windows PowerShell 的 curl/Schannel 在本机沙箱下取不到证书，
-REM 所以统一改用 Python 的 urllib（走 OpenSSL，正常工作）。
+REM Download helper for bundled tools.
+REM Windows PowerShell's curl/Schannel cannot fetch certificates on this box,
+REM so downloads go through Python urllib instead.
+REM NOTE: keep this file pure ASCII (see gsflow.cmd for why).
 setlocal
 set "ROOT=%~dp0.."
 set "PY=%ROOT%\env\venv\Scripts\python.exe"

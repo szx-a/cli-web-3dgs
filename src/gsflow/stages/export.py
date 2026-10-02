@@ -185,11 +185,36 @@ class ExportStage(Stage):
     # ------------------------------------------------------------------ 读取
     @staticmethod
     def _find_ply(job_dir: Path) -> Path | None:
+        """找迭代次数最高的 point_cloud.ply。
+
+        踩坑：不能直接按路径字符串排序——`iteration_5000` 会排在
+        `iteration_30000` 之后（字典序），导致导出的是早期检查点。
+        这里优先读训练阶段写在 metrics.json 里的最终模型路径。
+        """
+        import re
+
+        metrics = job_dir / "04_train" / "metrics.json"
+        if metrics.exists():
+            try:
+                data = json.loads(metrics.read_text(encoding="utf-8"))
+                recorded = Path(str(data.get("ply", "")))
+                if recorded.exists():
+                    return recorded
+            except (json.JSONDecodeError, OSError, TypeError):
+                pass
+
         base = job_dir / "04_train" / "point_cloud"
         if not base.exists():
             return None
-        cands = sorted(base.rglob("point_cloud.ply"))
-        return cands[-1] if cands else None
+        cands = list(base.rglob("point_cloud.ply"))
+        if not cands:
+            return None
+
+        def iteration(p: Path) -> int:
+            m = re.search(r"iteration_(\d+)", str(p))
+            return int(m.group(1)) if m else -1
+
+        return max(cands, key=iteration)
 
     @staticmethod
     def _read_ply(ply: Path, max_points: int = 0) -> dict:

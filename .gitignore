@@ -31,3 +31,4 @@ venv/
 *.swp
 Thumbs.db
 desktop.ini
+*.pyc

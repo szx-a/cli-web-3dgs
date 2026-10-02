@@ -1,5 +1,7 @@
 @echo off
-REM gsflow CLI 启动器：直接用工作区内的虚拟环境，不污染系统 Python
+REM gsflow CLI launcher - uses the project virtual environment only.
+REM NOTE: keep this file pure ASCII; cmd.exe reads .cmd as ANSI on zh-CN Windows
+REM and non-ASCII comments corrupt the whole script.
 setlocal
 chcp 65001 >nul
 set "ROOT=%~dp0.."
@@ -8,12 +10,13 @@ set "TEMP=%ROOT%\env\tmp"
 set "TMP=%ROOT%\env\tmp"
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
-REM 第三方库的配置/缓存目录全部关进工作区（ultralytics 默认写 AppData 会被沙箱拒绝）
+REM Third-party config/cache dirs must stay inside the project too.
 set "YOLO_CONFIG_DIR=%ROOT%\env\config\ultralytics"
 set "MPLCONFIGDIR=%ROOT%\env\config\matplotlib"
+set "TORCH_EXTENSIONS_DIR=%ROOT%\env\torch_extensions"
 if not exist "%PY%" (
-  echo [gsflow] 未找到虚拟环境：%PY%
-  echo [gsflow] 请先运行：powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
+  echo [gsflow] virtual env not found: %PY%
+  echo [gsflow] run: powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
   exit /b 1
 )
 "%PY%" -m gsflow.cli %*

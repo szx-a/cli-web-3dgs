@@ -37,11 +37,16 @@ def _desktop() -> Path:
 
 
 def _start_menu() -> Path:
+    """开始菜单分组目录。
+
+    刻意用**纯 ASCII 且无空格**的名字：带空格/中文的目录名在多层
+    powershell -Command 调用里很容易因为引号嵌套而建不出来。
+    """
     import os
 
     appdata = os.environ.get("APPDATA")
     base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
-    return base / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "gsflow 三维重建"
+    return base / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "gsflow"
 
 
 def _make_lnk(path: Path, target: Path, args: str, workdir: Path, desc: str) -> Path:
@@ -71,10 +76,17 @@ Write-Output 'created: {path}'
 """
     r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
                        capture_output=True, text=True, encoding="utf-8", errors="ignore")
-    if r.returncode != 0:
-        print(f"  失败: {path}\n  {r.stderr.strip()[:200]}")
-    else:
+    # 必须自己验证产物：WScript.Shell 保存失败时 PowerShell 仍可能返回 0，
+    # 而且脚本里的 Test-Path 也在同一个（会被权限拦住的）进程里，不可信。
+    if path.exists():
         print(f"  已创建: {path}")
+        return path
+    why = (r.stderr or r.stdout or "").strip().splitlines()
+    hint = next((l for l in why if "无法保存" in l or "Unauthorized" in l or "拒绝" in l), "")
+    print(f"  失败（未生成）: {path}")
+    if hint:
+        print(f"           {hint.strip()[:160]}")
+    print("           提示：桌面/开始菜单在沙箱授权之外，需要提权或手动运行脚本。")
     return path
 
 

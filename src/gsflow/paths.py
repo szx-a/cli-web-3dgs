@@ -11,6 +11,7 @@ D:\\3dgs-workspace 是指向这些真实目录的目录链接（junction），
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 # --- 项目根（src/gsflow/paths.py -> 上溯三级） ---
@@ -147,6 +148,65 @@ def _patch_torch_subprocess_decode() -> None:
         pass
 
 
+def _ninja_unusable() -> bool:
+    """检测 ninja 在当前环境是否能正常结束。
+
+    实测踩坑：本机沙箱下 ninja（官方版与 MinGW 版都试过）**能完成任务但不退出进程**，
+    而 torch 的 cpp_extension 是同步等待 ninja 结束的，于是 JIT 编译永远卡住
+    （表现为 ninja 进程 CPU=0、构建目录只有 build.ninja、日志为空）。
+    """
+    import os as _os
+    import shutil as _shutil
+    import subprocess as _subprocess
+    import tempfile as _tempfile
+
+    exe = _shutil.which("ninja")
+    if not exe:
+        return True  # 没有 ninja，反正用不了
+    try:
+        with _tempfile.TemporaryDirectory(dir=str(TMP_DIR)) as d:
+            nj = Path(d) / "build.ninja"
+            nj.write_text("rule r\n  command = cmd /c echo ok > $out\n\nbuild o.txt: r\n", encoding="ascii")
+            p = _subprocess.Popen([exe, "-C", d], stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL,
+                                  env=child_env())
+            try:
+                p.wait(timeout=20)
+                return False  # 正常退出 -> ninja 可用
+            except _subprocess.TimeoutExpired:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+                return True
+    except Exception:
+        return True
+
+
+def _patch_torch_ninja_bypass() -> None:
+    """把 torch 的 ninja 构建路径替换成"直接调编译器"的构建器。
+
+    只在检测到 ninja 不可用时启用（结果会缓存），避免影响正常环境。
+    """
+    import os as _os
+
+    if _os.environ.get("GSFLOW_FORCE_NINJA", "") == "1":
+        return
+    if _os.environ.get("GSFLOW_NINJA_BYPASS") == "1":
+        return
+    # 只在真的要用 torch 编译扩展时才做这个检测：它要启动一次 ninja 并等最多 20 秒
+    if "torch.utils.cpp_extension" not in sys.modules:
+        return
+    if not _ninja_unusable():
+        return
+    try:
+        from . import build as _build
+
+        if _build.install_bypass():
+            _os.environ["GSFLOW_NINJA_BYPASS"] = "1"
+    except Exception:
+        pass
+
+
 def apply_runtime_env() -> None:
     """把 runtime_env 应用到当前进程（必须在 import ultralytics / rembg / matplotlib 之前调用）。"""
     import os as _os
@@ -156,6 +216,7 @@ def apply_runtime_env() -> None:
         _os.environ.setdefault(k, v)
     _patch_rembg_home()
     _patch_torch_subprocess_decode()
+    _patch_torch_ninja_bypass()
 
 
 def child_env(extra: dict[str, str] | None = None) -> dict[str, str]:

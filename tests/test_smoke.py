@@ -144,6 +144,25 @@ def test_frames_stage_imports_images(workdir: Path) -> None:
     assert len(list((job_dir / "01_images_raw").glob("*.jpg"))) == 3
 
 
+def test_export_picks_highest_iteration(workdir: Path) -> None:
+    """导出必须取迭代数最高的检查点（字典序会把 iteration_5000 排到最后）。"""
+    from gsflow.stages.export import ExportStage
+
+    job = workdir / "job"
+    for n in (5000, 30000, 10000):
+        d = job / "04_train" / "point_cloud" / f"iteration_{n}"
+        d.mkdir(parents=True)
+        (d / "point_cloud.ply").write_bytes(b"x")
+    assert ExportStage._find_ply(job).parent.name == "iteration_30000"
+
+    # 有 metrics.json 时以它记录为准
+    (job / "04_train" / "metrics.json").write_text(
+        json.dumps({"ply": str(job / "04_train" / "point_cloud" / "iteration_10000" / "point_cloud.ply")}),
+        encoding="utf-8",
+    )
+    assert ExportStage._find_ply(job).parent.name == "iteration_10000"
+
+
 def test_export_glb_roundtrip(workdir: Path) -> None:
     """手工造一个 3DGS PLY，验证 GLB 导出与 manifest（需要 torch，无则跳过）。"""
     torch = pytest.importorskip("torch")

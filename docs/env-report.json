@@ -1,0 +1,213 @@
+{
+  "platform": {
+    "system": "Windows",
+    "release": "11",
+    "version": "10.0.26200",
+    "machine": "AMD64",
+    "node": "DESKTOP-BISKVUQ"
+  },
+  "venv": {
+    "python": "3.13.11",
+    "executable": "F:\\3dgs-and-ai\\env\\venv\\Scripts\\python.exe",
+    "in_venv": true,
+    "expected_venv": "F:\\3dgs-and-ai\\env\\venv",
+    "using_expected_venv": true
+  },
+  "memory": {
+    "total_gb": 15.2,
+    "available_gb": 3.3,
+    "load_percent": 78.0
+  },
+  "gpu": {
+    "available": true,
+    "nvidia_smi": "C:\\Windows\\system32\\nvidia-smi.EXE",
+    "gpus": [
+      {
+        "name": "NVIDIA GeForce RTX 5060 Laptop GPU",
+        "driver": "573.22",
+        "vram_total_mb": 8151.0,
+        "vram_used_mb": 1099.0,
+        "compute_cap": "12.0"
+      }
+    ]
+  },
+  "cuda": {
+    "nvcc": "",
+    "CUDA_HOME": "",
+    "CUDA_PATH": "D:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8"
+  },
+  "torch": {
+    "installed": true,
+    "version": "2.11.0+cu128",
+    "cuda_build": "12.8",
+    "cuda_available": true,
+    "device": "NVIDIA GeForce RTX 5060 Laptop GPU",
+    "compute_capability": "sm_120",
+    "arch_list": [
+      "sm_75",
+      "sm_80",
+      "sm_86",
+      "sm_90",
+      "sm_100",
+      "sm_120"
+    ],
+    "kernel_support": true
+  },
+  "disks": [
+    {
+      "drive": "C:",
+      "total_gb": 384.1,
+      "free_gb": 181.9
+    },
+    {
+      "drive": "D:",
+      "total_gb": 400.0,
+      "free_gb": 154.4
+    },
+    {
+      "drive": "F:",
+      "total_gb": 146.5,
+      "free_gb": 116.2
+    }
+  ],
+  "tools": [
+    {
+      "name": "ffmpeg",
+      "found": true,
+      "path": "F:\\3dgs-and-ai\\tools\\ffmpeg\\bin\\ffmpeg.exe",
+      "source": "bundled",
+      "version": "ffmpeg version 9.0.2-essentials_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers"
+    },
+    {
+      "name": "ffprobe",
+      "found": true,
+      "path": "F:\\3dgs-and-ai\\tools\\ffmpeg\\bin\\ffprobe.exe",
+      "source": "bundled",
+      "version": "ffprobe version 9.0.2-essentials_build-www.gyan.dev Copyright (c) 2007-2026 the FFmpeg developers"
+    },
+    {
+      "name": "colmap",
+      "found": true,
+      "path": "F:\\3dgs-and-ai\\tools\\colmap\\COLMAP.bat",
+      "source": "bundled",
+      "version": "(Commit e7e89eb on 2025-06-30 with CUDA)"
+    }
+  ],
+  "packages": [
+    {
+      "module": "numpy",
+      "pip": "numpy",
+      "purpose": "数值/图像处理",
+      "installed": true,
+      "version": "2.5.3"
+    },
+    {
+      "module": "PIL",
+      "pip": "pillow",
+      "purpose": "图像读写",
+      "installed": true,
+      "version": "12.3.0"
+    },
+    {
+      "module": "plyfile",
+      "pip": "plyfile",
+      "purpose": "3DGS PLY 读写/导出",
+      "installed": true,
+      "version": "1.1.5"
+    },
+    {
+      "module": "torch",
+      "pip": "torch",
+      "purpose": "训练与分割后端",
+      "installed": true,
+      "version": "2.11.0+cu128"
+    },
+    {
+      "module": "torchvision",
+      "pip": "torchvision",
+      "purpose": "图像变换",
+      "installed": true,
+      "version": "0.26.0+cu128"
+    },
+    {
+      "module": "gsplat",
+      "pip": "gsplat",
+      "purpose": "默认 3DGS 训练后端",
+      "installed": true,
+      "version": "1.5.3"
+    },
+    {
+      "module": "fastapi",
+      "pip": "fastapi",
+      "purpose": "Web GUI",
+      "installed": true,
+      "version": "0.142.2"
+    },
+    {
+      "module": "uvicorn",
+      "pip": "uvicorn",
+      "purpose": "Web GUI 服务器",
+      "installed": true,
+      "version": "0.54.0"
+    },
+    {
+      "module": "onnxruntime",
+      "pip": "onnxruntime",
+      "purpose": "无门槛分割后端推理",
+      "installed": true,
+      "version": "1.30.0"
+    },
+    {
+      "module": "rembg",
+      "pip": "rembg",
+      "purpose": "一键抠图后端",
+      "installed": true,
+      "version": "2.0.85"
+    },
+    {
+      "module": "ultralytics",
+      "pip": "ultralytics",
+      "purpose": "FastSAM 后端",
+      "installed": true,
+      "version": "8.4.171"
+    },
+    {
+      "module": "transformers",
+      "pip": "transformers",
+      "purpose": "SAM2/SAM3 后端",
+      "installed": false,
+      "error": "ModuleNotFoundError"
+    }
+  ],
+  "network": {
+    "pypi_org_reachable": true,
+    "download_pytorch_org_reachable": true,
+    "huggingface_co_reachable": false,
+    "hf-mirror_com_reachable": true,
+    "github_com_reachable": true,
+    "huggingface_reachable": false
+  },
+  "paths": {
+    "project_root": "F:\\3dgs-and-ai",
+    "workspace_dir": "F:\\3dgs-and-ai\\workspace",
+    "tools_dir": "F:\\3dgs-and-ai\\tools",
+    "tmp_dir": "F:\\3dgs-and-ai\\env\\tmp"
+  },
+  "plan": [
+    {
+      "severity": "info",
+      "item": "GPU 为 Blackwell（sm_120）",
+      "action": "CUDA 必须 12.8+；torch 必须 cu128 及以上；不要使用文档里的 CUDA 11.8。"
+    },
+    {
+      "severity": "warn",
+      "item": "未检测到 nvcc（CUDA Toolkit）",
+      "action": "gsplat 纯 pip 路线可暂不装；若要官方 rasterizer 或自编译扩展，装 CUDA 12.8/12.9。"
+    },
+    {
+      "severity": "warn",
+      "item": "huggingface.co 不可达",
+      "action": "设置 HF 镜像（gui 设置页填 hf_endpoint=https://hf-mirror.com）或配置代理。"
+    }
+  ]
+}

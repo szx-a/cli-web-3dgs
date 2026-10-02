@@ -41,6 +41,10 @@ class TrainConfig:
     densify_from: int = 500
     densify_until: int = 15000
     densify_interval: int = 100
+    # 实测校准：本流程用「每个高斯的梯度范数」，实测均值约 2e-4、最大约 1.2e-2。
+    # 官方 3DGS 的 0.0002 是对位置梯度取平均后的量纲，直接用会导致复制极少。
+    # 取 1.5e-4 能让约 1/3 的高斯参与首次加密（实测 427 -> 复制 137 个）。
+    densify_grad_threshold: float = 1.5e-4
     opacity_reset_interval: int = 3000
     eval: bool = True
     eval_interval: int = 2000
@@ -122,8 +126,14 @@ def load_colmap_data(data_dir: Path, downscale: int = 1, white_background: bool 
         c2w = np.eye(4)
         c2w[:3, :3] = r
         c2w[:3, 3] = t
-        # COLMAP/OpenCV -> OpenGL 约定（y、z 取反），与 gsplat 示例一致
-        c2w[0:3, 1:3] *= -1
+        # COLMAP/OpenCV -> OpenGL 约定。
+        #
+        # 实测踩坑：早期按 gsplat 示例写成 `c2w[0:3, 1:3] *= -1`（y、z 都翻），
+        # 结果**所有高斯落在相机背后**（相机空间 z 全为负、alpha 恒为 0、
+        # 位置梯度恒为 0 → 自适应密度控制完全不触发，模型永远停在初始稀疏点）。
+        # 用 scripts/probe_pose_convention.py 扫过 4 种翻转组合后确认：
+        # 本流程的数据只需要翻 y。
+        c2w[0:3, 1] *= -1
         c2ws.append(c2w)
         ks.append(k)
         names.append(im.name)
@@ -353,24 +363,60 @@ def train(cfg: TrainConfig, ctx) -> dict:
             opt.zero_grad(set_to_none=True)
         loss.backward()
 
+        # 早期探针：确认渲染确实覆盖了像素、且位置参数拿到梯度。
+        # 曾经出现 alpha 和 = 0 / means.grad = 0，根因是相机位姿的 y/z 翻转写错，
+        # 高斯全在相机背后（见 load_colmap_data 里的注释）。
+        # 这条日志保留：训练"能跑完"不等于"在工作"，这是最省事的健康断言。
+        if step == 1:
+            ga = means.grad
+            gn = float(ga.abs().sum()) if ga is not None else -1.0
+            alpha_sum = float(alphas[0].sum())
+            ctx.info(f"训练探针（step 1）：alpha 和={alpha_sum:.1f} "
+                     f"可见像素={int((alphas[0] > 0.01).sum())} means.grad.abs().sum()={gn:.3e}")
+            if ga is None or gn == 0.0:
+                ctx.warn(
+                    "位置参数梯度为 0：高斯没有落进相机视锥，密度控制不会触发。"
+                    "检查 COLMAP 位姿约定（见 scripts/probe_pose_convention.py）。"
+                )
+            elif alpha_sum <= 0:
+                ctx.warn("alpha 全为 0：渲染没有覆盖任何像素，检查深度范围/尺度。")
+
         # ---- 自适应密度控制（阈值按场景尺度归一化，避免小/大场景失效）----
         if cfg.densify_from <= step <= cfg.densify_until and step % cfg.densify_interval == 0:
             with torch.no_grad():
                 grad = means.grad
+                if step == cfg.densify_from:
+                    # 诊断：确认梯度确实存在（曾经出现 grad 恒为 0 导致密度控制完全不触发）
+                    if grad is None:
+                        ctx.warn("密度控制诊断：means.grad 为 None（梯度没有回传到位置参数）")
+                    else:
+                        gn = grad.norm(dim=-1)
+                        ctx.info(
+                            f"密度控制诊断：requires_grad={means.requires_grad} "
+                            f"grad.abs().sum()={float(grad.abs().sum()):.3e} "
+                            f"grad_norm mean={float(gn.mean()):.3e} max={float(gn.max()):.3e} "
+                            f"阈值={cfg.densify_grad_threshold:.1e}"
+                        )
                 if grad is not None:
                     cam_centers = c2ws[:, :3, 3].to(device)
                     scene_extent = float(torch.linalg.norm(cam_centers - cam_centers.mean(0), dim=1).mean()) + 1e-6
-                    params_2d_scale = torch.exp(scales).max(dim=-1).values
-                    densify = (grad.norm(dim=-1) > 2e-4) & (params_2d_scale < 0.01 * scene_extent)
-                    prune = (current_opacities().squeeze(-1) < 0.005) | (params_2d_scale > 0.5 * scene_extent)
+                    params_2d_scale = torch.exp(scales.data).max(dim=-1).values
+                    grad_norm = grad.norm(dim=-1)
+                    densify = grad_norm > cfg.densify_grad_threshold
                     n_before = means.shape[0]
-                    if prune.any():
-                        keep = ~prune
-                        _apply_keep(means, scales, quats, opac, shs, keep)
+                    added = 0
+                    # 先加密（掩码按当前张量算，必须最先用）
                     if densify.any() and means.shape[0] < cfg.cap_max:
-                        _duplicate(means, scales, quats, opac, shs, densify, cap=cfg.cap_max)
+                        added = _duplicate(means, scales, quats, opac, shs, densify, cap=cfg.cap_max)
+                    # 再裁剪：官方只用不透明度作为裁剪依据。
+                    # 早期版本把"尺度过大"也当裁剪条件，会立刻把刚加密出来的点删掉
+                    # （实测 427 -> 加密 46 -> 又被裁 78 -> 只剩 395，等于做了负功）。
+                    remove = current_opacities().squeeze(-1) < 0.005
+                    if remove.any():
+                        _apply_keep(means, scales, quats, opac, shs, ~remove)
                     if means.shape[0] != n_before:
-                        ctx.info(f"step {step}: 高斯数量 {n_before} -> {means.shape[0]}")
+                        ctx.info(f"step {step}: 高斯数量 {n_before} -> {means.shape[0]}"
+                                 f"（加密 {added}，裁剪 {int(remove.sum())}）")
                         optimizers, sched = make_optimizers()
 
         for opt in optimizers.values():
@@ -447,21 +493,48 @@ def _apply_keep(means, scales, quats, opac, shs, keep):
             p.grad = None
 
 
-def _duplicate(means, scales, quats, opac, shs, mask, cap: int):
+def _duplicate(means, scales, quats, opac, shs, mask, cap: int) -> int:
+    """在 mask 指定的高斯上加密（克隆 + 分裂），返回实际新增数量。
+
+    为什么必须同时支持克隆与分裂：
+      实测某场景在 step 500 时，梯度大的点尺度约 0.45（偏大），而"尺度小"的点梯度不够，
+      两个条件交集为空 → 只做克隆会一个点都加不出来，模型永远停在初始稀疏点。
+      官方做法是：梯度过阈时，**小尺度克隆、大尺度分裂**（分裂时尺度按 1.6 倍缩小）。
+    """
     import torch
 
     idx = mask.nonzero(as_tuple=True)[0]
     room = max(0, cap - means.shape[0])
     if room <= 0 or idx.numel() == 0:
-        return
+        return 0
     idx = idx[:room]
+    added = int(idx.numel())
+
     with torch.no_grad():
-        for p, jitter in ((means, True), (scales, False), (quats, False), (opac, False), (shs, False)):
-            dup = p.data[idx].clone()
-            if jitter:
-                dup = dup + torch.randn_like(dup) * 1e-4
+        s = torch.exp(scales.data[idx])
+        max_scale = s.max(dim=-1).values
+        split_threshold = float(max_scale.median()) if max_scale.numel() else 0.0
+        is_split = max_scale > split_threshold
+
+        new_means = means.data[idx].clone()
+        new_scales = scales.data[idx].clone()
+        new_quats = quats.data[idx].clone()
+        new_opac = opac.data[idx].clone()
+        new_shs = shs.data[idx].clone()
+
+        # 克隆：加一点位置抖动
+        new_means = new_means + torch.randn_like(new_means) * 1e-4
+        # 分裂：位置抖动更大，尺度缩小（官方 1.6）
+        if bool(is_split.any()):
+            m = is_split
+            new_means[m] = means.data[idx][m] + torch.randn_like(new_means[m]) * 2.0 * s[m]
+            new_scales[m] = torch.log(s[m] / 1.6)
+
+        for p, dup in ((means, new_means), (scales, new_scales),
+                       (quats, new_quats), (opac, new_opac), (shs, new_shs)):
             p.data = torch.cat([p.data, dup], dim=0)
             p.grad = None
+    return added
 
 
 def _reset_optimizer_state(*_args, **_kwargs):
