@@ -1,0 +1,33 @@
+# ---- 敏感与个人数据（绝不提交）----
+config/credentials.json
+config/credentials.example.json
+
+# ---- 运行期产物 ----
+env/
+workspace/
+downloads/
+models/
+logs/
+data/
+# 自带的外部工具与便携 CUDA：由 scripts\download.cmd / build_portable_cuda.cmd 重建，
+# 体积大（COLMAP+FFmpeg+便携CUDA 约 900MB、2000 个文件），不入库
+tools/
+.env
+*.part
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# ---- 前端/编辑器 ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

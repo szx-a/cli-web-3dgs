@@ -1,0 +1,12 @@
+# 训练与分割可选依赖（按需安装，避免一次性吃掉几 GB 带宽）
+# 训练：torch 必须用 cu128+ 轮子（RTX 50 / sm_120）
+--index-url https://download.pytorch.org/whl/cu128
+torch>=2.7
+torchvision>=0.22
+--index-url https://pypi.org/simple
+gsplat>=1.4
+onnxruntime>=1.19
+ultralytics>=8.3
+rembg>=2.0.57
+transformers>=4.50
+huggingface_hub>=0.25

@@ -1,0 +1,49 @@
+[project]
+name = "gsflow"
+version = "0.1.0"
+description = "Windows 端 AI 图像清理 + 3DGS 三维重建全流程（流程核心 + CLI + Web GUI）"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "pillow>=10",
+    "plyfile>=1.0",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+# 3DGS 训练后端（默认推荐：gsplat 纯 Python，免自编译 CUDA 扩展）
+train = [
+    "torch>=2.7",
+    "torchvision>=0.22",
+    "gsplat>=1.4",
+]
+# 分割后端（无授权门槛，先打通全链路）
+segment = [
+    "onnxruntime>=1.19",
+    "rembg>=2.0.57",
+    "ultralytics>=8.3",
+]
+# SAM2.1 / SAM3（需自行准备权重，SAM3 需 HF 授权）
+segment-sam = [
+    "transformers>=4.50",
+    "huggingface_hub>=0.25",
+]
+dev = [
+    "pytest>=8",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+gsflow = "gsflow.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+gsflow = ["web/static/*"]

@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gsflow · AI 清理 + 3DGS 重建控制台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">gsflow<span class="dot">·</span><small>AI 图像清理 + 3DGS 三维重建</small></div>
+  <nav id="tabs">
+    <button class="tab active" data-tab="new">新建作业</button>
+    <button class="tab" data-tab="jobs">作业与进度</button>
+    <button class="tab" data-tab="doctor">环境自检</button>
+    <button class="tab" data-tab="settings">设置 / API Key</button>
+    <button class="tab" data-tab="about">说明</button>
+  </nav>
+  <div class="badge" id="health">连接中…</div>
+</header>
+
+<main>
+  <!-- ================= 新建作业 ================= -->
+  <section class="panel active" id="panel-new">
+    <div class="grid">
+      <div class="card">
+        <h2>1. 输入</h2>
+        <label>输入路径（视频文件 / 图片目录 / 单张图）
+          <input id="in-path" placeholder="D:\data\room.mp4 或 D:\data\photos">
+        </label>
+        <div class="row">
+          <label class="grow">作业标题
+            <input id="in-title" value="3DGS 重建">
+          </label>
+          <label class="grow">作业 ID（留空自动生成）
+            <input id="in-jobid" placeholder="自动">
+          </label>
+        </div>
+        <p class="hint">已经有 COLMAP 结果想接着跑训练？填已有「作业 ID」并只勾选 train 阶段即可续跑。</p>
+      </div>
+
+      <div class="card">
+        <h2>2. 阶段</h2>
+        <div id="stage-list" class="stages"></div>
+        <div class="row">
+          <label class="grow">强制重跑的阶段（逗号分隔，忽略已有产物）
+            <input id="in-force" placeholder="例如 colmap,train">
+          </label>
+        </div>
+        <label class="check"><input type="checkbox" id="in-dryrun"> 只做干跑（列阶段不执行）</label>
+        <label class="check"><input type="checkbox" id="in-halt" checked> 某阶段失败即停止</label>
+      </div>
+
+      <div class="card">
+        <h2>3. 关键参数</h2>
+        <div class="row">
+          <label class="grow">分割后端
+            <select id="p-mask-backend">
+              <option value="classical">classical（零依赖兜底，静置物体+纯色背景）</option>
+              <option value="fastsam">fastsam（推荐，无门槛）</option>
+              <option value="rembg">rembg（一键抠图）</option>
+              <option value="sam2">sam2（需权重/HF Token）</option>
+              <option value="sam3">sam3（需 HF 授权 + Token）</option>
+            </select>
+          </label>
+          <label class="grow">清理模式
+            <select id="p-mask-mode">
+              <option value="black">black（背景纯黑，COLMAP 最稳）</option>
+              <option value="inpaint">inpaint（纹理补全，实验）</option>
+            </select>
+          </label>
+        </div>
+        <div class="row">
+          <label class="grow">分割提示 prompt（可空，如 person / 椅子）
+            <input id="p-mask-prompt" placeholder="留空则取最大前景">
+          </label>
+        </div>
+        <div class="row">
+          <label class="grow">抽帧 fps
+            <input id="p-frames-fps" type="number" step="0.5" value="2">
+          </label>
+          <label class="grow">缩放长边
+            <input id="p-frames-long" type="number" step="160" value="1920">
+          </label>
+        </div>
+        <div class="row">
+          <label class="grow">COLMAP 匹配
+            <select id="p-colmap-matcher">
+              <option value="auto">auto（按文件名自动判断）</option>
+              <option value="sequential">sequential</option>
+              <option value="exhaustive">exhaustive</option>
+            </select>
+          </label>
+          <label class="grow">训练后端
+            <select id="p-train-backend">
+              <option value="gsplat">gsplat（默认，免编译）</option>
+              <option value="official">official（原版，需自编译）</option>
+              <option value="external">external（自备脚本）</option>
+            </select>
+          </label>
+        </div>
+        <div class="row">
+          <label class="grow">迭代次数
+            <input id="p-train-iters" type="number" step="1000" value="30000">
+          </label>
+          <label class="grow">训练分辨率（长边）
+            <input id="p-train-res" type="number" step="100" value="1600">
+          </label>
+          <label class="grow">高斯上限
+            <input id="p-train-cap" type="number" step="100000" value="1500000">
+          </label>
+        </div>
+        <p class="hint">8GB 显存建议：150~250 张图 / 长边 1400~1600 / 迭代 15000~30000。</p>
+      </div>
+
+      <div class="card">
+        <h2>4. 提交</h2>
+        <div class="row">
+          <button class="primary" id="btn-run">开始重建</button>
+          <button id="btn-dry">干跑检查</button>
+        </div>
+        <pre class="cli" id="cli-preview">gsflow run …</pre>
+        <p class="hint">上面的命令与表单等价，可直接复制到终端执行（CLI 与 GUI 共用同一流程核心）。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 作业与进度 ================= -->
+  <section class="panel" id="panel-jobs">
+    <div class="grid two">
+      <div class="card">
+        <h2>运行中的作业</h2>
+        <div id="running-list" class="list"></div>
+        <h2>历史作业</h2>
+        <div id="history-list" class="list"></div>
+      </div>
+      <div class="card">
+        <h2>实时进度 <span id="live-title" class="muted"></span></h2>
+        <div class="progress"><div class="bar" id="progress-bar"></div></div>
+        <div class="row">
+          <button id="btn-cancel" disabled>取消当前作业</button>
+          <button id="btn-refresh">刷新</button>
+        </div>
+        <pre class="log" id="log-view"></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 环境自检 ================= -->
+  <section class="panel" id="panel-doctor">
+    <div class="card">
+      <h2>环境自检 <button id="btn-doctor" class="small">重新检测</button></h2>
+      <div id="doctor-plan" class="plan"></div>
+      <pre class="log tall" id="doctor-view">点击「重新检测」…</pre>
+    </div>
+  </section>
+
+  <!-- ================= 设置 ================= -->
+  <section class="panel" id="panel-settings">
+    <div class="grid two">
+      <div class="card">
+        <h2>API Key / 凭据</h2>
+        <p class="hint">保存到 config/credentials.json（已加入 .gitignore），响应里只回显尾 4 位。</p>
+        <label>HuggingFace Token（SAM2/SAM3 权重）<input id="c-hf_token" placeholder="hf_..."></label>
+        <label>HF 镜像地址<input id="c-hf_endpoint" placeholder="https://hf-mirror.com"></label>
+        <label>SAM3 API Key（若走托管接口）<input id="c-sam3_api_key" placeholder="可留空"></label>
+        <label>其它 API Key（预留，如 SD-inpaint）<input id="c-openai_api_key" placeholder="可留空"></label>
+        <div class="row">
+          <label class="grow">HTTP 代理<input id="c-http_proxy" placeholder="http://127.0.0.1:7890"></label>
+          <label class="grow">HTTPS 代理<input id="c-https_proxy" placeholder="http://127.0.0.1:7890"></label>
+        </div>
+        <div class="row">
+          <button class="primary" id="btn-save-creds">保存凭据</button>
+          <button id="btn-test-net">测试 HuggingFace 连通性</button>
+        </div>
+        <div id="net-result" class="hint"></div>
+      </div>
+      <div class="card">
+        <h2>流程配置（config/config.toml）</h2>
+        <p class="hint">点路径写法：段.键，例如 colmap.max_image_size。保存后立即对后续作业生效。</p>
+        <div id="config-editor" class="cfg"></div>
+        <div class="row">
+          <button class="primary" id="btn-save-config">保存配置</button>
+          <button id="btn-reload-config">重新载入</button>
+          <button id="btn-reset-config">恢复默认</button>
+        </div>
+        <h2>外部工具路径</h2>
+        <p class="hint">留空则自动探测：项目 tools\ 目录 → 系统 PATH。</p>
+        <div id="tools-editor" class="cfg"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 说明 ================= -->
+  <section class="panel" id="panel-about">
+    <div class="card">
+      <h2>这套流程在做什么</h2>
+      <ol class="steps">
+        <li><b>抽帧/导入</b>：视频经 ffmpeg 抽帧并缩放到目标长边，或直接导入图片。</li>
+        <li><b>AI 清理</b>：分割后端生成前景掩码，背景填黑（或补全），同时输出掩码供 COLMAP 忽略动态物体。
+          后端可选：classical（零依赖兜底）/ fastsam / rembg / sam2 / sam3（需 HF 授权）。</li>
+        <li><b>COLMAP</b>：特征提取 → 匹配（自动判断序列/全局）→ 稀疏重建 → 导出，给出注册率与重投影误差体检。</li>
+        <li><b>3DGS 训练</b>：去畸变后用 gsplat 训练，自适应密度控制 + 渐进分辨率 + 掩码内损失。</li>
+        <li><b>导出</b>：PLY → GLB/SPZ/OBJ + 离线查看器 + 预览图。</li>
+        <li><b>报告</b>：注册率、掩码占比、清晰度、PSNR 与改进建议。</li>
+      </ol>
+      <h2>架构红线</h2>
+      <ul>
+        <li>流程核心不依赖 UI；CLI 与 Web 只是两个入口，行为完全一致（GUI 里会显示等价命令）。</li>
+        <li>阶段之间只通过磁盘产物 + job.json 通信，随时可断点续跑或单阶段重跑。</li>
+        <li>外部工具（ffmpeg/colmap）用适配器定位，缺失时给“可执行的修复建议”而不是堆栈。</li>
+      </ul>
+      <h2>显存建议（8GB 卡）</h2>
+      <ul>
+        <li>1600px / 150~250 张 / 30k 迭代：可跑，训练约 30~60 分钟。</li>
+        <li>大场景（>400 张或户外）：降到 1200~1400px，或分批重建后合并。</li>
+        <li>OOM 时流程会自动降一档分辨率重试一次。</li>
+      </ul>
+    </div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

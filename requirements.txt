@@ -1,0 +1,10 @@
+# 核心运行依赖（不含 torch / 分割后端；那些由 bootstrap.ps1 按需安装）
+numpy>=1.26
+pillow>=10
+plyfile>=1.0
+matplotlib>=3.8
+scipy>=1.11
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+requests>=2.31

@@ -1,0 +1,76 @@
+[project]
+name = "gsflow"
+workspace_dir = "F:\\3dgs-and-ai\\workspace"
+
+[tools]
+ffmpeg = ""
+ffprobe = ""
+colmap = ""
+magick = ""
+
+[frames]
+mode = "fps"
+fps = 2.0
+count = 120
+long_side = 1920
+blur_threshold = 0.0
+max_frames = 0
+
+[mask]
+backend = "fastsam"
+mode = "black"
+dilate_px = 4
+feather_px = 2
+min_area_ratio = 0.002
+keep_largest = true
+batch_size = 4
+mask_black_threshold = 8
+on_failure = "keep"
+
+[colmap]
+cameras = "SIMPLE_RADIAL"
+single_camera = true
+max_image_size = 2048
+max_num_features = 8192
+use_gpu = true
+guided_matching = true
+max_num_matches = 32768
+min_num_matches = 32
+multiple_models = false
+matcher = "auto"
+sequential_overlap = 12
+vocab_tree_path = ""
+use_masks = true
+quality_min_registered_ratio = 0.75
+quality_max_reproj_error = 2.0
+
+[train]
+backend = "gsplat"
+iterations = 30000
+resolution = 1600
+sh_degree = 3
+data_device = "cuda"
+cap_max = 1500000
+eval = true
+fp16 = false
+extra_args = ""
+
+[export]
+formats = ["glb_points", "viewer_html"]
+glb_max_points = 800000
+glb_shrink = 1.0
+viewer_cdn = ""
+
+[metrics]
+enabled = true
+num_views = 8
+
+[web]
+host = "127.0.0.1"
+port = 8787
+open_browser = false
+
+[runtime]
+max_parallel_jobs = 1
+keep_intermediate = true
+log_tail_lines = 400
