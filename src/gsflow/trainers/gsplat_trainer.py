@@ -27,6 +27,12 @@ import numpy as np
 
 from ..errors import StageError
 
+# torch 必须在模块级导入：密度控制/参数迁移的辅助函数用了 @torch.no_grad() 装饰器
+try:
+    import torch
+except ImportError:  # 允许在没有 torch 的环境里 import 本模块（便于静态检查）
+    torch = None  # type: ignore[assignment]
+
 
 @dataclass
 class TrainConfig:
@@ -41,10 +47,18 @@ class TrainConfig:
     densify_from: int = 500
     densify_until: int = 15000
     densify_interval: int = 100
-    # 实测校准：本流程用「每个高斯的梯度范数」，实测均值约 2e-4、最大约 1.2e-2。
-    # 官方 3DGS 的 0.0002 是对位置梯度取平均后的量纲，直接用会导致复制极少。
-    # 取 1.5e-4 能让约 1/3 的高斯参与首次加密（实测 427 -> 复制 137 个）。
-    densify_grad_threshold: float = 1.5e-4
+    # 加密判据：位置梯度范数超过阈值。
+    # 实测校准：某场景 step 500 时 grad_norm 均值约 2e-4、最大约 1.2e-2；
+    # 随着优化推进梯度会明显衰减（step 3000 已掉到 1e-5 量级），固定阈值会导致
+    # "只在前几步加密过一次"。因此采用**分位数自适应阈值**：
+    # 取所有高斯梯度范数的 (1 - densify_quantile) 分位数，并夹在 min/max 之间。
+    densify_quantile: float = 0.75
+    densify_grad_threshold: float = 1.5e-4   # 自适应阈值的下限
+    densify_grad_max: float = 5e-3           # 自适应阈值的上限
+    # 加密时"大尺度分裂 / 小尺度克隆"的分界（相对尺度中位数的倍数），官方 0.01*scene_scale
+    split_scale_ratio: float = 1.0
+    # 裁剪阈值：不透明度低于此值的高斯被删除（官方 0.005）
+    prune_opacity: float = 0.005
     opacity_reset_interval: int = 3000
     eval: bool = True
     eval_interval: int = 2000
@@ -52,6 +66,24 @@ class TrainConfig:
     mask_loss_until: float = 0.25
     seed: int = 42
     log_every: int = 200
+
+
+def _quantile(values, q: float) -> float:
+    """取分位数（0..1）。
+
+    只用排序实现：torch.quantile 在元素很多时可能报错/很慢，
+    而 torch.kthvalue 需要 1-based 的 k，算错就会拿到最小值
+    （踩坑：曾出现"分位 0.00e+00"导致阈值退化成下限）。
+    """
+    import torch
+
+    v = values.detach().float().reshape(-1)
+    n = v.numel()
+    if n == 0:
+        return 0.0
+    q = min(max(float(q), 0.0), 1.0)
+    k = min(n - 1, max(0, int(round(q * (n - 1)))))
+    return float(torch.sort(v).values[k])
 
 
 def ssim_simple(img1, img2):
@@ -257,20 +289,45 @@ def train(cfg: TrainConfig, ctx) -> dict:
     rgb0 = torch.from_numpy(cols).float().to(device) / 255.0
     shs.data[:, 0, :] = (rgb0 - 0.5) / 0.28209479177387814  # SH DC 反解
 
-    def make_optimizers():
-        """密度控制会改变参数张量形状，必须重建优化器与调度器（官方实现同款做法）。"""
-        opts = {
-            "means": torch.optim.Adam([means], lr=1.6e-4, eps=1e-15),
-            "scales": torch.optim.Adam([scales], lr=5e-3, eps=1e-15),
-            "quats": torch.optim.Adam([quats], lr=1e-3, eps=1e-15),
-            "opacities": torch.optim.Adam([opac], lr=5e-2, eps=1e-15),
-            "shs": torch.optim.Adam([shs], lr=2.5e-3, eps=1e-15),
-        }
-        gamma = 0.01 ** (1 / max(cfg.iterations, 1))
-        schs = {k: torch.optim.lr_scheduler.ExponentialLR(v, gamma=gamma) for k, v in opts.items()}
-        return opts, schs
+    # 参数用字典管理，和官方 gsplat 一致：密度控制会**替换**参数对象并迁移优化器状态，
+    # 所以不能像早期版本那样把参数绑死在闭包里的局部变量上。
+    params: dict[str, torch.nn.Parameter] = {
+        "means": means,
+        "scales": scales,
+        "quats": quats,
+        "opacities": opac,
+        "shs": shs,
+    }
+    _LR = {"means": 1.6e-4, "scales": 5e-3, "quats": 1e-3, "opacities": 5e-2, "shs": 2.5e-3}
+    _gamma = 0.01 ** (1 / max(cfg.iterations, 1))
 
-    optimizers, sched = make_optimizers()
+    def make_optimizers():
+        """为**当前**的参数对象建优化器（只在开头调用一次）。
+
+        密度控制时不重建优化器，而是迁移状态 + 原地重建同 gamma 的调度器
+        （见 _update_param_with_optimizer 与 official gsplat 的 ops.py）。
+        """
+        opts = {k: torch.optim.Adam([v], lr=_LR[k], eps=1e-15) for k, v in params.items()}
+        return opts
+
+    def schedule_lrs(step_idx: int) -> None:
+        """与 ExponentialLR(gamma) 等价：手动设置每个参数组的学习率。"""
+        factor = _gamma ** step_idx
+        for k, opt in optimizers.items():
+            for group in opt.param_groups:
+                group["lr"] = _LR[k] * factor
+
+    optimizers = make_optimizers()
+    sched = None  # 用 schedule_lrs 手动等价实现，避免替换参数后调度器失效
+
+    def refresh_params() -> None:
+        """密度控制替换参数对象后，把局部变量重新指向新对象。"""
+        nonlocal means, scales, quats, opac, shs
+        means = params["means"]
+        scales = params["scales"]
+        quats = params["quats"]
+        opac = params["opacities"]
+        shs = params["shs"]
 
     background = torch.tensor([1.0, 1.0, 1.0] if cfg.white_background else [0.0, 0.0, 0.0], device=device)
 
@@ -283,6 +340,56 @@ def train(cfg: TrainConfig, ctx) -> dict:
     def normalize_quats():
         with torch.no_grad():
             quats.data = quats.data / (quats.data.norm(dim=-1, keepdim=True) + 1e-8)
+
+    def densify_and_prune(step: int, grad_norm: "torch.Tensor | None") -> tuple[int, int]:
+        """自适应密度控制，返回 (加密数, 裁剪数)。
+
+        严格照官方 gsplat 的模式（参考 `gsplat/strategy/ops.py` 与 `default.py`）：
+          * 参数用字典管理，扩缩容时**替换 `torch.nn.Parameter` 对象**；
+          * 同步迁移优化器里的 Adam 状态（按行拼接/裁剪），绝不重建优化器；
+          * 调用时机在 `optimizer.step()` + `zero_grad(set_to_none=True)` 之后。
+
+        两个关键点（都踩过坑）：
+          1. 判据不能用 `means.grad` —— 官方顺序里 zero_grad 在密度控制之前，
+             那时 .grad 已是 None，会导致一次都不加密。所以由调用方传入
+             "backward 之后缓存的位置梯度范数"。
+          2. 必须替换参数对象 + 迁移优化器状态。早期"改 p.data + 重建优化器"会报
+             "Function ... returned an invalid gradient at index 0 -
+              got [N_new, ...] but expected shape compatible with [N_old, ...]"。
+        """
+        if grad_norm is None:
+            return 0, 0
+        with torch.no_grad():
+            q = _quantile(grad_norm, 1.0 - cfg.densify_quantile)
+            thr = min(max(q, cfg.densify_grad_threshold), cfg.densify_grad_max)
+            is_grad_high = grad_norm > thr
+
+            # 官方 DefaultStrategy：梯度过阈者，小尺度克隆、大尺度分裂。
+            scales_max = torch.exp(params["scales"].data).max(dim=-1).values
+            ref = float(scales_max.median()) if scales_max.numel() else 0.0
+            is_split = is_grad_high & (scales_max > cfg.split_scale_ratio * ref)
+            is_dup = is_grad_high & (~is_split)
+            n_before = params["means"].shape[0]
+            if cfg.cap_max and n_before >= cfg.cap_max:
+                is_dup = torch.zeros_like(is_dup)
+                is_split = torch.zeros_like(is_split)
+
+            n_dup, n_split = _grow(params, optimizers, is_dup, is_split)
+            refresh_params()
+
+            # 裁剪只用不透明度（官方做法）。早期把"尺度过大"也当裁剪条件，
+            # 会立刻删掉刚加密出来的点（427 -> 加密 46 -> 又被裁 78，做了负功）。
+            is_prune = torch.sigmoid(params["opacities"].data).squeeze(-1) < cfg.prune_opacity
+            n_prune = int(is_prune.sum())
+            if n_prune:
+                _apply_keep(params, optimizers, ~is_prune)
+                refresh_params()
+
+            ctx.info(f"step {step} 密度：阈值={thr:.2e} 克隆 {n_dup} 分裂 {n_split} "
+                     f"裁剪 {n_prune} -> {params['means'].shape[0]} 个高斯")
+            for p in params.values():
+                p.grad = None
+        return n_dup + n_split, n_prune
 
     ckpt_dir = cfg.out_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -359,14 +466,16 @@ def train(cfg: TrainConfig, ctx) -> dict:
         ssim_val = ssim_simple(render.permute(2, 0, 1)[None], gt.permute(2, 0, 1)[None])
         loss = (1.0 - cfg.ssim_weight) * l1 + cfg.ssim_weight * (1.0 - ssim_val)
 
-        for opt in optimizers.values():
-            opt.zero_grad(set_to_none=True)
+        # ---- 反向 ----
         loss.backward()
-
-        # 早期探针：确认渲染确实覆盖了像素、且位置参数拿到梯度。
-        # 曾经出现 alpha 和 = 0 / means.grad = 0，根因是相机位姿的 y/z 翻转写错，
-        # 高斯全在相机背后（见 load_colmap_data 里的注释）。
-        # 这条日志保留：训练"能跑完"不等于"在工作"，这是最省事的健康断言。
+        # 缓存本步的位置梯度范数：密度控制需要它，但那时 .grad 已被 zero_grad 清掉。
+        grad_norm_cache = None
+        if means.grad is not None:
+            with torch.no_grad():
+                grad_norm_cache = means.grad.norm(dim=-1).detach().clone()
+        # 探针：确认渲染确实覆盖了像素、且位置参数拿到梯度。
+        # 曾经出现 alpha 和 = 0 / means.grad = 0（相机位姿翻转写错，高斯全在相机背后）。
+        # 训练"能跑完"不等于"在工作"，这是最省事的健康断言。
         if step == 1:
             ga = means.grad
             gn = float(ga.abs().sum()) if ga is not None else -1.0
@@ -381,48 +490,20 @@ def train(cfg: TrainConfig, ctx) -> dict:
             elif alpha_sum <= 0:
                 ctx.warn("alpha 全为 0：渲染没有覆盖任何像素，检查深度范围/尺度。")
 
-        # ---- 自适应密度控制（阈值按场景尺度归一化，避免小/大场景失效）----
-        if cfg.densify_from <= step <= cfg.densify_until and step % cfg.densify_interval == 0:
-            with torch.no_grad():
-                grad = means.grad
-                if step == cfg.densify_from:
-                    # 诊断：确认梯度确实存在（曾经出现 grad 恒为 0 导致密度控制完全不触发）
-                    if grad is None:
-                        ctx.warn("密度控制诊断：means.grad 为 None（梯度没有回传到位置参数）")
-                    else:
-                        gn = grad.norm(dim=-1)
-                        ctx.info(
-                            f"密度控制诊断：requires_grad={means.requires_grad} "
-                            f"grad.abs().sum()={float(grad.abs().sum()):.3e} "
-                            f"grad_norm mean={float(gn.mean()):.3e} max={float(gn.max()):.3e} "
-                            f"阈值={cfg.densify_grad_threshold:.1e}"
-                        )
-                if grad is not None:
-                    cam_centers = c2ws[:, :3, 3].to(device)
-                    scene_extent = float(torch.linalg.norm(cam_centers - cam_centers.mean(0), dim=1).mean()) + 1e-6
-                    params_2d_scale = torch.exp(scales.data).max(dim=-1).values
-                    grad_norm = grad.norm(dim=-1)
-                    densify = grad_norm > cfg.densify_grad_threshold
-                    n_before = means.shape[0]
-                    added = 0
-                    # 先加密（掩码按当前张量算，必须最先用）
-                    if densify.any() and means.shape[0] < cfg.cap_max:
-                        added = _duplicate(means, scales, quats, opac, shs, densify, cap=cfg.cap_max)
-                    # 再裁剪：官方只用不透明度作为裁剪依据。
-                    # 早期版本把"尺度过大"也当裁剪条件，会立刻把刚加密出来的点删掉
-                    # （实测 427 -> 加密 46 -> 又被裁 78 -> 只剩 395，等于做了负功）。
-                    remove = current_opacities().squeeze(-1) < 0.005
-                    if remove.any():
-                        _apply_keep(means, scales, quats, opac, shs, ~remove)
-                    if means.shape[0] != n_before:
-                        ctx.info(f"step {step}: 高斯数量 {n_before} -> {means.shape[0]}"
-                                 f"（加密 {added}，裁剪 {int(remove.sum())}）")
-                        optimizers, sched = make_optimizers()
-
         for opt in optimizers.values():
             opt.step()
-        for sch in sched.values():
-            sch.step()
+            opt.zero_grad(set_to_none=True)
+        schedule_lrs(step)
+
+        # ---- 结构更新（后向之后进行，官方称之为 post-backward step）----
+        # 官方 simple_trainer.py 的顺序就是：
+        #   optimizer.step() -> optimizer.zero_grad(set_to_none=True) -> strategy.step_post_backward(...)
+        #
+        # 但 zero_grad 之后 means.grad 已经是 None，所以判据必须在 backward 之后、
+        # step 之前就缓存下来（这一点和官方不同：官方用的是策略自己累积的 grad2d 统计量，
+        # 不依赖 .grad）。早期直接读 means.grad -> 恒为 None -> 一次都不加密。
+        if cfg.densify_from <= step <= cfg.densify_until and step % cfg.densify_interval == 0:
+            densify_and_prune(step, grad_norm_cache)
 
         # ---- 透明度周期性重置（清除“漂浮”高斯）----
         if cfg.opacity_reset_interval and step % cfg.opacity_reset_interval == 0 and step < cfg.densify_until:
@@ -482,64 +563,133 @@ def train(cfg: TrainConfig, ctx) -> dict:
 
 
 # --------------------------------------------------------------- 辅助函数
-def _apply_keep(means, scales, quats, opac, shs, keep):
-    import torch
+def _update_param_with_optimizer(param_fn, optimizer_fn, params: dict, optimizers: dict, names=None):
+    """按官方 gsplat 的做法更新参数与优化器状态。
 
-    keep_idx = keep.nonzero(as_tuple=True)[0]
-    with torch.no_grad():
-        for p in (means, scales, quats, opac, shs):
-            new = p.data[keep_idx].clone()
-            p.data = new
-            p.grad = None
+    这是本项目踩坑最久的一处，必须严格照抄官方模式（gsplat/strategy/ops.py）：
+      * **创建新的 `torch.nn.Parameter` 对象**，而不是修改 `p.data`；
+      * 把优化器 `param_groups` 指向新对象，并**迁移 Adam 的 state**（exp_avg / exp_avg_sq），
+        迁移函数按行拼接（新增行补 0）；
+      * 绝不重建优化器（重建会丢动量，还会让 autograd 与旧张量的关联残留，
+        导致 "returned an invalid gradient ... expected shape compatible with [N_old]"）。
 
-
-def _duplicate(means, scales, quats, opac, shs, mask, cap: int) -> int:
-    """在 mask 指定的高斯上加密（克隆 + 分裂），返回实际新增数量。
-
-    为什么必须同时支持克隆与分裂：
-      实测某场景在 step 500 时，梯度大的点尺度约 0.45（偏大），而"尺度小"的点梯度不够，
-      两个条件交集为空 → 只做克隆会一个点都加不出来，模型永远停在初始稀疏点。
-      官方做法是：梯度过阈时，**小尺度克隆、大尺度分裂**（分裂时尺度按 1.6 倍缩小）。
+    参考：`gsplat.strategy.ops._update_param_with_optimizer`。
     """
     import torch
 
-    idx = mask.nonzero(as_tuple=True)[0]
-    room = max(0, cap - means.shape[0])
-    if room <= 0 or idx.numel() == 0:
-        return 0
-    idx = idx[:room]
-    added = int(idx.numel())
+    if names is None:
+        names = list(params.keys())
 
-    with torch.no_grad():
-        s = torch.exp(scales.data[idx])
-        max_scale = s.max(dim=-1).values
-        split_threshold = float(max_scale.median()) if max_scale.numel() else 0.0
-        is_split = max_scale > split_threshold
-
-        new_means = means.data[idx].clone()
-        new_scales = scales.data[idx].clone()
-        new_quats = quats.data[idx].clone()
-        new_opac = opac.data[idx].clone()
-        new_shs = shs.data[idx].clone()
-
-        # 克隆：加一点位置抖动
-        new_means = new_means + torch.randn_like(new_means) * 1e-4
-        # 分裂：位置抖动更大，尺度缩小（官方 1.6）
-        if bool(is_split.any()):
-            m = is_split
-            new_means[m] = means.data[idx][m] + torch.randn_like(new_means[m]) * 2.0 * s[m]
-            new_scales[m] = torch.log(s[m] / 1.6)
-
-        for p, dup in ((means, new_means), (scales, new_scales),
-                       (quats, new_quats), (opac, new_opac), (shs, new_shs)):
-            p.data = torch.cat([p.data, dup], dim=0)
-            p.grad = None
-    return added
+    for name in names:
+        old = params[name]
+        new = param_fn(name, old)
+        params[name] = new
+        opt = optimizers.get(name)
+        if opt is None:
+            continue
+        for group in opt.param_groups:
+            state = opt.state.pop(old, None)
+            if state is not None:
+                migrated = {}
+                for key, value in state.items():
+                    if key == "step" or not torch.is_tensor(value):
+                        migrated[key] = value
+                    else:
+                        migrated[key] = optimizer_fn(key, value)
+                opt.state[new] = migrated
+            group["params"] = [new]
 
 
-def _reset_optimizer_state(*_args, **_kwargs):
-    """已废弃：密度控制后改为整体重建优化器（见 make_optimizers）。"""
-    return None
+@torch.no_grad()
+def _apply_keep(params: dict, optimizers: dict, keep) -> None:
+    """按 keep 掩码裁剪高斯（官方 remove 模式）。"""
+    import torch
+
+    sel = torch.where(keep)[0]
+
+    def param_fn(name, p):
+        return torch.nn.Parameter(p[sel].clone(), requires_grad=p.requires_grad)
+
+    def optimizer_fn(key, v):
+        return v[sel].clone()
+
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+
+
+@torch.no_grad()
+def _grow(params: dict, optimizers: dict, duplicate_mask, split_mask) -> tuple[int, int]:
+    """加密：对 duplicate_mask 克隆、对 split_mask 分裂（官方 duplicate/split 模式）。"""
+    import torch
+
+    n_dup = int(duplicate_mask.sum())
+    if n_dup:
+        sel_d = torch.where(duplicate_mask)[0]
+
+        def param_fn(name, p):
+            merged = torch.cat([p, p[sel_d]], dim=0)
+            return torch.nn.Parameter(merged, requires_grad=p.requires_grad)
+
+        def optimizer_fn(key, v):
+            return torch.cat([v, torch.zeros((len(sel_d), *v.shape[1:]), device=v.device)], dim=0)
+
+        _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers,
+                                     names=[k for k in params if k != "shs"])
+        # SH 的 DC 分量要一起复制，高阶分量为 0（与官方 split/duplicate 一致）
+        shs = params["shs"]
+        sh0 = torch.cat([shs[:, :1, :], shs[sel_d][:, :1, :]], dim=0)
+        rest = torch.zeros((sh0.shape[0], shs.shape[1] - 1, 3), device=sh0.device, dtype=sh0.dtype)
+        new_shs = torch.cat([sh0, rest], dim=1)
+        _swap_param("shs", new_shs, params, optimizers,
+                    lambda v: torch.cat([v, torch.zeros((len(sel_d), *v.shape[1:]), device=v.device)], dim=0))
+
+    n_split = 0
+    if split_mask is not None and bool(split_mask.any()):
+        sel_s = torch.where(split_mask)[0]
+        n_split = int(sel_s.numel())
+        # 分裂：位置抖动 2*scale，尺度除以 1.6（官方做法）
+        scales = torch.exp(params["scales"].data[sel_s])
+        offsets = torch.randn_like(params["means"].data[sel_s]) * 2.0 * scales
+
+        def param_fn(name, p):
+            extra = p[sel_s].clone()
+            if name == "means":
+                extra = extra + offsets
+            elif name == "scales":
+                extra = torch.log(torch.exp(extra) / 1.6)
+            return torch.nn.Parameter(torch.cat([p, extra], dim=0), requires_grad=p.requires_grad)
+
+        def optimizer_fn(key, v):
+            return torch.cat([v, torch.zeros((len(sel_s), *v.shape[1:]), device=v.device)], dim=0)
+
+        _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers,
+                                     names=[k for k in params if k != "shs"])
+        shs = params["shs"]
+        sh0 = torch.cat([shs[:, :1, :], shs[sel_s][:, :1, :]], dim=0)
+        rest = torch.zeros((sh0.shape[0], shs.shape[1] - 1, 3), device=sh0.device, dtype=sh0.dtype)
+        new_shs = torch.cat([sh0, rest], dim=1)
+        _swap_param("shs", new_shs, params, optimizers,
+                    lambda v: torch.cat([v, torch.zeros((len(sel_s), *v.shape[1:]), device=v.device)], dim=0))
+    return n_dup, n_split
+
+
+def _swap_param(name: str, new_tensor, params: dict, optimizers: dict, optimizer_fn) -> None:
+    """单独替换某个参数（shs 需要特殊处理，走这里）。"""
+    import torch
+
+    old = params[name]
+    new = torch.nn.Parameter(new_tensor, requires_grad=old.requires_grad)
+    params[name] = new
+    opt = optimizers.get(name)
+    if opt is None:
+        return
+    for group in opt.param_groups:
+        state = opt.state.pop(old, None)
+        if state is not None:
+            migrated = {}
+            for key, value in state.items():
+                migrated[key] = value if (key == "step" or not torch.is_tensor(value)) else optimizer_fn(value)
+            opt.state[new] = migrated
+        group["params"] = [new]
 
 
 def evaluate(rasterization, means, quats, scales, opacities, shs, imgs, masks, ks, viewmats,
