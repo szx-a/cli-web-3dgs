@@ -518,6 +518,10 @@ def train(cfg: TrainConfig, ctx) -> dict:
     psnr_log: list[dict] = []
     t0 = time.time()
     ema_loss = None
+    # 最佳检查点跟踪（导出阶段优先用它，见 stages/export.py:_find_ply）
+    best_psnr = float("-inf")
+    best_step = 0
+    best_ply: Path | None = None
 
     for step in range(1, cfg.iterations + 1):
         if ctx.cancel_requested:
@@ -644,7 +648,7 @@ def train(cfg: TrainConfig, ctx) -> dict:
 
         if cfg.eval and cfg.eval_interval and (step % cfg.eval_interval == 0 or step == cfg.iterations):
             # 全部用关键字传参：位置传参曾因顺序写错而静默失效（形状恰好兼容）
-            psnr = evaluate(
+            eval_res = evaluate(
                 rasterization=rasterization,
                 means=means,
                 quats=quats,
@@ -668,6 +672,25 @@ def train(cfg: TrainConfig, ctx) -> dict:
             tag = "（训练视图，非泛化指标）" if psnr_on_train else ""
             ctx.emit(f"step {step} 评估 PSNR={psnr:.2f} dB{tag}", level="info",
                      progress=step / cfg.iterations)
+            # 记录/保存"最佳检查点"：
+            # 3DGS 在小规模环绕拍摄上常出现"过训练"（后期加密导致拟合变差，
+            # 真实素材实测 step8000 的 26.45 dB 退化到 step15000 的 21.26 dB）。
+            # 所以评估时若刷新了最佳 PSNR，就顺手把模型存下来，
+            # 导出阶段会优先用它（见 stages/export.py:_find_ply）。
+            if eval_res is not None and eval_res > best_psnr + 1e-6:
+                best_psnr = float(eval_res)
+                best_step = step
+                best_dir = gs_dir / f"iteration_{step}"
+                save_ply(
+                    path=best_dir / "point_cloud.ply",
+                    means=means,
+                    scales=current_scales(),
+                    quats=quats,
+                    opacities=current_opacities(),
+                    shs=shs,
+                    sh_degree=cfg.sh_degree,
+                )
+                best_ply = best_dir / "point_cloud.ply"
 
         if step % 5000 == 0 or step == cfg.iterations:
             # 关键字传参：位置传参出过一次静默错位（evaluate 的 PSNR 因此恒为 0）
@@ -711,10 +734,18 @@ def train(cfg: TrainConfig, ctx) -> dict:
         "psnr_curve": psnr_log,
         "loss_curve": loss_log[-200:],
         "ply": str(final_ply),
+        # 最佳检查点（导出优先用它）：3DGS 会"过训练"，最后一步往往不是最好的
+        "best_psnr": (round(best_psnr, 3) if best_psnr != float("-inf") else None),
+        "best_step": best_step or None,
+        "best_ply": (str(best_ply) if best_ply else str(final_ply)),
     }
     (cfg.out_dir / "metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
-    ctx.success(f"训练完成：{metrics['gaussians']} 个高斯，用时 {metrics['elapsed_min']} 分钟"
-                + (f"，PSNR {metrics['psnr']:.2f} dB" if metrics["psnr"] else ""))
+    msg = (f"训练完成：{metrics['gaussians']} 个高斯，用时 {metrics['elapsed_min']} 分钟"
+           + (f"，PSNR {metrics['psnr']:.2f} dB" if metrics["psnr"] else ""))
+    if metrics["best_psnr"] and metrics["psnr"] and metrics["best_psnr"] > metrics["psnr"] + 0.1:
+        msg += (f"；**最佳检查点在 step {metrics['best_step']}"
+                f"（{metrics['best_psnr']:.2f} dB），导出将采用它**")
+    ctx.success(msg)
     return metrics
 
 

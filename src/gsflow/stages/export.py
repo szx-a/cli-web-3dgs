@@ -185,35 +185,68 @@ class ExportStage(Stage):
     # ------------------------------------------------------------------ 读取
     @staticmethod
     def _find_ply(job_dir: Path) -> Path | None:
-        """找迭代次数最高的 point_cloud.ply。
+        """挑要导出的 point_cloud.ply —— **优先挑指标最佳的检查点，而不是最后一个**。
 
-        踩坑：不能直接按路径字符串排序——`iteration_5000` 会排在
-        `iteration_30000` 之后（字典序），导致导出的是早期检查点。
-        这里优先读训练阶段写在 metrics.json 里的最终模型路径。
+        为什么不是"最后一个"：3DGS 在小规模环绕拍摄上常见"过训练"——
+        密度控制后期不断加密，拟合反而变差。真实素材实测：
+            step 8000  PSNR 26.45 dB  ← 峰值
+            step 15000 PSNR 21.26 dB  ← 退化 5.2 dB
+        而早期实现固定导出 metrics.json 里的 `ply` 字段（= 最后一次迭代），
+        等于**每次都导出最差的那个模型**。
+
+        现在的选择顺序：
+          1. metrics.json 里记录的 `best_ply`（训练时按评估 PSNR 选出的最佳检查点）；
+          2. 若有 psnr_curve，按曲线峰值对应的迭代去取同目录的检查点；
+          3. 否则回退到迭代次数最高的（并保留按数值而非字典序排序的修正）。
+
+        注意：不能按路径字符串排序——`iteration_5000` 会排在 `iteration_30000` 之后。
         """
         import re
 
+        base = job_dir / "04_train" / "point_cloud"
         metrics = job_dir / "04_train" / "metrics.json"
+        data: dict = {}
         if metrics.exists():
             try:
                 data = json.loads(metrics.read_text(encoding="utf-8"))
-                recorded = Path(str(data.get("ply", "")))
-                if recorded.exists():
-                    return recorded
             except (json.JSONDecodeError, OSError, TypeError):
-                pass
-
-        base = job_dir / "04_train" / "point_cloud"
-        if not base.exists():
-            return None
-        cands = list(base.rglob("point_cloud.ply"))
-        if not cands:
-            return None
+                data = {}
 
         def iteration(p: Path) -> int:
             m = re.search(r"iteration_(\d+)", str(p))
             return int(m.group(1)) if m else -1
 
+        # 1) 训练阶段直接记下的最佳检查点
+        #    注意 Path("") 会解析成当前目录且 .exists() 为真，必须先用字符串长度兜住，
+        #    否则缺字段时会返回一个空路径。
+        best_raw = str(data.get("best_ply") or "").strip()
+        if best_raw:
+            best = Path(best_raw)
+            if best.exists():
+                return best
+
+        # 2) 用 PSNR 曲线的峰值迭代去取
+        curve = data.get("psnr_curve") or []
+        if curve and base.exists():
+            try:
+                peak_step = max(curve, key=lambda x: float(x.get("psnr", 0))).get("step")
+                cand = base / f"iteration_{int(peak_step)}" / "point_cloud.ply"
+                if cand.exists():
+                    return cand
+                # 峰值迭代没存检查点：退而求其次，取不超过峰值迭代里最大的那个
+                allp = sorted(base.rglob("point_cloud.ply"), key=iteration)
+                below = [p for p in allp if iteration(p) <= int(peak_step)]
+                if below:
+                    return below[-1]
+            except (TypeError, ValueError):
+                pass
+
+        # 3) 回退：迭代次数最高
+        if not base.exists():
+            return None
+        cands = list(base.rglob("point_cloud.ply"))
+        if not cands:
+            return None
         return max(cands, key=iteration)
 
     @staticmethod

@@ -21,7 +21,10 @@ class RembgSegmenter(Segmenter):
 
         _paths._patch_rembg_home()
 
-        model = self.opt.extra.get("model", "u2net")
+        # 注意 `or "u2net"`：配置里可能给的是**空字符串**而不是缺键，
+        # 而 dict.get(key, default) 只对"键不存在"生效、对 `""` 不生效，
+        # 于是空串被原样传给 rembg -> "No session class found for model ''"。
+        model = (self.opt.extra.get("model") or "u2net").strip()
         try:
             return new_session(model)
         except Exception as exc:

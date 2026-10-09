@@ -76,7 +76,10 @@ class MaskStage(Stage):
             imgsz=int(ctx.cfg("imgsz", 1024) or 1024),
             conf=float(ctx.cfg("conf", 0.25) or 0.25),
             batch_size=int(ctx.cfg("batch_size", 4) or 4),
-            extra={"model": ctx.params.get("mask.model", "")},
+            # 后端相关选项：`or None` 之类的空值统一交给后端自己取默认
+            # （踩坑：曾把空字符串 model="" 原样传给 rembg，导致
+            #  "No session class found for model ''"）
+            extra={"model": (ctx.params.get("mask.model") or "").strip()},
         )
 
         ctx.info(f"分割后端 = {backend_name}，清理模式 = {mode}，共 {len(images)} 张图")

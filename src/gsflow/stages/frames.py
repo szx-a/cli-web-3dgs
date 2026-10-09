@@ -23,6 +23,34 @@ VIDEO_EXT = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".wmv", ".flv", ".webm", ".
 META_NAME = "_frames.json"
 
 
+def _fps_mode_flag(ffmpeg_path: str) -> str:
+    """返回当前 ffmpeg 支持的帧同步选项名（`-fps_mode` 或旧的 `-vsync`）。
+
+    踩坑：`-vsync` 在 ffmpeg 5.0 起废弃、**9.0 已移除**，老代码传它会在真实视频上
+    直接抽帧失败（"Unrecognized option 'vsync'"）。本项目此前只用预置图片测试，
+    从未走过视频路径，所以直到跑真实素材才暴露。
+    这里探测一次 ffmpeg 的帮助输出，按版本选名字，避免绑死某个版本。
+    """
+    import functools
+    import subprocess
+
+    @functools.lru_cache(maxsize=4)
+    def _probe(path: str) -> str:
+        try:
+            out = subprocess.run(
+                [path, "-hide_banner", "-h", "full"],
+                capture_output=True, text=True, errors="ignore", timeout=30,
+            )
+            text = (out.stdout or "") + (out.stderr or "")
+            if "-fps_mode" in text:
+                return "-fps_mode"
+        except Exception:  # noqa: BLE001
+            pass
+        return "-vsync"
+
+    return _probe(ffmpeg_path)
+
+
 class FramesStage(Stage):
     name = "frames"
     title = "① 抽帧 / 图片导入"
@@ -105,11 +133,25 @@ class FramesStage(Stage):
                 if p.is_file():
                     p.unlink()
         cmd = [ffmpeg.path, "-hide_banner", "-loglevel", "warning", "-y", "-i", str(src)]
-        if mode == "fps":
-            cmd += ["-r", f"{fps}"]
+        # `-r` 必须在两种模式都加：count 模式只是先把"目标张数"换算成等效 fps，
+        # 真正让 ffmpeg 降采样的是这个 `-r`。
+        # 踩坑：早期把它写在 `if mode == "fps"` 里，于是 count 模式算出 fps 却没用上，
+        # 结果 23 秒 30fps 的视频被判成"抽 120 张"实际抽出 **698 张（全部帧）**，
+        # 后续 mask 阶段白白处理了近 6 倍数据。
+        cmd += ["-r", f"{fps}"]
         if vf:
             cmd += ["-vf", ",".join(vf)]
-        cmd += ["-qscale:v", "2", "-vsync", "0", str(out_dir / "%05d.jpg")]
+        # 帧同步选项的坑（两层）：
+        #   1) ffmpeg 5.0 起 `-vsync` 废弃、**9.0 已彻底移除**，传它会直接
+        #      "Unrecognized option 'vsync'"。新名字是 `-fps_mode`。
+        #   2) 更重要的是**取值必须匹配**：一旦用了 `-r`（我们要按目标张数降采样），
+        #      就只能配 CFR，配 `passthrough` 会报
+        #      "One of -r/-fpsmax was specified together a non-CFR -vsync/-fps_mode.
+        #       This is contradictory."
+        #      （第一版就是踩了这个：没加 -r 时 passthrough 能跑，加了 -r 就冲突。）
+        # 所以这里统一用 `cfr`：既有确定的帧率、又不会静默丢掉我们要的帧。
+        cmd += ["-qscale:v", "2", _fps_mode_flag(ffmpeg.path), "cfr"]
+        cmd += [str(out_dir / "%05d.jpg")]
         log = ctx.logs_dir() / "ffmpeg_frames.log"
         ctx.info("开始抽帧 ...")
         code = run_tool(cmd, log_file=log, on_line=lambda l: ctx.emit(l, level="debug"))
