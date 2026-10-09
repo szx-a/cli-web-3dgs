@@ -55,63 +55,61 @@ def make_texture(size: int = 512, seed: int = 7) -> Image.Image:
 
 def render_view(texture: Image.Image, plane_size: float, cam_pos: np.ndarray,
                 look_at: np.ndarray, focal_px: float, out_size: int) -> Image.Image:
-    """用「平面单应」把纹理投影到相机平面：精确、可控，适合做 SfM 的合成输入。
+    """用**逐像素光线投射**渲染一块带纹理的平面（世界系 z=0，法线 +z）。
 
-    相机系约定：右手，x 向右，y 向上，z 朝后（OpenCV 风格）。
-    相机的“上”统一由世界 up 轴推出（而不是每帧各自 cross），
-    这样各视角共用一个水平面，SfM 才有稳定的解。
+    为什么不用上一版的单应 + `PIL.Image.transform`：
+    单应矩阵算出来是对的（`H @ src` 精确等于目标图像坐标），但 PIL 的
+    `transform` 有自己的一套约定（fillcolor、逆映射方向、越界处理），
+    结果是整块四边形被填成黑色而**不报任何错**。
+    这种"库的隐式约定"最容易浪费排查时间，所以这里改成从第一性原理直接实现：
+    对每个像素发一条射线，求与平面的交点，再采样纹理。逻辑完全可控、可读、可验证。
+
+    相机约定（OpenCV / COLMAP 风格）：x 向右、y 向下、z 向前。
     """
-    world_up = np.array([0.0, 1.0, 0.0])
+    # --- 相机基（行 = 相机轴在世界系）---
     forward = look_at - cam_pos
     forward = forward / np.linalg.norm(forward)
-    right = np.cross(world_up, forward)
-    if np.linalg.norm(right) < 1e-6:
-        right = np.array([1.0, 0.0, 0.0])
-    right = right / np.linalg.norm(right)
-    up = np.cross(forward, right)
-    up = up / np.linalg.norm(up)
+    world_up = np.array([0.0, 1.0, 0.0])
+    cam_x = np.cross(world_up, forward)
+    if np.linalg.norm(cam_x) < 1e-8:            # 正上方俯视，换一个参考轴
+        cam_x = np.cross(np.array([0.0, 0.0, 1.0]), forward)
+    cam_x = cam_x / np.linalg.norm(cam_x)
+    cam_y = np.cross(forward, cam_x)            # y 向下（OpenCV）
+    cam_y = cam_y / np.linalg.norm(cam_y)
 
-    # 相机基（世界 -> 相机）
-    R = np.stack([right, up, forward], axis=0)  # 行 = 相机轴在世界系
-    t = -R @ cam_pos
+    # --- 像素栅格 -> 相机系射线方向 ---
+    n = out_size
+    c = (n - 1) / 2.0
+    jj, ii = np.meshgrid(np.arange(n), np.arange(n), indexing="xy")  # ii=行(y), jj=列(x)
+    dx = (jj - c) / focal_px
+    dy = (ii - c) / focal_px
+    dirs = (dx[..., None] * cam_x + dy[..., None] * cam_y + forward)   # [n,n,3]
+    dirs /= np.linalg.norm(dirs, axis=-1, keepdims=True)
 
-    w, h = out_size, out_size
-    cx, cy = w / 2, h / 2
-    K = np.array([[focal_px, 0, cx], [0, focal_px, cy], [0, 0, 1.0]])
+    # --- 与平面 z=0 求交 ---
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t = -cam_pos[2] / dirs[..., 2]
+    hit = np.isfinite(t) & (t > 0)
+    px = cam_pos[0] + t * dirs[..., 0]
+    py = cam_pos[1] + t * dirs[..., 1]
 
-    # 平面四角（世界系，z=0，中心在原点）
-    hs = plane_size / 2
-    corners_world = np.array([
-        [-hs, -hs, 0.0],
-        [hs, -hs, 0.0],
-        [hs, hs, 0.0],
-        [-hs, hs, 0.0],
-    ])
-    corners_cam = (R @ corners_world.T).T + t
-    if np.any(corners_cam[:, 2] <= 0.05):
-        return None  # 有角点在相机后方，跳过
+    hs = plane_size / 2.0
+    inside = hit & (np.abs(px) <= hs) & (np.abs(py) <= hs)
 
-    corners_img = (K @ corners_cam.T).T
-    corners_img = corners_img[:, :2] / corners_img[:, 2:3]
+    # --- 采样纹理（世界 (px,py) -> 纹理 uv）---
+    tex = np.asarray(texture.convert("RGB"), dtype=np.uint8)
+    th, tw = tex.shape[:2]
+    u = np.clip(((px / plane_size) + 0.5) * (tw - 1), 0, tw - 1).astype(np.int32)
+    v = np.clip(((0.5 - py / plane_size)) * (th - 1), 0, th - 1).astype(np.int32)
+    sampled = tex[v, u]                        # [n,n,3]
 
-    # 目标图上的四个角（顺序与上面一致）
-    dst = corners_img.astype(np.float32)
-    src = np.array([[0, 0], [texture.width, 0], [texture.width, texture.height], [0, texture.height]], dtype=np.float32)
+    # --- 合成：背景 + 平面 + 噪声与轻微模糊（模拟真实照片）---
+    bg_color = np.array([35, 38, 45], dtype=np.float32)
+    out = np.where(inside[..., None], sampled.astype(np.float32), bg_color)
 
-    # 求 texture -> image 的单应（4 点 DLT），PIL 需要 target->source 的逆映射
-    H = _homography(src, dst)
-    H_inv = np.linalg.inv(H)
-    warped = texture.transform((w, h), Image.PERSPECTIVE, tuple(H_inv.flatten()[:8]), resample=Image.BICUBIC)
-
-    # 合成到深灰背景 + 轻微噪声与模糊，模拟真实照片
-    bg = Image.new("RGB", (w, h), (35, 38, 45))
-    mask = _quad_mask((w, h), dst)
-    bg.paste(warped, (0, 0), mask)
-
-    arr = np.asarray(bg, dtype=np.float32)
-    rng = np.random.default_rng(abs(hash((cam_pos.tobytes()))) % 2**31)
-    arr += rng.normal(0, 2.5, arr.shape)
-    img = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+    rng = np.random.default_rng(abs(hash(cam_pos.tobytes())) % 2**31)
+    out = out + rng.normal(0, 2.5, out.shape)
+    img = Image.fromarray(np.clip(out, 0, 255).astype(np.uint8))
     return img.filter(ImageFilter.GaussianBlur(0.6))
 
 
@@ -132,22 +130,38 @@ def _homography(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
     return vt[-1].reshape(3, 3)
 
 
-def build_dataset(out_dir: Path, views: int, size: int, plane: float = 3.0) -> int:
+def build_dataset(out_dir: Path, views: int, size: int, plane: float = 3.0,
+                  elev_deg: float = 30.0) -> int:
+    """生成环绕视角的合成数据。
+
+    ⚠️ 这里出过一个让整条流水线"看起来全坏了"的 bug，务必理解清楚：
+
+    平面角点是 `(±hs, ±hs, 0)` —— 即平面位于 **z=0**，法线朝向世界 **+z**。
+    而最初的相机轨迹是 `(r·cosθ, 小高度, r·sinθ)`：
+      * θ=0 时相机在 `(r, 0.15, 0)`，视线方向几乎与平面**平行** → 平面被侧视成一条线；
+      * 相机高度只有 0.15、半径 3.6 → 仰角仅 2.4°，基线也几乎退化。
+    于是渲染出来是一张几乎全黑的图（只有一条淡竖线），
+    SIFT 无特征（36 张只注册了 14 张），重建自然也无从谈起。
+
+    正确做法：相机必须**绕过平面法线**（即在包含 +z 的半空间里环绕），
+    这样才始终"正对"平面；再叠加一个俯仰角让视角有变化、扩大基线。
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     for p in out_dir.iterdir():
         if p.is_file():
             p.unlink()
     texture = make_texture(768)
-    radius = plane * 1.2
+    radius = plane * 1.6
     focal = size * 0.9
+    elev = math.radians(elev_deg)
     written = 0
     for i in range(views):
         theta = 2 * math.pi * i / views
-        # 环绕 + 高度起伏：既有水平基线，也有俯仰变化（更接近手持环绕拍摄）
+        # 绕平面法线（+z）环绕，并向 +z 侧抬高 -> 始终正对平面
         cam = np.array([
-            radius * math.cos(theta),
-            0.45 * math.sin(2 * theta) + 0.15,
-            radius * math.sin(theta),
+            radius * math.cos(elev) * math.cos(theta),
+            radius * math.cos(elev) * math.sin(theta),
+            radius * math.sin(elev) + 0.10 * plane * math.sin(2 * theta),
         ])
         img = render_view(texture, plane, cam, np.zeros(3), focal, size)
         if img is None:
@@ -161,6 +175,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="合成多视角数据 + 端到端跑通 frames/colmap/export")
     ap.add_argument("--views", type=int, default=24)
     ap.add_argument("--size", type=int, default=800)
+    # 相机俯仰角：太小时水平面会被侧视成一条线（见 build_dataset 的注释）
+    ap.add_argument("--elev", type=float, default=30.0, help="相机俯仰角（度），默认 30")
     ap.add_argument("--stages", default="frames,colmap,export")
     ap.add_argument("--out", default=str(ROOT / "env" / "synthetic" / "images"))
     ap.add_argument("--backend", default="classical", help="mask 阶段使用的分割后端")
@@ -173,7 +189,7 @@ def main() -> int:
     from gsflow.stages import register_all  # noqa: F401
 
     out_dir = Path(args.out)
-    n = build_dataset(out_dir, args.views, args.size)
+    n = build_dataset(out_dir, args.views, args.size, elev_deg=args.elev)
     print(f"已生成合成视图 {n} 张 -> {out_dir}")
 
     stages = [s.strip() for s in args.stages.split(",") if s.strip()]

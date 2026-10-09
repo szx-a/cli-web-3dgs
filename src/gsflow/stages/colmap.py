@@ -262,34 +262,60 @@ class ColmapStage(Stage):
         return max(subs, key=score)
 
     def _quality_report(self, ctx: StageContext, images_dir: Path, text_dir: Path) -> dict:
+        """统计注册率与平均重投影误差。
+
+        ⚠️ 踩坑（曾长期报出 meaningless 的数值）：重投影误差**不在 images.txt 里**。
+
+        `images.txt` 每行格式是：
+            IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME
+        第 8 个字段（索引 7）是 **TY（相机平移分量）**，不是误差！
+        早期代码读的正是 `parts[7]`，于是"平均重投影误差"实际是相机 TY 的平均值
+        （一次实测得到 99.987px，看起来像标定崩了，其实重建误差只有 0.8px），
+        还会误触发 "> 2.0px 标定可能不稳定" 的告警。
+
+        真正的逐点重投影误差在 `points3D.txt` 的第 8 列：
+            POINT3D_ID X Y Z R G B ERROR TRACK[]
+        所以这里改成从 points3D.txt 统计，同时按点数加权。
+        """
         total_images = sum(1 for p in images_dir.iterdir() if p.suffix.lower() in IMAGE_EXT)
         images_txt = text_dir / "images.txt"
         points_txt = text_dir / "points3D.txt"
+
         registered = 0
-        errors: list[float] = []
         if images_txt.exists():
             for line in images_txt.read_text(encoding="utf-8", errors="ignore").splitlines():
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
+                # 只统计"位姿行"（第二行是 POINTS2D，字段数远超 10 且第 10 列不是 .jpg/.png）
                 parts = line.split()
-                if len(parts) >= 10:
+                if len(parts) >= 10 and parts[9].lower().endswith(tuple(IMAGE_EXT)):
                     registered += 1
-                    try:
-                        errors.append(float(parts[7]))
-                    except ValueError:
-                        pass
+
+        # 逐点重投影误差（points3D.txt 第 8 列）
+        errors: list[float] = []
         points = 0
         if points_txt.exists():
             for line in points_txt.read_text(encoding="utf-8", errors="ignore").splitlines():
                 line = line.strip()
-                if line and not line.startswith("#"):
-                    points += 1
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) < 8:
+                    continue
+                points += 1
+                try:
+                    errors.append(float(parts[7]))
+                except ValueError:
+                    pass
+
+        mean_err = round(sum(errors) / len(errors), 4) if errors else 0.0
         return {
             "total_images": total_images,
             "registered": registered,
             "registered_ratio": round(registered / max(total_images, 1), 4),
-            "mean_reproj_error": round(sum(errors) / max(len(errors), 1), 4),
+            "mean_reproj_error": mean_err,          # 逐点平均，单位 px
+            "mean_reproj_error_max": round(max(errors), 4) if errors else 0.0,
             "points3D": points,
             "model": MODEL_DIR,
         }
