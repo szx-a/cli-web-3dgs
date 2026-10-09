@@ -155,7 +155,6 @@ def _ninja_unusable() -> bool:
     而 torch 的 cpp_extension 是同步等待 ninja 结束的，于是 JIT 编译永远卡住
     （表现为 ninja 进程 CPU=0、构建目录只有 build.ninja、日志为空）。
     """
-    import os as _os
     import shutil as _shutil
     import subprocess as _subprocess
     import tempfile as _tempfile
