@@ -349,7 +349,223 @@ class ExportStage(Stage):
 
     # ------------------------------------------------------------------ 预览
     def _render_previews(self, ctx: StageContext, gauss: dict, out_dir: Path, count: int = 4) -> list[dict]:
-        """用 matplotlib 做正交投影预览（无 torch 依赖，导出阶段也能独立跑）。"""
+        """生成预览图：优先用 **gsplat 真实渲染**，失败时退回 matplotlib 散点投影。
+
+        为什么要真渲染：matplotlib 版只是把高斯**中心点**画成散点，
+        得到的是一团点云，看不出重建质量（一个 PSNR 35dB 的好模型和一堆乱点长得一样）。
+        真渲染能直接反映"模型看到的世界"，也是用户最关心的产物。
+
+        gsplat 不可用时（例如无 GPU 环境）自动退回散点图，保证导出阶段仍能独立跑通。
+        """
+        rendered = self._render_previews_splat(ctx, gauss, out_dir, count)
+        if rendered:
+            return rendered
+        return self._render_previews_scatter(ctx, gauss, out_dir, count)
+
+    def _render_previews_splat(self, ctx: StageContext, gauss: dict, out_dir: Path,
+                               count: int = 4) -> list[dict]:
+        """用 gsplat 从若干环绕视角真实渲染模型（无头，不需要 GUI）。"""
+        try:
+            import torch
+            from gsplat import rasterization
+            from PIL import Image
+        except Exception as exc:  # noqa: BLE001
+            ctx.info(f"未启用真实渲染预览（{type(exc).__name__}），改用散点投影")
+            return []
+
+        try:
+            if not torch.cuda.is_available():
+                ctx.info("无 CUDA 设备，预览改用散点投影")
+                return []
+            xyz = torch.as_tensor(gauss["xyz"], dtype=torch.float32, device="cuda")
+            n = xyz.shape[0]
+            if n == 0:
+                return []
+            # 注意：_read_ply 已经把 PLY 里的 log 尺度**指数化**过了，
+            # 这里拿到的是真实尺度，绝对不能再 exp 一次
+            # （早期在预览里又 exp 了一遍 -> 尺度变成天文数字 -> 渲染一片空白）。
+            scales_real = torch.as_tensor(gauss["scales"], dtype=torch.float32, device="cuda")
+            quats = torch.as_tensor(gauss["quats"], dtype=torch.float32, device="cuda")
+            rgb = torch.as_tensor(gauss["rgb"], dtype=torch.float32, device="cuda") / 255.0
+
+            opac0 = torch.as_tensor(gauss["opacity"], dtype=torch.float32, device="cuda").reshape(-1)
+            # 只保留"看得见"的高斯：低不透明度的浮点数会把取景撑大、把画面渲成一片背景色。
+            keep = opac0 > 0.02
+            if int(keep.sum()) < 16:
+                keep = torch.ones_like(opac0, dtype=torch.bool)
+            xyz = xyz[keep]
+            scales_real = scales_real[keep]
+            quats = quats[keep]
+            opac = opac0[keep]
+            rgb = rgb[keep]
+            n = int(xyz.shape[0])
+            ctx.info(f"预览渲染使用 {n} 个可见高斯（不透明度 > 0.02）")
+
+            # 首选：直接用**训练时的真实相机位姿**渲染。
+            # 自己估的"环绕相机"很容易取景失当（实测把画面渲成一片背景色），
+            # 而训练相机的视角天然合理，也正好能反映"模型在训练视图上看到什么"。
+            poses = self._training_cameras(ctx, out_dir)
+            if poses:
+                return self._render_from_poses(ctx, xyz, scales_real, quats, opac, rgb, poses, out_dir, count)
+
+            center = xyz.mean(dim=0)
+            spread = torch.linalg.norm(xyz - center, dim=1) + scales_real.max(dim=1).values
+            radius = float(spread.max()) * 2.6 + 1e-3
+            H = W = 512
+            fov = 1.0
+            focal = 0.5 * W / np.tan(0.5 * fov)
+            shs = ((rgb - 0.5) / 0.28209479177387814).reshape(n, 1, 3)
+
+            angles = [("front", 0.0, 0.15), ("side", 90.0, 0.15),
+                      ("top", 0.0, 1.35), ("iso", 45.0, 0.55)]
+            out: list[dict] = []
+            for name, az_deg, el in angles[:count]:
+                az = np.radians(az_deg)
+                eye = center + torch.tensor(
+                    [radius * np.cos(el) * np.cos(az),
+                     radius * np.cos(el) * np.sin(az),
+                     radius * np.sin(el)], dtype=torch.float32, device="cuda")
+                fwd = center - eye
+                fwd = fwd / (fwd.norm() + 1e-9)
+                up_w = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device="cuda")
+                right = torch.cross(up_w, fwd, dim=0)
+                if float(right.norm()) < 1e-6:
+                    right = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32, device="cuda")
+                right = right / (right.norm() + 1e-9)
+                up = torch.cross(fwd, right, dim=0)
+                up = up / (up.norm() + 1e-9)
+                R = torch.stack([right, up, fwd], dim=0)
+                t = -R @ eye
+                viewmat = torch.eye(4, dtype=torch.float32, device="cuda")
+                viewmat[:3, :3] = R
+                viewmat[:3, 3] = t
+                K = torch.tensor([[focal, 0, W / 2], [0, focal, H / 2], [0, 0, 1.0]],
+                                 dtype=torch.float32, device="cuda")
+                with torch.no_grad():
+                    colors, alphas, _ = rasterization(
+                        means=xyz, quats=quats, scales=scales_real,
+                        opacities=opac.clamp(0, 1), colors=shs,
+                        viewmats=viewmat[None], Ks=K[None],
+                        width=W, height=H, sh_degree=0, packed=False, render_mode="RGB",
+                    )
+                    img = colors[0] + (1 - alphas[0])
+                arr = (img.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+                p = out_dir / f"preview_{name}.png"
+                Image.fromarray(arr).save(p)
+                kb = round(p.stat().st_size / 1024, 1)
+                out.append({"kind": "preview", "path": p.name, "size_kb": kb, "size_mb": round(kb / 1024, 3),
+                            "desc": f"{name} 视角渲染（gsplat 真实渲染）"})
+        except Exception as exc:  # noqa: BLE001
+            ctx.warn(f"真实渲染预览失败（{type(exc).__name__}: {exc}），改用散点投影")
+            return []
+        if out:
+            ctx.info(f"已生成 {len(out)} 张真实渲染预览（gsplat）")
+        return out
+
+    def _training_cameras(self, ctx: StageContext, out_dir: Path):
+        """读取训练阶段用的 COLMAP 稀疏模型，取若干真实相机位姿（c2w）与 K。
+
+        为什么不用"自己估的环绕相机"：实测那样很容易取景失当
+        （相机落在高斯云内部或太远），渲出来是一片背景色，
+        而训练相机的视角天然合理，也正好展示"模型在训练视图上看到什么"。
+        """
+        try:
+            import torch
+
+            from ..gsdata.colmap_io import read_model
+        except Exception:  # noqa: BLE001
+            return None
+
+        job_dir = Path(getattr(ctx, "job_dir", out_dir.parent.parent))
+        data_dir = job_dir / "04_train" / "data"
+        sparse = data_dir / "sparse"
+        model_dir = sparse / "0" if (sparse / "0" / "cameras.bin").exists() else sparse
+        if not (model_dir / "cameras.bin").exists():
+            ctx.info(f"未找到训练用稀疏模型（{model_dir}），预览退回环绕相机")
+            return None
+        try:
+            rec = read_model(model_dir)
+        except Exception as exc:  # noqa: BLE001
+            ctx.warn(f"读取稀疏模型失败（{type(exc).__name__}），预览退回环绕相机")
+            return None
+        if not rec.images:
+            return None
+
+        poses = []
+        for im in rec.images:
+            cam = rec.cameras.get(im.camera_id)
+            if cam is None:
+                continue
+            r, t = im.cam_to_world()
+            c2w = np.eye(4)
+            c2w[:3, :3] = r
+            c2w[:3, 3] = t
+            poses.append((c2w.astype(np.float32), cam.intrinsics().astype(np.float32),
+                          int(cam.width), int(cam.height), im.name))
+        # 均匀抽 4 个视角，避免都挤在同一侧
+        if len(poses) > 4:
+            idx = np.linspace(0, len(poses) - 1, 4).round().astype(int)
+            poses = [poses[i] for i in idx]
+        ctx.info(f"预览将使用 {len(poses)} 个训练相机位姿（来自 {model_dir.name}）")
+        return poses
+
+    def _render_from_poses(self, ctx: StageContext, xyz, scales_real, quats, opac, rgb,
+                           poses, out_dir: Path, count: int) -> list[dict]:
+        """用给定的真实相机位姿渲染预览（gt 图若存在则并排拼上，便于对照）。
+
+        注意 scales_real 是**真实尺度**（_read_ply 已指数化），不要再 exp。
+        """
+        import torch
+        from gsplat import rasterization
+        from PIL import Image
+
+        n = int(xyz.shape[0])
+        shs = ((rgb - 0.5) / 0.28209479177387814).reshape(n, 1, 3)
+        names = ["front", "side", "top", "iso"]
+        out: list[dict] = []
+        for k, (c2w, K, cw, ch, img_name) in enumerate(poses[:count]):
+            W = H = 512
+            sx, sy = W / max(cw, 1), H / max(ch, 1)
+            Ks = K.copy()
+            Ks[0, 0] *= sx
+            Ks[1, 1] *= sy
+            Ks[0, 2] *= sx
+            Ks[1, 2] *= sy
+            viewmat = np.linalg.inv(c2w).astype(np.float32)
+            with torch.no_grad():
+                colors, alphas, _ = rasterization(
+                    means=xyz, quats=quats, scales=scales_real,
+                    opacities=opac.clamp(0, 1), colors=shs,
+                    viewmats=torch.as_tensor(viewmat, device="cuda")[None],
+                    Ks=torch.as_tensor(Ks, device="cuda")[None],
+                    width=W, height=H, sh_degree=0, packed=False, render_mode="RGB",
+                )
+                img = colors[0] + (1 - alphas[0])
+            arr = (img.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+
+            # 若去畸变图像还在，把真值放在右侧做对照（对诊断很有用）
+            gt_p = None
+            job_dir = Path(getattr(ctx, "job_dir", out_dir.parent.parent))
+            cand = job_dir / "04_train" / "data" / "images" / img_name
+            if cand.exists():
+                try:
+                    with Image.open(cand) as gi:
+                        gt = np.asarray(gi.convert("RGB").resize((W, H)))
+                    gt_p = np.concatenate([arr, gt], axis=1)
+                except Exception:  # noqa: BLE001
+                    gt_p = None
+
+            p = out_dir / f"preview_{names[k] if k < len(names) else k}.png"
+            Image.fromarray(gt_p if gt_p is not None else arr).save(p)
+            kb = round(p.stat().st_size / 1024, 1)
+            out.append({"kind": "preview", "path": p.name, "size_kb": kb, "size_mb": round(kb / 1024, 3),
+                        "desc": f"训练视角 {img_name} 渲染" + ("（左：渲染，右：真值）" if gt_p is not None else "")})
+        if out:
+            ctx.info(f"已生成 {len(out)} 张训练视角渲染预览")
+        return out
+
+    def _render_previews_scatter(self, ctx: StageContext, gauss: dict, out_dir: Path, count: int = 4) -> list[dict]:
+        """兜底：用 matplotlib 做正交投影散点预览（无 torch/CUDA 时使用）。"""
         try:
             import matplotlib
 
@@ -384,9 +600,9 @@ class ExportStage(Stage):
             # 预览图很小，用 KB 报；字段名与 MB 分开，避免单位混淆
             kb = round(p.stat().st_size / 1024, 1)
             out.append({"kind": "preview", "path": p.name, "size_kb": kb, "size_mb": round(kb / 1024, 3),
-                        "desc": f"{name} 视角预览"})
+                        "desc": f"{name} 视角预览（散点投影）"})
         if out:
-            ctx.info(f"已生成 {len(out)} 张预览图")
+            ctx.info(f"已生成 {len(out)} 张预览图（散点投影）")
         return out
 
     # ------------------------------------------------------------------ 查看器

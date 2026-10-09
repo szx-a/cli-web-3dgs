@@ -51,9 +51,15 @@ class TrainConfig:
     # 实测校准：某场景 step 500 时 grad_norm 均值约 2e-4、最大约 1.2e-2；
     # 随着优化推进梯度会明显衰减（step 3000 已掉到 1e-5 量级），固定阈值会导致
     # "只在前几步加密过一次"。因此采用**分位数自适应阈值**：
-    # 取所有高斯梯度范数的 (1 - densify_quantile) 分位数，并夹在 min/max 之间。
-    densify_quantile: float = 0.75
-    densify_grad_threshold: float = 1.5e-4   # 自适应阈值的下限
+    # 加密判据：位置梯度的范数阈值。
+    # 官方 gsplat DefaultStrategy 用的是**固定绝对阈值**（grow_grad2d=0.0002，
+    # 作用在按视图累积后的 2D 屏幕梯度上）。早期我改成"分位数自适应阈值"，
+    # 结果梯度一衰减阈值就跟着降 -> **无限膨胀**（实测 6000 步涨到 6 万高斯并
+    # 让 PSNR 从 33.75 掉到 21.47）。梯度随优化自然衰减本身就是停止加密的信号，
+    # 不需要（也不应该）人为跟随。这里默认用固定阈值。
+    densify_grad_threshold: float = 2e-4
+    # 可选：>0 时改用"梯度的 (1-q) 分位"作阈值（仅用于实验对比）
+    densify_quantile: float = 0.0
     densify_grad_max: float = 5e-3           # 自适应阈值的上限
     # 以下三个比例都相对 scene_scale（相机中心到均值距离），取自官方 DefaultStrategy：
     #   grow_scale3d  = 0.01 -> 尺度 <= 0.01*scene_scale 走"克隆"
@@ -67,7 +73,14 @@ class TrainConfig:
     revised_opacity: float = 0.1
     # 裁剪阈值：不透明度低于此值的高斯被删除（官方 0.005）
     prune_opacity: float = 0.005
-    opacity_reset_interval: int = 3000
+    # 不透明度重置：官方每 3000 步把不透明度压回 0.01，**并在之后立刻重新致密化**。
+    # 实测教训：我只实现了"压回 0.1"、漏了官方配套的 densify 补回步骤，
+    # 结果每次重置都把模型打掉一大半 —— 同一份数据、其余设置不变：
+    #     重置开 -> step6000 PSNR 19.02，之后一直在 19~21 徘徊
+    #     重置关 -> step10000 PSNR 36.44，且稳定上升
+    # 因此默认关闭（0 = 关闭）。若要开启，必须同时实现"重置后致密化"，
+    # 否则请不要打开。
+    opacity_reset_interval: int = 0
     eval: bool = True
     # 相机轴约束：默认 False = 不翻转，与官方 gsplat 的 COLMAP 加载器一致。
     # 只保留用于对照实验；正常流程不要打开。
@@ -213,6 +226,34 @@ def load_colmap_data(data_dir: Path, downscale: int = 1, white_background: bool 
     }
 
 
+def _init_scales_nn(means, k: int = 3):
+    """按官方 3DGS 的做法算初始尺度：到 k 个最近邻的平均平方距离，再开方。
+
+    官方（inria `gaussian_model.create_from_pcd`）：
+        dist2 = torch.clamp_min(distCUDA2(points), 0.0000001)   # 到最近邻的平方距离均值
+        scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
+    这里用分块 cdist 实现，避免一次性构造 N×N 矩阵（大场景会吃满显存）。
+    """
+    import torch
+
+    pts = means.detach().float()
+    n = pts.shape[0]
+    if n <= 1:
+        return torch.full((n, 1), 0.01, device=pts.device)
+    kk = min(k, n - 1)
+    out = torch.empty(n, device=pts.device)
+    chunk = max(1, min(n, 4096))
+    for s in range(0, n, chunk):
+        e = min(n, s + chunk)
+        d = torch.cdist(pts[s:e], pts)                      # [c, n]
+        # 排除自身（对角线），取最小的 kk 个
+        d[torch.arange(e - s, device=pts.device), torch.arange(s, e, device=pts.device)] = float("inf")
+        nn = d.topk(kk, dim=1, largest=False).values        # [c, kk]
+        out[s:e] = nn.pow(2).mean(dim=1)
+    dist = torch.sqrt(torch.clamp_min(out, 1e-8))
+    return dist.clamp_min(1e-4).unsqueeze(-1)
+
+
 def _load_images(data_dir: Path, names: list[str], max_side: int | None):
     from PIL import Image
     import torch
@@ -318,9 +359,19 @@ def train(cfg: TrainConfig, ctx) -> dict:
 
     means = torch.nn.Parameter(torch.from_numpy(pts).float().to(device))
     n = means.shape[0]
-    dist = torch.sqrt(torch.sum((means - means.mean(0)) ** 2, dim=1, keepdim=True))
-    dist = torch.clamp(dist, 1e-3, None)
-    scales = torch.nn.Parameter(torch.log(dist * 0.5).repeat(1, 3).to(device))
+
+    # 尺度初始化：官方 3DGS/gsplat 用 **最近邻距离** 的平均平方距离再开方
+    #   dist2 = mean(||p - knn(p)||^2)      # k=3
+    #   scales = log(sqrt(dist2))
+    # 踩坑：原来用的是"到点云质心的距离 × 0.5"。
+    # 对一块平面场景，质心到每个点的距离约等于平面的半径（本例 ~1.0），
+    # 于是初始高斯有半个场景那么大 -> 整幅图被少数几个巨大高斯糊住，
+    # 渲染出来就是一片带颜色的雾。改成最近邻距离后才与官方一致
+    # （可以用 --set train.init_scale_mode=knn|centroid 对照）。
+    init_dist = _init_scales_nn(means.detach(), k=3)
+    scales = torch.nn.Parameter(torch.log(init_dist).repeat(1, 3).to(device))
+    ctx.info(f"初始尺度（最近邻均值）= {float(init_dist.mean()):.5f}，"
+             f"中位数 {float(init_dist.median()):.5f}")
     quats = torch.nn.Parameter(torch.zeros(n, 4, device=device))
     quats.data[:, 0] = 1.0
     opac = torch.nn.Parameter(torch.logit(torch.full((n, 1), 0.1, device=device)))
@@ -410,8 +461,12 @@ def train(cfg: TrainConfig, ctx) -> dict:
         if grad_norm is None:
             return 0, 0
         with torch.no_grad():
-            q = _quantile(grad_norm, 1.0 - cfg.densify_quantile)
-            thr = min(max(q, cfg.densify_grad_threshold), cfg.densify_grad_max)
+            # 默认固定绝对阈值（官方语义）；densify_quantile>0 时才启用分位自适应（实验用）
+            if cfg.densify_quantile > 0:
+                thr = _quantile(grad_norm, 1.0 - cfg.densify_quantile)
+                thr = min(max(thr, cfg.densify_grad_threshold), cfg.densify_grad_max)
+            else:
+                thr = cfg.densify_grad_threshold
             is_grad_high = grad_norm > thr
 
             # 官方语义：按**绝对尺度阈值**（0.01 * scene_scale）区分克隆/分裂。
@@ -434,8 +489,9 @@ def train(cfg: TrainConfig, ctx) -> dict:
             # 裁剪规则一：不透明度过低（官方 prune_opa）
             is_prune = torch.sigmoid(params["opacities"].data).squeeze(-1) < cfg.prune_opacity
             # 裁剪规则二：尺度过大（官方 prune_scale3d）——**这条是防发散的关键，早期漏实现**。
-            # 官方只在 step > reset_every 之后启用，保持一致。
-            use_scale_prune = (not cfg.prune_scale_after_reset) or step > cfg.opacity_reset_interval
+            # 官方在重置周期之后才启用；本项目默认不重置，故以 densify_from 作为门槛
+            # （即"训练进入中段后"才启用尺度裁剪）。
+            use_scale_prune = (not cfg.prune_scale_after_reset) or step > cfg.densify_from
             if use_scale_prune:
                 scales_now = torch.exp(params["scales"].data).max(dim=-1).values
                 is_prune = is_prune | (scales_now > cfg.prune_scale3d * scene_scale)
@@ -868,7 +924,21 @@ def _dump_compare(dump_dir, view_idx: int, render, gt) -> None:
 
 
 def save_ply(path: Path, means, scales, quats, opacities, shs, sh_degree: int) -> Path:
-    """导出标准 3DGS PLY（与官方 inria 格式一致，可被 SuperSplat/three.js 读取）。"""
+    """导出标准 3DGS PLY（与官方 inria 格式一致，可被 SuperSplat/three.js 读取）。
+
+    ⚠️ 关于两个"隐藏的表示约定"，这里踩过坑：
+
+      * **scale_* 存的是 log 尺度**，不是真实尺度。
+        官方 `save_ply` 写的是 `self.scaling`（即 log 尺度），读的时候要 `exp()`。
+        本项目调用方传进来的 `scales` 是 `exp(log_scale)` 之后的**真实尺度**，
+        所以这里必须先取 log 再写；否则读回时会再 exp 一次，
+        误差达 200 倍（实测尺度从 0.005 变成 1.0，渲染成一片糊）。
+
+      * **opacity 存的是 logit**，不是 sigmoid 后的概率。
+        调用方传进来的 `opacities` 已经是 sigmoid 后的值，这里要转回 logit。
+
+    这样才能与官方 inria / SuperSplat / three.js 的 PLY 约定互通。
+    """
     from plyfile import PlyData, PlyElement
     import torch
 
@@ -879,8 +949,9 @@ def save_ply(path: Path, means, scales, quats, opacities, shs, sh_degree: int) -
         f_dc = shs[:, 0, :].detach().cpu().numpy().astype(np.float32)
         sh_dim = (sh_degree + 1) ** 2
         f_rest = shs[:, 1:sh_dim, :].detach().cpu().numpy().transpose(0, 2, 1).reshape(len(xyz), -1).astype(np.float32)
-        op = opacities.detach().cpu().numpy().astype(np.float32)
-        sc = scales.detach().cpu().numpy().astype(np.float32)
+        # 真实尺度 -> log 尺度；概率 -> logit（与官方 PLY 约定对齐）
+        sc = torch.log(torch.clamp(scales.detach(), min=1e-12)).cpu().numpy().astype(np.float32)
+        op = torch.logit(torch.clamp(opacities.detach(), min=1e-6, max=1 - 1e-6)).cpu().numpy().astype(np.float32)
         rot = quats.detach().cpu().numpy().astype(np.float32)
 
     attrs = ["x", "y", "z", "nx", "ny", "nz"]
