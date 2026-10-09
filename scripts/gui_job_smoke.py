@@ -52,7 +52,17 @@ def main() -> int:
         "input_path": args.images,
         "title": "GUI 提交的全链路作业",
         "stages": [s for s in args.stages.split(",") if s],
-        "params": {"mask": {"backend": args.backend, "dilate_px": 2}},
+        # 同时带上"点路径"形式的参数（GUI 的 _flatten_params 就是产出这种），
+        # 以及嵌套形式，验证后端两种都吃得住、且 CLI 侧能同构复现。
+        "params": {
+            "mask": {"backend": args.backend, "dilate_px": 2},
+            "train.densify_until": 4000,
+            "train.mask_loss_until": 1.0,
+            "export.formats": "glb_points,mesh,viewer_html",
+            "export.mesh_method": "poisson",
+            "export.mesh_poisson_depth": 9,
+            "export.mesh_target_triangles": 400000,
+        },
     }
     res = post(base, "/api/run", body)
     run_id, job_id = res["run_id"], res.get("job_id", "")

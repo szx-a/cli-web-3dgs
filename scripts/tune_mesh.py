@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import argparse
-import itertools
 import sys
 from pathlib import Path
 
@@ -34,10 +33,11 @@ def main() -> int:
     ap.add_argument("--views", type=int, default=6)
     ap.add_argument("--size", type=int, default=256)
     ap.add_argument("--max-combos", type=int, default=12)
+    ap.add_argument("--extended", action="store_true",
+                    help="额外扫描法线定向 / 离群点阈值 / KNN")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
-    import open3d as o3d
     import torch
     from gsplat import rasterization
 
@@ -102,22 +102,21 @@ def main() -> int:
     op_np = np.asarray(base["opacity"], dtype=np.float64).reshape(-1)
     normals_all = _gaussian_normals(base, type("C", (), {"info": lambda *a, **k: None})())
 
-    def build(crop_q, dens_q, depth, largest=True):
+    def build(crop_q, dens_q, depth, largest=True, stat_std=2.0, knn=30, orient=True):
         g = base
+        nrm = normals_all
         if crop_q is not None:
             lo, hi, _ = auto_crop_bounds(xyz_np, op_np, quantile=crop_q)
             m = np.all((xyz_np >= lo) & (xyz_np <= hi), axis=1)
             if m.sum() >= 256:
                 g = {k: (v[m] if hasattr(v, "__len__") and len(v) == n else v)
                      for k, v in base.items()}
-        nrm = normals_all
-        if crop_q is not None and nrm is not None:
-            lo, hi, _ = auto_crop_bounds(xyz_np, op_np, quantile=crop_q)
-            m = np.all((xyz_np >= lo) & (xyz_np <= hi), axis=1)
-            nrm = nrm[m]
+                if nrm is not None:
+                    nrm = nrm[m]
         mesh, _ = poisson_mesh(np.asarray(g["xyz"], dtype=np.float64),
                                np.asarray(g["rgb"]), normals=nrm,
-                               depth=depth, density_quantile=dens_q)
+                               depth=depth, density_quantile=dens_q,
+                               statistical_std=stat_std, knn=knn, orient=orient)
         if largest:
             mesh, _ = to_largest_component(mesh)
         return mesh
@@ -128,29 +127,45 @@ def main() -> int:
             B = rasterize_mesh_silhouette(mesh, poses[i][0], Ks, size, size)
             u = int((A | B).sum())
             ious.append(int((A & B).sum()) / u if u else 0.0)
-        return float(np.mean(ious)), float(np.mean([b.sum() for b in
-                    [rasterize_mesh_silhouette(mesh, poses[i][0], Ks, size, size)
-                     for (A, Ks), i in zip(silA, sel)]]))
+        return float(np.mean(ious))
 
-    combos = list(itertools.product([None, 0.90, 0.98], [0.0, 0.03], [8, 9]))
+    # 第一轮：裁剪/密度/泊松层数（上一轮已定位 dens_q=0.0 最佳，这里继续找最优 depth 与 crop）
+    combos = []
+    for crop_q in (None, 0.90, 0.95, 1.00):
+        for depth in (8, 9, 10):
+            combos.append(dict(crop_q=crop_q, dens_q=0.0, depth=depth))
+    # 第二轮（--extended）：法线方向与离群点阈值
+    if args.extended:
+        for stat_std in (1.0, 2.0, 3.5):
+            combos.append(dict(crop_q=0.90, dens_q=0.0, depth=9, stat_std=stat_std))
+        for orient in (True, False):
+            combos.append(dict(crop_q=0.90, dens_q=0.0, depth=9, orient=orient))
+        for knn in (10, 50):
+            combos.append(dict(crop_q=0.90, dens_q=0.0, depth=9, knn=knn))
     combos = combos[: args.max_combos]
-    print(f"\n{'crop_q':>8}{'dens_q':>8}{'depth':>7}{'triangles':>12}{'IOU':>8}")
-    print("-" * 46)
+
+    keys = ("crop_q", "dens_q", "depth", "stat_std", "knn", "orient")
+    print("\n" + "".join(f"{k:>9}" for k in keys) + f"{'triangles':>11}{'IOU':>8}")
+    print("-" * (9 * len(keys) + 19))
     results = []
-    for crop_q, dens_q, depth in combos:
+    for c in combos:
         try:
-            mesh = build(crop_q, dens_q, depth)
-            iou, _ = score(mesh)
-            print(f"{str(crop_q):>8}{dens_q:>8}{depth:>7}{len(mesh.triangles):>12}{iou:>8.3f}")
-            results.append((iou, crop_q, dens_q, depth, len(mesh.triangles)))
+            mesh = build(**c)
+            iou = score(mesh)
+            row = "".join(f"{str(c.get(k, '-')):>9}" for k in keys)
+            print(f"{row}{len(mesh.triangles):>11}{iou:>8.3f}")
+            results.append((iou, dict(c), len(mesh.triangles)))
         except Exception as exc:  # noqa: BLE001
-            print(f"{str(crop_q):>8}{dens_q:>8}{depth:>7}{'FAIL':>12}  {type(exc).__name__}")
+            row = "".join(f"{str(c.get(k, '-')):>9}" for k in keys)
+            print(f"{row}{'FAIL':>11}  {type(exc).__name__}: {str(exc)[:40]}")
     if results:
-        results.sort(reverse=True)
-        iou, cq, dq, dp, tri = results[0]
-        print(f"\n最佳: crop_q={cq} dens_q={dq} depth={dp} -> IoU {iou:.3f}, {tri} 三角形")
-        print(f"建议：--set export.mesh_crop_quantile={cq if cq else ''} "
-              f"--set export.mesh_density_quantile={dq} --set export.mesh_poisson_depth={dp}")
+        results.sort(key=lambda r: -r[0])
+        iou, best, tri = results[0]
+        print(f"\n最佳: {best} -> IoU {iou:.3f}, {tri} 三角形")
+        flags = " ".join(f"--set export.mesh_{k}={v}" for k, v in best.items()
+                         if v is not None and k in ("crop_quantile", "density_quantile",
+                                                    "poisson_depth", "stat_std", "knn", "orient"))
+        print(f"建议参数：{flags}")
     return 0
 
 

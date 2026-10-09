@@ -342,6 +342,149 @@ def filter_depth(depth, alpha, min_alpha: float = 0.5, erode_px: int = 1,
                   "kept_ratio": (n2 / n0) if n0 else 0.0}
 
 
+def backproject_depth_to_points(rendered, c2ws, view_idx, ks, src_wh,
+                                width: int, height: int,
+                                depth_stride: int = 2,
+                                min_alpha: float = 0.5, erode_px: int = 1,
+                                grad_thresh_ratio: float = 0.06,
+                                max_depth_ratio: float = 0.0,
+                                colors_out: bool = True):
+    """把多视角渲染出的深度图**反投影**成"紧贴表面"的稠密点云。
+
+    这是整条网格流水线的**核心步骤**（用户给的社区标准流程第 1 步）：
+    3DGS 的高斯中心是"分布在表面附近的三维体"，直接拿去重建会得到
+    厚壳/鼓包；而深度反投影给出的是**薄薄一层贴在表面上**的点，
+    每个点的法线天然就是"从相机指向表面"的方向。
+
+    过滤：
+      * `min_alpha` 不透明度阈值
+      * `erode_px` 对 alpha 做腐蚀，去掉星芒状漂浮高斯
+      * `grad_thresh_ratio` 剔除与邻域中值深度差异过大的像素（深度跳变）
+      * `depth_stride` 像素采样步长（控制点数，避免几百万点拖慢泊松）
+
+    返回 (points[N,3], colors[N,3], normals[N,3] 或 None, 统计)
+    """
+    import numpy as np
+
+    pts_all, col_all, nrm_all = [], [], []
+    n_used = 0
+    kept = 0
+    total = 0
+    for k, i in enumerate(view_idx):
+        rgb, depth, alpha = rendered[k]
+        valid, _ = filter_depth(depth, alpha, min_alpha=max(min_alpha, 0.5),
+                                erode_px=erode_px,
+                                grad_thresh_ratio=grad_thresh_ratio,
+                                extent=max(float(np.nanmax(depth)), 1e-6))
+        if max_depth_ratio > 0:
+            valid &= depth < max_depth_ratio
+        if not valid.any():
+            continue
+        vs, us = np.nonzero(valid)
+        total += len(vs)
+        if depth_stride > 1:
+            sel = ((vs % depth_stride) == 0) & ((us % depth_stride) == 0)
+            vs, us = vs[sel], us[sel]
+        if len(vs) == 0:
+            continue
+        kept += len(vs)
+
+        Ks = scale_intrinsics(ks[i], src_wh, (width, height))
+        fx, fy, cx, cy = Ks[0, 0], Ks[1, 1], Ks[0, 2], Ks[1, 2]
+        z = depth[vs, us].astype(np.float64)
+        x = (us - cx) / fx * z
+        y = (vs - cy) / fy * z
+        cam_pts = np.stack([x, y, z], axis=1)
+        # 法线（相机系）：单位方向即"相机指向表面"的方向
+        cam_n = cam_pts / np.linalg.norm(cam_pts, axis=1, keepdims=True)
+
+        c2w = np.asarray(c2ws[i], dtype=np.float64)
+        R, t = c2w[:3, :3], c2w[:3, 3]
+        pts_all.append(cam_pts @ R.T + t)
+        nrm_all.append(cam_n @ R.T)
+        if colors_out:
+            col_all.append((rgb[vs, us] * 255.0).astype(np.float64))
+        n_used += 1
+
+    if not pts_all:
+        return np.zeros((0, 3)), np.zeros((0, 3)), None, {"views_used": 0}
+    pts = np.concatenate(pts_all, axis=0)
+    cols = np.concatenate(col_all, axis=0) if col_all else None
+    nrms = np.concatenate(nrm_all, axis=0) if nrm_all else None
+    # 同一表面点会被多个视角重复采到：体素下采样前先去掉完全重合的点
+    return pts, cols, nrms, {"views_used": n_used, "pixels": total, "points": len(pts)}
+
+
+def voxel_downsample(points, colors=None, normals=None, voxel: float = 0.01):
+    """体素下采样：均匀化点密度，防止局部过密让泊松过拟合。
+
+    社区标准流程第 2 步。深度反投影出来的点密度**严重不均**：
+    近处视角每像素一个点、远处几个视角叠加，密度差可达百倍。
+    泊松对密度敏感，所以必须先均匀化。
+
+    这里用 numpy 实现（按体素索引取均值），避免为了一个下采样引入 open3d 依赖。
+    同体素内的点取坐标/颜色/法线的平均。
+    """
+    import numpy as np
+
+    pts = np.asarray(points, dtype=np.float64)
+    if len(pts) == 0 or voxel <= 0:
+        return pts, colors, normals
+    keys = np.floor(pts / float(voxel)).astype(np.int64)
+    # 用唯一化 + 反查分组，比 Python 循环快几个数量级
+    _, inv = np.unique(keys, axis=0, return_inverse=True)
+    cnt = np.bincount(inv).astype(np.float64)
+    out = np.zeros((len(cnt), 3), dtype=np.float64)
+    np.add.at(out, inv, pts)
+    out /= cnt[:, None]
+
+    def _avg(arr):
+        if arr is None:
+            return None
+        a = np.asarray(arr, dtype=np.float64)
+        acc = np.zeros((len(cnt), a.shape[1]), dtype=np.float64)
+        np.add.at(acc, inv, a)
+        return acc / cnt[:, None]
+
+    return out, _avg(colors), _avg(normals)
+
+
+def smooth_mesh(mesh, method: str = "taubin", iterations: int = 5):
+    """网格平滑：去掉 TSDF/泊松产生的阶梯状噪点。
+
+    Taubin（λ/μ）比拉普拉斯好：拉普拉斯会整体收缩体积，
+    Taubin 用一次负向步长抵消收缩，更适合"要保持形状"的重建结果。
+    """
+    try:
+        if method == "taubin":
+            return mesh.filter_smooth_taubin(number_of_iterations=int(iterations))
+        if method == "laplacian":
+            return mesh.filter_smooth_laplacian(number_of_iterations=int(iterations))
+    except Exception:  # noqa: BLE001
+        pass
+    return mesh
+
+
+def simplify_mesh(mesh, target_triangles: int = 0, voxel: float = 0.0):
+    """QEM 二次误差简化：把几百万面降到可用的量级（社区标准流程第 4 步）。
+
+    open3d 用的是 `simplify_quadric_decimation`（QEM），
+    能在大幅减少面数的同时较好保留形状。
+    """
+    n = len(mesh.triangles)
+    if target_triangles and n > target_triangles:
+        try:
+            return mesh.simplify_quadric_decimation(int(target_triangles))
+        except Exception:  # noqa: BLE001
+            pass
+    if voxel and voxel > 0:
+        try:
+            return mesh.simplify_vertex_clustering(float(voxel))
+        except Exception:  # noqa: BLE001
+            pass
+    return mesh
+
+
 def render_mesh_previews(mesh, out_dir, size: int = 512, views=None) -> list[dict]:
     """用 open3d 的离屏渲染器把网格渲成几张预览图。
 
@@ -411,7 +554,7 @@ def render_mesh_previews(mesh, out_dir, size: int = 512, views=None) -> list[dic
 def poisson_mesh(points, colors, normals=None, depth: int = 9,
                  density_quantile: float = 0.0,
                  knn: int = 30, statistical_nb: int = 20, statistical_std: float = 2.0,
-                 orient: bool = True):
+                 orient: bool = True, voxel_downsample_size: float = 0.0):
     """泊松表面重建：直接从高斯点云得到**闭合实体网格**。
 
     为什么需要这条路线（用户提醒后补上）：
@@ -439,13 +582,19 @@ def poisson_mesh(points, colors, normals=None, depth: int = 9,
     if len(pts) < 64:
         raise ValueError(f"点太少（{len(pts)}），无法做泊松重建")
 
+    # 2) 体素下采样（可选）：均匀化密度，防止局部过密让泊松过拟合。
+    #    深度反投影出来的点密度差异很大，这一步在"反投影路线"里很重要。
+    if voxel_downsample_size and voxel_downsample_size > 0:
+        pts, colors, normals = voxel_downsample(pts, colors, normals,
+                                                 voxel=float(voxel_downsample_size))
+
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts)
     if colors is not None:
         c = np.asarray(colors)
-        if c.dtype != np.float64 or c.max() > 1.0:
-            c = c.astype(np.float64) / 255.0
-        pcd.colors = o3d.utility.Vector3dVector(np.clip(c, 0, 1))
+        if c.max() > 1.0:
+            c = c / 255.0
+        pcd.colors = o3d.utility.Vector3dVector(np.clip(c.astype(np.float64), 0, 1))
 
     if normals is not None:
         n = np.asarray(normals, dtype=np.float64)
@@ -454,11 +603,13 @@ def poisson_mesh(points, colors, normals=None, depth: int = 9,
     if not pcd.has_normals():
         pcd.estimate_normals(
             search_param=o3d.geometry.KDTreeSearchParamKNN(knn=knn))
-        if orient:
-            try:
-                pcd.orient_normals_consistent_tangent_plane(k=knn)
-            except Exception:  # noqa: BLE001
-                pass
+    if orient and len(pcd.points) > 0:
+        # 泊松对**法线朝向一致性**极敏感；深度反投影给的法线本来就大致朝外，
+        # 但在凹面/薄壳处仍会翻转，所以再跑一次一致定向。
+        try:
+            pcd.orient_normals_consistent_tangent_plane(k=int(knn))
+        except Exception:  # noqa: BLE001
+            pass
 
     # 1) 统计离群点
     pcd, _ = pcd.remove_statistical_outlier(
@@ -484,57 +635,6 @@ def poisson_mesh(points, colors, normals=None, depth: int = 9,
                   "points_in": int(len(pts)), "points_used": int(len(pcd.points)),
                   "density_thresh": (round(float(np.quantile(dens, density_quantile)), 6)
                                      if dens.size else None)}
-
-
-def mesh_from_training_views(
-    gauss, job_dir: Path, width: int = 512, max_views: int = 80,
-    method: str = "poisson", voxel_div: float = 400.0,
-    auto_crop: bool = True, crop_opacity: float = 0.3, crop_quantile: float = 0.9,
-    min_alpha: float = 0.5, erode_px: int = 1, grad_thresh: float = 0.06,
-    poisson_depth: int = 9, density_quantile: float = 0.03,
-    log=None,
-):
-    """统一的网格提取入口，支持 `poisson` 与 `tsdf` 两种方法。
-
-    返回 (mesh, info)。`job_dir` 用于定位训练时的 COLMAP 相机位姿（TSDF 需要）。
-    """
-    import numpy as np
-
-    def _log(msg: str) -> None:
-        if log:
-            log(msg)
-
-    pts = np.asarray(gauss["xyz"], dtype=np.float64)
-    op = np.asarray(gauss["opacity"], dtype=np.float64).reshape(-1)
-    rgb = np.asarray(gauss["rgb"])
-
-    if method == "poisson":
-        # 3DGS 的朝向信息在旋转四元数里：每个高斯的局部 +z 轴可当法线初值，
-        # 这比纯几何估计更贴合表面（社区也常用这种做法）。
-        normals = None
-        try:
-            q = np.asarray(gauss["quats"], dtype=np.float64)
-            if q.shape[1] == 4 and len(q) == len(pts):
-                # 四元数 (w,x,y,z) -> 旋转矩阵第三列 = 局部 z 轴在世界系的方向
-                w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-                normals = np.stack([
-                    2 * (x * z + w * y),
-                    2 * (y * z - w * x),
-                    1 - 2 * (x * x + y * y),
-                ], axis=1)
-                nrm = np.linalg.norm(normals, axis=1, keepdims=True) + 1e-9
-                normals = normals / nrm
-                _log("使用高斯旋转给出的朝向作为法线初值")
-        except Exception:  # noqa: BLE001
-            normals = None
-        mesh, info = poisson_mesh(pts, rgb, normals=normals, depth=poisson_depth,
-                                  density_quantile=density_quantile)
-        return mesh, info
-
-    # method == "tsdf"
-    from .mesh_export import render_depths, _scene_extent, fuse_tsdf, scale_intrinsics  # noqa: F401
-
-    raise NotImplementedError("TSDF 路线请直接用 ExportStage._export_mesh（它持有相机位姿上下文）")
 
 
 def clean_mesh(mesh, min_tri_ratio: float = 0.002):

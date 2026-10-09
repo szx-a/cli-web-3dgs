@@ -107,10 +107,63 @@
             <input id="p-train-res" type="number" step="100" value="1600">
           </label>
           <label class="grow">高斯上限
-            <input id="p-train-cap" type="number" step="100000" value="1500000">
+            <input id="p-train-cap" type="number" step="100000" value="600000">
           </label>
         </div>
-        <p class="hint">8GB 显存建议：150~250 张图 / 长边 1400~1600 / 迭代 15000~30000。</p>
+        <div class="row">
+          <label class="grow">密度控制窗口上界（densify_until）
+            <input id="p-train-densify" type="number" step="500" value="4000">
+          </label>
+          <label class="grow">掩码内损失占比（mask_loss_until）
+            <input id="p-train-maskloss" type="number" step="0.05" min="0" max="1" value="1.0">
+          </label>
+        </div>
+        <p class="hint">8GB 显存建议：150~250 张图 / 长边 1400~1600 / 迭代 15000~30000。
+          实测：<b>densify_until=4000</b> 比官方默认 15000 更省（高斯少 68%）
+          且不会过训练退化；<b>mask_loss_until=1.0</b>（全程掩码约束）能让模型轮廓更干净、网格更准。</p>
+      </div>
+
+      <div class="card">
+        <h2>3.5 网格导出（可选，产物从"点云"变成"实体"）</h2>
+        <div class="row">
+          <label class="grow">网格提取方法
+            <select id="p-mesh-method">
+              <option value="poisson">poisson（深度反投影 + 泊松，推荐）</option>
+              <option value="tsdf">tsdf（深度图 TSDF 融合）</option>
+            </select>
+          </label>
+          <label class="grow">导出格式（逗号分隔）
+            <input id="p-export-formats" value="glb_points,mesh,viewer_html"
+                   placeholder="glb_points,mesh,spz,obj,viewer_html">
+          </label>
+        </div>
+        <div class="row">
+          <label class="grow">泊松八叉树深度
+            <input id="p-mesh-depth" type="number" step="1" min="6" max="12" value="9">
+          </label>
+          <label class="grow">目标面数（QEM 简化，0=不简化）
+            <input id="p-mesh-tris" type="number" step="50000" value="400000">
+          </label>
+          <label class="grow">平滑迭代（Taubin）
+            <input id="p-mesh-smooth" type="number" step="1" min="0" value="5">
+          </label>
+        </div>
+        <div class="row">
+          <label class="grow">深度渲染分辨率
+            <input id="p-mesh-width" type="number" step="128" value="640">
+          </label>
+          <label class="grow">参与融合的视角上限
+            <input id="p-mesh-views" type="number" step="10" value="80">
+          </label>
+          <label class="grow">密度裁剪分位（0=不裁）
+            <input id="p-mesh-densq" type="number" step="0.005" min="0" value="0">
+          </label>
+        </div>
+        <p class="hint">网格流程：渲染深度 → 按不透明度/深度一致性过滤 → <b>反投影成稠密点云</b>
+          → 体素下采样均匀化 → 泊松重建 → 平滑 → QEM 简化 → obj/ply/<b>网格 glb</b>。
+          <code>mesh</code> 会同时产出 <code>model_mesh.obj / .ply / .glb</code>，
+          网格 glb 可直接拖进 Blender、Unity、three.js 或 Windows「3D 查看器」。
+          实测轮廓 IoU：深度反投影路线 <b>0.65</b>，明显优于直接把高斯中心喂给泊松（0.24，网格只有物体的 1/5 大）。</p>
       </div>
 
       <div class="card">

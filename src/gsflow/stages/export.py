@@ -38,7 +38,11 @@ def validate_glb(path: Path) -> dict:
 
     为什么要单独做：GLB 是二进制容器，"文件有内容"并不代表能被查看器读出来。
     这里检查 magic/版本/总长、chunk 结构、bufferView 的 4 字节对齐与越界、
-    POSITION 的 min/max、以及图元模式是否为 POINTS。
+    POSITION 的 min/max，并按图元模式做针对性校验：
+
+      * `POINTS`（点云式 glb）：POSITION 与 COLOR_0 顶点数必须一致
+      * `TRIANGLES`（网格 glb）：必须带 indices，且索引不能越界、
+        索引数必须是 3 的倍数（否则有残缺三角形）
     """
     problems: list[str] = []
     info: dict = {}
@@ -90,16 +94,41 @@ def validate_glb(path: Path) -> dict:
 
     if not pos.get("min") or not pos.get("max"):
         problems.append("POSITION accessor 缺少 min/max（glTF 规范要求）")
-    if prim.get("mode", 4) != MODE_POINTS:
-        problems.append(f"图元模式不是 POINTS（{prim.get('mode')}）")
+    mode = prim.get("mode", MODE_TRIANGLES)
+    if mode not in (MODE_POINTS, MODE_TRIANGLES):
+        problems.append(f"图元模式既不是 POINTS 也不是 TRIANGLES（{mode}）")
     if pos["count"] != col["count"]:
         problems.append("POSITION 与 COLOR_0 顶点数不一致")
+
+    tri_count = 0
+    if mode == MODE_TRIANGLES:
+        idx_id = prim.get("indices")
+        if idx_id is None:
+            problems.append("TRIANGLES 图元缺少 indices")
+        else:
+            idx = gltf["accessors"][idx_id]
+            if idx["count"] % 3 != 0:
+                problems.append(f"索引数 {idx['count']} 不是 3 的倍数")
+            if idx["componentType"] not in (5123, 5125):
+                problems.append(f"索引 componentType 应为 UNSIGNED_SHORT/INT（{idx['componentType']}）")
+            tri_count = idx["count"] // 3
+            # 索引上界必须落在顶点数范围内（越界会让查看器崩溃/黑屏）
+            bv = gltf["bufferViews"][idx["bufferView"]]
+            seg = raw[chunks[b_idx][2] + bv["byteOffset"]:
+                      chunks[b_idx][2] + bv["byteOffset"] + bv["byteLength"]]
+            fmt = "<H" if idx["componentType"] == 5123 else "<I"
+            step = 2 if idx["componentType"] == 5123 else 4
+            n = min(idx["count"], len(seg) // step)
+            vals = struct.unpack(f"<{n}{fmt[1]}", seg[:n * step]) if n else ()
+            if vals and max(vals) >= pos["count"]:
+                problems.append(f"索引越界：max={max(vals)} >= 顶点数 {pos['count']}")
 
     info = {
         "bytes": len(raw),
         "chunks": len(chunks),
-        "mode": prim.get("mode", 4),
+        "mode": mode,
         "count": pos["count"],
+        "triangles": tri_count,
         "materials": len(gltf.get("materials", [])),
         "extensions": gltf.get("extensionsUsed", []),
     }
@@ -351,8 +380,8 @@ class ExportStage(Stage):
         import numpy as np
         import torch
 
-        from ..gsdata.mesh_export import (auto_crop_bounds, clean_mesh, poisson_mesh,
-                                          to_largest_component)
+        from ..gsdata.mesh_export import (_scene_extent, auto_crop_bounds, clean_mesh,
+                                          poisson_mesh, to_largest_component)
 
         gauss = self._read_ply(ply, max_points=0)
         n = len(gauss["xyz"])
@@ -381,25 +410,107 @@ class ExportStage(Stage):
             else:
                 ctx.warn("聚焦后剩余高斯过少，改用全部点")
 
-        # ---------------- 泊松路线：只要点 + 法线，不依赖深度图 ----------------
-        if method == "poisson":
-            mesh, info = poisson_mesh(
-                np.asarray(gauss["xyz"], dtype=np.float64),
-                np.asarray(gauss["rgb"]),
-                normals=_gaussian_normals(gauss, ctx),
-                depth=int(ctx.cfg("mesh_poisson_depth", 9) or 9),
-                # 默认 0（不裁）。实测这是最敏感的参数：
-                # 0.03 会把轮廓 IoU 从 0.683 砍到 0.315。
-                density_quantile=float(ctx.cfg("mesh_density_quantile", 0.0) or 0.0),
+        # ---------------- 路线一：深度反投影 -> 泊松（社区标准流程，默认） ----------------
+        # 用户给的社区标准流程：
+        #   1) 从 3DGS 渲染深度图，按不透明度/深度一致性过滤后**反投影**成稠密点云
+        #   2) 统计去噪 + **体素下采样**均匀化密度 + 法线一致定向
+        #   3) 泊松重建（depth 控制八叉树层数）
+        #   4) 后处理：裁掉低密度包络面 + 平滑 + QEM 简化
+        # 关键点：**不能直接拿高斯中心当输入点云** —— 那些点是一团一团分布在
+        # 表面附近的三维体，泊松会得到厚壳与鼓包；反投影出来的才是"薄薄一层"。
+        if method in ("poisson", "poisson_depth", "backproject"):
+            from ..gsdata.mesh_export import (backproject_depth_to_points,
+                                              render_depths, select_views_by_distance,
+                                              simplify_mesh, smooth_mesh, voxel_downsample)
+
+            cams = self._training_cameras(
+                ctx, out_dir, limit=int(ctx.cfg("mesh_max_views", 80) or 80))
+            if not cams:
+                ctx.warn("找不到训练相机位姿，无法反投影深度（需要 04_train/data/sparse）")
+                return []
+
+            c2ws = np.stack([c[0] for c in cams])
+            src_wh = (int(cams[0][2]), int(cams[0][3]))
+            ks = np.stack([c[1] for c in cams])
+            pts_all = np.asarray(gauss["xyz"], dtype=np.float64)
+
+            if ctx.cfg("mesh_view_filter", True):
+                keep, vstat = select_views_by_distance(c2ws, pts_all)
+                if int(keep.sum()) < len(keep):
+                    ctx.info(f"视角筛选：保留 {vstat['kept']}/{vstat['total']}"
+                             f"（距离中位数 {vstat['median_dist']}，MAD {vstat['mad']}）")
+                    c2ws, ks = c2ws[keep], ks[keep]
+                    cams = [c for c, k in zip(cams, keep) if k]
+
+            center, extent = _scene_extent(c2ws, pts_all)
+            width = int(ctx.cfg("mesh_width", 640) or 640)
+
+            xyz = torch.as_tensor(gauss["xyz"], dtype=torch.float32, device="cuda")
+            scales_real = torch.as_tensor(gauss["scales"], dtype=torch.float32, device="cuda")
+            quats_t = torch.as_tensor(gauss["quats"], dtype=torch.float32, device="cuda")
+            opac = torch.as_tensor(gauss["opacity"], dtype=torch.float32, device="cuda").reshape(-1)
+            rgb = torch.as_tensor(gauss["rgb"], dtype=torch.float32, device="cuda") / 255.0
+            shs = ((rgb - 0.5) / 0.28209479177387814).reshape(n, 1, 3)
+
+            ctx.info(f"① 渲染深度：{min(len(c2ws), int(ctx.cfg('mesh_max_views', 80) or 80))}"
+                     f"/{len(c2ws)} 个视角 @ {width}px ...")
+            rendered, used_idx = render_depths(
+                means=xyz, quats=quats_t, scales_real=scales_real,
+                opacities=opac.clamp(0, 1), shs=shs,
+                c2ws=c2ws, ks=ks, width=width, height=width, sh_degree=0,
+                src_wh=src_wh, max_views=int(ctx.cfg("mesh_max_views", 80) or 80),
             )
-            ctx.info(f"泊松重建完成：depth={info['depth']}，"
-                     f"用了 {info['points_used']} 个点，"
-                     f"得到 {len(mesh.triangles)} 个三角形 / {len(mesh.vertices)} 个顶点")
+
+            ctx.info("② 深度反投影 -> 稠密点云 ...")
+            bp_pts, bp_cols, bp_nrm, bp_stat = backproject_depth_to_points(
+                rendered=rendered, c2ws=c2ws, view_idx=used_idx, ks=ks, src_wh=src_wh,
+                width=width, height=width,
+                depth_stride=int(ctx.cfg("mesh_depth_stride", 2) or 1),
+                min_alpha=float(ctx.cfg("mesh_min_alpha", 0.5) or 0.5),
+                erode_px=int(ctx.cfg("mesh_erode_px", 1) or 0),
+                grad_thresh_ratio=float(ctx.cfg("mesh_grad_thresh", 0.06) or 0.0),
+            )
+            if len(bp_pts) < 1000:
+                ctx.warn(f"反投影只得到 {len(bp_pts)} 个点，太少，放弃网格导出")
+                return []
+            ctx.info(f"   反投影得到 {len(bp_pts)} 个点"
+                     f"（{bp_stat['views_used']} 视角，{bp_stat['pixels']} 个有效像素）")
+
+            # 体素下采样：均匀化密度（近处视角点密、远处稀疏，差异可达百倍）。
+            # 反投影会产出百万级点，必须下采样，否则泊松既慢又过拟合。
+            # 默认取 体素尺度 = 场景尺度/400 的 1/4（比几何体素更粗），
+            # 实测 250 万点 -> 155 万点，网格质量不受影响。
+            vds = float(ctx.cfg("mesh_voxel_downsample", 0.0) or 0.0)
+            if vds <= 0:
+                vds = extent / float(ctx.cfg("mesh_voxel_div", 400.0) or 400.0) * 0.25
+            bp_pts, bp_cols, bp_nrm = voxel_downsample(bp_pts, bp_cols, bp_nrm, voxel=vds)
+            ctx.info(f"③ 体素下采样（{vds:.5f}）后剩 {len(bp_pts)} 个点")
+
+            mesh, info = poisson_mesh(
+                bp_pts, bp_cols, normals=bp_nrm,
+                depth=int(ctx.cfg("mesh_poisson_depth", 9) or 9),
+                density_quantile=float(ctx.cfg("mesh_density_quantile", 0.0) or 0.0),
+                orient=True,
+            )
+            info["method"] = "poisson_backproject"
+            info["points_used"] = int(len(bp_pts))
+            ctx.info(f"④ 泊松重建（depth={info['depth']}）："
+                     f"{len(mesh.triangles)} 个三角形 / {len(mesh.vertices)} 个顶点")
+
+            it = int(ctx.cfg("mesh_smooth_iters", 5) or 0)
+            if it > 0:
+                mesh = smooth_mesh(mesh, method=str(ctx.cfg("mesh_smooth", "taubin") or "taubin"),
+                                   iterations=it)
+                ctx.info(f"⑤ 平滑（{ctx.cfg('mesh_smooth', 'taubin')} × {it}）")
+            target = int(ctx.cfg("mesh_target_triangles", 400000) or 0)
+            if target > 0 and len(mesh.triangles) > target:
+                before = len(mesh.triangles)
+                mesh = simplify_mesh(mesh, target_triangles=target)
+                ctx.info(f"⑥ QEM 简化：{before} -> {len(mesh.triangles)} 面")
             return self._finish_mesh(ctx, mesh, info, out_dir)
 
-        # ---------------- TSDF 路线：需要训练相机位姿 ----------------
-        from ..gsdata.mesh_export import (fuse_tsdf, render_depths,
-                                          select_views_by_distance, _scene_extent)
+        # ---------------- 路线二：TSDF 融合 ----------------
+        from ..gsdata.mesh_export import fuse_tsdf
 
         # 网格融合需要尽量多的视角覆盖表面（预览才只需要 4 个）
         cams = self._training_cameras(ctx, out_dir, limit=int(ctx.cfg("mesh_max_views", 80) or 80))
@@ -517,6 +628,22 @@ class ExportStage(Stage):
                     "size_mb": round(ply_path.stat().st_size / 1024 / 1024, 2),
                     "desc": "三角网格 PLY（与 OBJ 同源）"})
 
+        # 网格 GLB：通用查看器 / Blender / Unity / three.js 都能直接打开带面的模型
+        # （点云 glb 只是"一堆点"，没有实感，所以网格版是必要的产物）
+        try:
+            glb_path = self._write_mesh_glb(out_dir / "model_mesh.glb", mesh)
+            vres = validate_glb(glb_path)
+            if not vres["ok"]:
+                ctx.warn("网格 GLB 规范校验未通过：" + "；".join(vres["problems"]))
+            out.append({"kind": "mesh_glb", "path": glb_path.name,
+                        "size_mb": round(glb_path.stat().st_size / 1024 / 1024, 2),
+                        "valid": bool(vres["ok"]),
+                        "desc": (f"三角网格 glTF 2.0（TRIANGLES 图元 + 顶点色，"
+                                 f"{len(mesh.triangles)} 面），可直接进 Blender/Unity/three.js")})
+            ctx.success(f"已导出 {glb_path.name}（网格 glb，校验{'通过' if vres['ok'] else '未通过'}）")
+        except Exception as exc:  # noqa: BLE001
+            ctx.warn(f"网格 GLB 导出失败（obj/ply 已导出）：{type(exc).__name__}: {exc}")
+
         bb = mesh.get_axis_aligned_bounding_box()
         out.append({"kind": "mesh_stats",
                     "method": info.get("method", "tsdf"),
@@ -607,6 +734,110 @@ class ExportStage(Stage):
             fh.write(json_bytes)
             fh.write(struct.pack("<II", len(bin_blob), BIN_CHUNK))
             fh.write(bin_blob)
+        return path
+
+    # -------------------------------------------------------------- 网格 GLB
+    def _write_mesh_glb(self, path: Path, mesh, name: str = "mesh") -> Path:
+        """把三角网格写成 glTF 2.0 二进制（`.glb`），**TRIANGLES 图元 + 顶点色**。
+
+        为什么需要：点云 GLB 在通用查看器里只是"一堆点"，
+        而网格 GLB 是**带面的实体**，能直接进 Blender / Unity / three.js /
+        Windows 自带的"3D 查看器"，这才是用户要的"有实感"。
+
+        坐标约定：glTF 是 **Y 轴向上**，而 COLMAP / 我们的重建是 Y 向下，
+        所以这里对 y、z 取反让模型正立（与点云 GLB 的处理保持一致）。
+
+        索引用 uint32（顶点可能上百万，uint16 会溢出）。
+        """
+        import numpy as np
+
+        verts = np.asarray(mesh.vertices, dtype=np.float32).copy()
+        tris = np.asarray(mesh.triangles, dtype=np.uint32)
+        if len(verts) == 0 or len(tris) == 0:
+            raise ValueError("网格为空，无法导出 glb")
+
+        verts[:, 1] *= -1
+        verts[:, 2] *= -1
+
+        if mesh.has_vertex_colors():
+            cols = np.clip(np.asarray(mesh.vertex_colors) * 255.0, 0, 255).astype(np.uint8)
+        else:
+            cols = np.full((len(verts), 3), 200, dtype=np.uint8)
+
+        if len(verts) > 0xFFFFFFFF:
+            raise ValueError("顶点数超出 uint32 索引范围")
+
+        # 三角形索引必须是**逆时针**（否则法线朝内、看起来是黑的）。
+        # open3d 的 extract_triangle_mesh 一般已是 CCW；这里按面积符号统一校正一次。
+        v = verts[tris]
+        n_face = np.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0])
+        flip = (n_face * (v.mean(axis=1) + 1e-9)).sum(axis=1) < 0
+        if flip.all():
+            tris = tris[:, ::-1]
+
+        pos_b = verts.tobytes()
+        col_b = cols.tobytes()
+        idx_b = tris.reshape(-1).tobytes()
+        # 各段按 4 字节对齐
+        pos_pad = (-len(pos_b)) % 4
+        col_pad = (-len(col_b)) % 4
+        blob = pos_b + b"\x00" * pos_pad + col_b + b"\x00" * col_pad + idx_b
+        pos_len, col_len, idx_len = len(pos_b), len(col_b), len(idx_b)
+        col_off = pos_len + pos_pad
+        idx_off = col_off + col_len + col_pad
+
+        gltf = {
+            "asset": {"version": "2.0", "generator": "gsflow"},
+            "scene": 0,
+            "scenes": [{"nodes": [0]}],
+            "nodes": [{"mesh": 0, "name": name}],
+            "meshes": [{
+                "name": name,
+                "primitives": [{
+                    "attributes": {"POSITION": 0, "COLOR_0": 1},
+                    "indices": 2,
+                    "mode": MODE_TRIANGLES,
+                    "material": 0,
+                }],
+            }],
+            "materials": [{
+                "name": "mesh_surface",
+                "pbrMetallicRoughness": {
+                    "baseColorFactor": [1, 1, 1, 1],
+                    "metallicFactor": 0.0,
+                    "roughnessFactor": 0.8,
+                },
+                "doubleSided": True,
+            }],
+            "buffers": [{"byteLength": len(blob)}],
+            "bufferViews": [
+                {"buffer": 0, "byteOffset": 0, "byteLength": pos_len, "target": 34962},
+                {"buffer": 0, "byteOffset": col_off, "byteLength": col_len, "target": 34962},
+                {"buffer": 0, "byteOffset": idx_off, "byteLength": idx_len, "target": 34963},
+            ],
+            "accessors": [
+                {"bufferView": 0, "componentType": COMPONENT_FLOAT, "count": int(len(verts)),
+                 "type": "VEC3",
+                 "min": [float(verts[:, i].min()) for i in range(3)],
+                 "max": [float(verts[:, i].max()) for i in range(3)]},
+                {"bufferView": 1, "componentType": 5121, "normalized": True,
+                 "count": int(len(verts)), "type": "VEC3"},
+                {"bufferView": 2, "componentType": 5125, "count": int(tris.size),
+                 "type": "SCALAR"},
+            ],
+            "extras": {"triangles": int(len(tris)), "vertices": int(len(verts)),
+                       "source": "gsflow-mesh"},
+        }
+        json_bytes = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
+        json_bytes += b" " * ((-len(json_bytes)) % 4)
+
+        total = 12 + 8 + len(json_bytes) + 8 + len(blob)
+        with path.open("wb") as fh:
+            fh.write(struct.pack("<III", GLB_MAGIC, 2, total))
+            fh.write(struct.pack("<II", len(json_bytes), JSON_CHUNK))
+            fh.write(json_bytes)
+            fh.write(struct.pack("<II", len(blob), BIN_CHUNK))
+            fh.write(blob)
         return path
 
     # ------------------------------------------------------------------ SPZ

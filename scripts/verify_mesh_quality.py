@@ -73,6 +73,52 @@ def rasterize_mesh_silhouette(mesh, c2w, K, w, h):
     return mask
 
 
+def render_mesh_depth(mesh, c2w, K, w, h):
+    """把网格光栅化成深度图（z-buffer）。返回 depth[H,W]，0 表示无几何。"""
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    tris = np.asarray(mesh.triangles, dtype=np.int64)
+    if len(tris) == 0:
+        return np.zeros((h, w), dtype=np.float64)
+    w2c = np.linalg.inv(np.asarray(c2w, dtype=np.float64))
+    vc = (w2c[:3, :3] @ verts.T).T + w2c[:3, 3]
+    proj = (np.asarray(K, dtype=np.float64) @ vc.T).T
+    with np.errstate(divide="ignore", invalid="ignore"):
+        uv = proj[:, :2] / proj[:, 2:3]
+    depth = np.zeros((h, w), dtype=np.float64)
+    for t in tris:
+        z = vc[t, 2]
+        if not np.all(z > 1e-6):
+            continue
+        p = uv[t]
+        if not np.all(np.isfinite(p)):
+            continue
+        x0, y0 = max(int(np.floor(p[:, 0].min())), 0), max(int(np.floor(p[:, 1].min())), 0)
+        x1, y1 = min(int(np.ceil(p[:, 0].max())), w - 1), min(int(np.ceil(p[:, 1].max())), h - 1)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        xs, ys = np.meshgrid(np.arange(x0, x1 + 1), np.arange(y0, y1 + 1))
+        pts = np.stack([xs.ravel(), ys.ravel()], axis=1).astype(np.float64) + 0.5
+        a, b, c = p[0], p[1], p[2]
+        v0, v1 = b - a, c - a
+        den = v0[0] * v1[1] - v1[0] * v0[1]
+        if abs(den) < 1e-12:
+            continue
+        v2 = pts - a
+        u = (v2[:, 0] * v1[1] - v1[0] * v2[:, 1]) / den
+        v = (v0[0] * v2[:, 1] - v2[:, 0] * v0[1]) / den
+        inside = (u >= 0) & (v >= 0) & (u + v <= 1)
+        if not inside.any():
+            continue
+        w0, w1, w2 = 1 - u - v, u, v
+        zz = w0 * z[0] + w1 * z[1] + w2 * z[2]
+        px, py = pts[inside][:, 0].astype(int), pts[inside][:, 1].astype(int)
+        zi = zz[inside]
+        cur = depth[py, px]
+        upd = (cur == 0) | (zi < cur)
+        depth[py[upd], px[upd]] = zi[upd]
+    return depth
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--job", required=True)
@@ -129,9 +175,10 @@ def main() -> int:
 
     size = args.size
     step = max(1, len(poses) // args.views)
-    print(f"\n{'view':>6}{'silhouette A':>14}{'silhouette B':>14}{'IoU':>8}")
-    print("-" * 44)
+    print(f"\n{'view':>6}{'silhouette A':>14}{'silhouette B':>14}{'IoU':>8}{'depth err':>11}")
+    print("-" * 56)
     ious = []
+    rels = []
     for i in range(0, len(poses), step):
         c2w, K, cw, ch = poses[i]
         sx, sy = size / cw, size / ch
@@ -141,24 +188,45 @@ def main() -> int:
         Ks[0, 2] *= sx
         Ks[1, 2] *= sy
         with torch.no_grad():
-            _, alphas, _ = rasterization(
+            # RGB+ED -> 同时拿到 alpha 与**期望深度**（用于深度一致性比对）
+            cols, alphas, _ = rasterization(
                 means=xyz, quats=quats, scales=scales_real,
                 opacities=opac.clamp(0, 1), colors=shs,
                 viewmats=torch.linalg.inv(torch.as_tensor(c2w, dtype=torch.float32,
                                                           device="cuda"))[None],
                 Ks=torch.as_tensor(Ks, dtype=torch.float32, device="cuda")[None],
-                width=size, height=size, sh_degree=0, packed=False, render_mode="RGB",
+                width=size, height=size, sh_degree=0, packed=False, render_mode="RGB+ED",
             )
+        img = cols[0].cpu().numpy()
         A = (alphas[0].cpu().numpy().reshape(size, size) > 0.5)
+        dg = img[..., 3].astype(np.float64)
+        dg = np.where(A, dg, 0.0)
         B = rasterize_mesh_silhouette(mesh, c2w, Ks, size, size)
         inter = int((A & B).sum())
         union = int((A | B).sum())
         iou = inter / union if union else 0.0
         ious.append(iou)
-        print(f"{i:>6}{int(A.sum()):>14}{int(B.sum()):>14}{iou:>8.3f}")
+
+        # 深度一致性：把网格也渲成深度图，与高斯渲染的期望深度比相对误差。
+        # 轮廓 IoU 只衡量"形状覆盖"，看不出表面是否贴合；
+        # 深度误差能直接反映"网格表面与模型表面差多少"。
+        dm = render_mesh_depth(mesh, c2w, Ks, size, size)
+        m = (dm > 0) & (dg > 0) & A & B
+        rel_med = float("nan")
+        if m.sum() > 100:
+            rel = np.abs(dm[m] - dg[m]) / np.maximum(dg[m], 1e-6)
+            rel_med = float(np.median(rel))
+            rels.append(rel)
+        tag = f"{rel_med*100:>10.2f}%" if rel_med == rel_med else f"{'--':>11}"
+        print(f"{i:>6}{int(A.sum()):>14}{int(B.sum()):>14}{iou:>8.3f}{tag}")
 
     print(f"\n平均轮廓 IoU = {np.mean(ious):.3f}")
     print("（IoU > 0.7 说明网格在几何上基本覆盖了物体；接近 0 说明网格和模型对不上）")
+    if rels:
+        allrel = np.concatenate(rels)
+        print(f"深度相对误差：中位数 {np.median(allrel)*100:.2f}%，"
+              f"均值 {allrel.mean()*100:.2f}%，p90 {np.quantile(allrel,0.9)*100:.2f}%")
+        print("（中位数 < 2% 说明网格表面与模型表面贴合良好）")
     return 0
 
 

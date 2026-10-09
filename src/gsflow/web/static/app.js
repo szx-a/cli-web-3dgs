@@ -77,6 +77,18 @@ function collectParams() {
   put('train.iterations', $('p-train-iters').value);
   put('train.resolution', $('p-train-res').value);
   put('train.cap_max', $('p-train-cap').value);
+  // 实测校准过的两个训练参数（见 docs/03 G13/G17）
+  put('train.densify_until', $('p-train-densify').value);
+  put('train.mask_loss_until', $('p-train-maskloss').value);
+  // 网格导出
+  put('export.formats', $('p-export-formats').value.trim());
+  put('export.mesh_method', $('p-mesh-method').value);
+  put('export.mesh_poisson_depth', $('p-mesh-depth').value);
+  put('export.mesh_target_triangles', $('p-mesh-tris').value);
+  put('export.mesh_smooth_iters', $('p-mesh-smooth').value);
+  put('export.mesh_width', $('p-mesh-width').value);
+  put('export.mesh_max_views', $('p-mesh-views').value);
+  put('export.mesh_density_quantile', $('p-mesh-densq').value);
   return p;
 }
 
@@ -275,9 +287,21 @@ const CONFIG_KEYS = [
   ['train.iterations', '迭代次数'],
   ['train.resolution', '训练分辨率'],
   ['train.cap_max', '高斯上限'],
+  ['train.densify_until', '密度控制窗口上界'],
+  ['train.densify_from', '密度控制起始步'],
+  ['train.mask_loss_until', '掩码内损失占比'],
   ['train.eval', '启用评估'],
   ['export.formats', '导出格式'],
   ['export.glb_max_points', 'GLB 点数上限'],
+  ['export.mesh_method', '网格提取方法'],
+  ['export.mesh_poisson_depth', '泊松八叉树深度'],
+  ['export.mesh_target_triangles', '网格目标面数'],
+  ['export.mesh_smooth_iters', '网格平滑迭代'],
+  ['export.mesh_width', '深度渲染分辨率'],
+  ['export.mesh_max_views', '融合视角上限'],
+  ['export.mesh_density_quantile', '网格密度裁剪分位'],
+  ['export.mesh_voxel_div', '网格体素细分'],
+  ['export.mesh_min_alpha', '网格最小不透明度'],
   ['runtime.max_parallel_jobs', '并发作业数'],
 ];
 
@@ -367,7 +391,10 @@ $('btn-reload-config').onclick = loadConfig;
 $('btn-reset-config').onclick = async () => { await api('/api/config/reset', { method: 'POST' }); loadConfig(); };
 ['in-path', 'in-title', 'in-jobid', 'in-force', 'p-mask-backend', 'p-mask-mode', 'p-mask-prompt',
   'p-frames-fps', 'p-frames-long', 'p-colmap-matcher', 'p-train-backend', 'p-train-iters',
-  'p-train-res', 'p-train-cap'].forEach((id) => { const el = $(id); if (el) el.addEventListener('input', updateCliPreview); });
+  'p-train-res', 'p-train-cap', 'p-train-densify', 'p-train-maskloss',
+  'p-export-formats', 'p-mesh-method', 'p-mesh-depth', 'p-mesh-tris', 'p-mesh-smooth',
+  'p-mesh-width', 'p-mesh-views', 'p-mesh-densq',
+].forEach((id) => { const el = $(id); if (el) el.addEventListener('input', updateCliPreview); });
 
 /* ------------------------------------------------------------------ 启动 */
 (async function boot() {
