@@ -106,6 +106,39 @@ def validate_glb(path: Path) -> dict:
     return {"ok": not problems, "problems": problems, "info": info}
 
 
+def _gaussian_normals(gauss: dict, ctx) -> object:
+    """从高斯的旋转四元数取出"局部 +z 轴在世界系的方向"，当作法线初值。
+
+    为什么比纯几何估计好：3DGS 训练时会把高斯压扁并**对齐表面**
+    （这正是它能重建几何的原因），所以旋转分量里就带着表面朝向信息。
+    在薄壳 / 纹理弱的物体上，这比 `estimate_normals` 的 PCA 估计稳得多，
+    而泊松重建的质量**几乎完全取决于法线朝向是否正确**。
+
+    返回 None 表示拿不到（调用方会退回几何估计）。
+    """
+    try:
+        import numpy as np
+
+        q = np.asarray(gauss["quats"], dtype=np.float64)
+        pts = np.asarray(gauss["xyz"])
+        if q.ndim != 2 or q.shape[1] != 4 or len(q) != len(pts):
+            return None
+        w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+        # 四元数 (w,x,y,z) 对应旋转矩阵的第三列
+        n = np.stack([
+            2 * (x * z + w * y),
+            2 * (y * z - w * x),
+            1 - 2 * (x * x + y * y),
+        ], axis=1)
+        nrm = np.linalg.norm(n, axis=1, keepdims=True)
+        if not np.all(np.isfinite(nrm)) or float(nrm.min()) < 1e-9:
+            return None
+        ctx.info("法线初值取自高斯旋转（局部 +z 轴）")
+        return n / nrm
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class ExportStage(Stage):
     name = "export"
     title = "⑤ 导出与预览"
@@ -318,12 +351,53 @@ class ExportStage(Stage):
         import numpy as np
         import torch
 
-        from ..gsdata.mesh_export import (clean_mesh, fuse_tsdf, render_depths,
-                                          to_largest_component, _scene_extent)
+        from ..gsdata.mesh_export import (auto_crop_bounds, clean_mesh, poisson_mesh,
+                                          to_largest_component)
 
         gauss = self._read_ply(ply, max_points=0)
         n = len(gauss["xyz"])
-        ctx.info(f"网格导出：读取 {n} 个高斯，准备渲染深度 ...")
+        method = str(ctx.cfg("mesh_method", "poisson") or "poisson").lower()
+        ctx.info(f"网格导出：方法={method}，读取 {n} 个高斯")
+
+        # 先把网格提取聚焦到"主体"上：COLMAP 会把桌面/背景杂物也重建出来。
+        # 泊松对远处杂点比 TSDF 更敏感（会生成巨大的"鼓包"），所以默认裁得更紧。
+        xyz_np = np.asarray(gauss["xyz"], dtype=np.float64)
+        op_np = np.asarray(gauss["opacity"], dtype=np.float64).reshape(-1)
+        default_q = 0.90 if method == "poisson" else 0.98
+        if ctx.cfg("mesh_auto_crop", True):
+            lo, hi, cinfo = auto_crop_bounds(
+                xyz_np, op_np,
+                op_thresh=float(ctx.cfg("mesh_crop_opacity", 0.3) or 0.3),
+                quantile=float(ctx.cfg("mesh_crop_quantile", default_q) or default_q),
+            )
+            inside = np.all((xyz_np >= lo) & (xyz_np <= hi), axis=1)
+            if int(inside.sum()) >= 256:
+                ctx.info(f"网格聚焦：保留 {int(inside.sum())}/{n} 个高斯"
+                         f"（裁剪框尺寸 {np.round(hi - lo, 3).tolist()}）")
+                gauss = {k: (v[inside] if hasattr(v, "__len__") and len(v) == n else v)
+                         for k, v in gauss.items()}
+                xyz_np, op_np = xyz_np[inside], op_np[inside]
+                n = len(gauss["xyz"])
+            else:
+                ctx.warn("聚焦后剩余高斯过少，改用全部点")
+
+        # ---------------- 泊松路线：只要点 + 法线，不依赖深度图 ----------------
+        if method == "poisson":
+            mesh, info = poisson_mesh(
+                np.asarray(gauss["xyz"], dtype=np.float64),
+                np.asarray(gauss["rgb"]),
+                normals=_gaussian_normals(gauss, ctx),
+                depth=int(ctx.cfg("mesh_poisson_depth", 9) or 9),
+                density_quantile=float(ctx.cfg("mesh_density_quantile", 0.03) or 0.0),
+            )
+            ctx.info(f"泊松重建完成：depth={info['depth']}，"
+                     f"用了 {info['points_used']} 个点，"
+                     f"得到 {len(mesh.triangles)} 个三角形 / {len(mesh.vertices)} 个顶点")
+            return self._finish_mesh(ctx, mesh, info, out_dir)
+
+        # ---------------- TSDF 路线：需要训练相机位姿 ----------------
+        from ..gsdata.mesh_export import (fuse_tsdf, render_depths,
+                                          select_views_by_distance, _scene_extent)
 
         # 网格融合需要尽量多的视角覆盖表面（预览才只需要 4 个）
         cams = self._training_cameras(ctx, out_dir, limit=int(ctx.cfg("mesh_max_views", 80) or 80))
@@ -336,6 +410,16 @@ class ExportStage(Stage):
         src_wh = (int(cams[0][2]), int(cams[0][3]))
         ks = np.stack([c[1] for c in cams])
         pts = np.asarray(gauss["xyz"], dtype=np.float64)
+
+        # 剔除距离异常的视角（贴太近 / 拉太远），否则场景尺度被放大、TSDF 全部失配
+        if ctx.cfg("mesh_view_filter", True):
+            keep, vstat = select_views_by_distance(c2ws, pts)
+            if int(keep.sum()) < len(keep):
+                ctx.info(f"视角筛选：保留 {vstat['kept']}/{vstat['total']}"
+                         f"（距离中位数 {vstat['median_dist']}，MAD {vstat['mad']}）")
+                c2ws, ks = c2ws[keep], ks[keep]
+                cams = [c for c, k in zip(cams, keep) if k]
+
         center, extent = _scene_extent(c2ws, pts)
         ctx.info(f"场景中心 {np.round(center, 3).tolist()}；尺度 {extent:.3f}")
 
@@ -372,9 +456,12 @@ class ExportStage(Stage):
             ks=ks, width=width, height=height, src_wh=src_wh,
             center=center, extent=extent,
             voxel_size=extent / max(voxel_div, 32.0), min_alpha=min_alpha,
+            # floater 抑制参数（详见 mesh_export.filter_depth 的注释）
+            erode_px=int(ctx.cfg("mesh_erode_px", 1) or 0),
+            grad_thresh_ratio=float(ctx.cfg("mesh_grad_thresh", 0.06) or 0.0),
         )
         ctx.info(f"融合完成：用了 {info['views_used']} 个视角，体素 {info['voxel']:.5f}"
-                 f"（设备 {info['device']}），"
+                 f"（设备 {info['device']}），深度过滤保留率 {info['filter_keep_ratio']*100:.1f}%，"
                  f"得到 {len(mesh.triangles)} 个三角形 / {len(mesh.vertices)} 个顶点")
 
         removed = 0
@@ -389,31 +476,71 @@ class ExportStage(Stage):
                      "或体素过大。可试 --set export.mesh_voxel_div=800")
             return []
 
-        out: list[dict] = []
-        obj_path = out_dir / "model_mesh.obj"
+        return self._finish_mesh(ctx, mesh, info, out_dir)
+
+    def _finish_mesh(self, ctx: StageContext, mesh, info: dict, out_dir: Path) -> list[dict]:
+        """网格后处理与落盘：去离群 -> 写 obj/ply -> 预览 -> 统计。"""
+        import numpy as np
         import open3d as o3d
 
+        from ..gsdata.mesh_export import clean_mesh, to_largest_component
+
+        largest_only = ctx.cfg("mesh_largest_only", True)
+        if isinstance(largest_only, str):
+            largest_only = largest_only.strip().lower() in ("1", "true", "yes", "on")
+        removed = 0
+        if largest_only:
+            mesh, removed = to_largest_component(mesh)
+            ctx.info(f"只保留最大连通块，去掉 {removed} 个三角形")
+        else:
+            mesh, removed = clean_mesh(mesh)
+
+        if len(mesh.triangles) == 0:
+            ctx.warn("网格后处理后为空，放弃导出")
+            return []
+
+        out: list[dict] = []
+        obj_path = out_dir / "model_mesh.obj"
         o3d.io.write_triangle_mesh(str(obj_path), mesh, write_vertex_colors=True)
         out.append({"kind": "mesh_obj", "path": obj_path.name,
                     "size_mb": round(obj_path.stat().st_size / 1024 / 1024, 2),
                     "desc": (f"三角网格 OBJ（{len(mesh.triangles)} 面，"
-                             f"TSDF 融合，{info['views_used']} 视角）")})
+                             f"{info.get('method', 'mesh')}，"
+                             f"{info.get('views_used', info.get('points_used', 0))} 输入）")})
         ctx.success(f"已导出 {obj_path.name}（{len(mesh.triangles)} 个三角形）")
 
-        # 附带一份网格 PLY：很多工具链（MeshLab / CloudCompare）读它比 obj 稳
         ply_path = out_dir / "model_mesh.ply"
         o3d.io.write_triangle_mesh(str(ply_path), mesh, write_vertex_colors=True)
         out.append({"kind": "mesh_ply", "path": ply_path.name,
                     "size_mb": round(ply_path.stat().st_size / 1024 / 1024, 2),
                     "desc": "三角网格 PLY（与 OBJ 同源）"})
 
-        # 网格统计写进 manifest，便于判断质量
         bb = mesh.get_axis_aligned_bounding_box()
         out.append({"kind": "mesh_stats",
+                    "method": info.get("method", "tsdf"),
                     "triangles": len(mesh.triangles), "vertices": len(mesh.vertices),
                     "bbox_extent": [round(float(v), 4) for v in bb.get_extent()],
-                    "views_used": info["views_used"], "voxel": round(info["voxel"], 5),
+                    "watertight": bool(mesh.is_edge_manifold()),
+                    "views_used": info.get("views_used"),
+                    "points_used": info.get("points_used"),
+                    "voxel": (round(info["voxel"], 5) if "voxel" in info else None),
                     "desc": "网格统计（供质量判断）"})
+
+        # 网格预览：否则用户拿到 obj 无从判断好坏（要开 Blender 才知道）
+        try:
+            from ..gsdata.mesh_export import render_mesh_previews
+
+            prevs = render_mesh_previews(mesh, out_dir,
+                                         size=int(ctx.cfg("mesh_preview_size", 512) or 512))
+            if prevs:
+                out.extend(prevs)
+                ctx.info(f"已生成 {len(prevs)} 张网格预览图（离屏渲染）")
+            else:
+                ctx.warn("网格预览渲染返回空白图（本机 Filament 离屏渲染在无窗口环境不可用），"
+                         "已跳过。网格文件本身正常，可用 Blender/MeshLab 打开查看；"
+                         "质量可用 manifest 里的 mesh_stats 判断。")
+        except Exception as exc:  # noqa: BLE001
+            ctx.warn(f"网格预览渲染失败（网格本身已导出）：{type(exc).__name__}: {exc}")
         return out
 
     # ------------------------------------------------------------------ GLB
