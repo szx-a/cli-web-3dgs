@@ -15,18 +15,18 @@
   },
   "memory": {
     "total_gb": 15.2,
-    "available_gb": 3.3,
-    "load_percent": 78.0
+    "available_gb": 3.1,
+    "load_percent": 79.0
   },
   "gpu": {
     "available": true,
-    "nvidia_smi": "C:\\Windows\\system32\\nvidia-smi.EXE",
+    "nvidia_smi": ".\\nvidia-smi.EXE",
     "gpus": [
       {
         "name": "NVIDIA GeForce RTX 5060 Laptop GPU",
         "driver": "573.22",
         "vram_total_mb": 8151.0,
-        "vram_used_mb": 1099.0,
+        "vram_used_mb": 644.0,
         "compute_cap": "12.0"
       }
     ]
@@ -57,7 +57,7 @@
     {
       "drive": "C:",
       "total_gb": 384.1,
-      "free_gb": 181.9
+      "free_gb": 185.4
     },
     {
       "drive": "D:",
@@ -67,7 +67,7 @@
     {
       "drive": "F:",
       "total_gb": 146.5,
-      "free_gb": 116.2
+      "free_gb": 115.9
     }
   ],
   "tools": [
@@ -184,7 +184,7 @@
     "download_pytorch_org_reachable": true,
     "huggingface_co_reachable": false,
     "hf-mirror_com_reachable": true,
-    "github_com_reachable": true,
+    "github_com_reachable": false,
     "huggingface_reachable": false
   },
   "paths": {

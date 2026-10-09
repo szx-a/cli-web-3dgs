@@ -11,6 +11,9 @@ from typing import Any
 from ..config import Settings
 from ..events import EventBus
 
+# 哨兵：用于区分"配置里没有这个键"与"配置值本身是 None"
+_MISSING = object()
+
 
 @dataclass
 class StageContext:
@@ -65,11 +68,32 @@ class StageContext:
 
     # --- 配置读取（阶段参数 > 全局配置） ---
     def cfg(self, key: str, default: Any = None) -> Any:
+        """读配置，优先级：job 的阶段参数 > job 的点路径参数 > config.toml（按阶段）> default。
+
+        踩坑：原来的回退是 `settings.get(key)`，而 config.toml 是**嵌套**的
+        （`[train] iterations = ...` -> 点路径 `train.iterations`）。
+        于是阶段里写 `ctx.cfg("iterations", 30000)` 永远取不到配置，静默用默认值
+        —— 整个 `[train]` 段（迭代数、分辨率、密度控制参数）实际上从未生效过，
+        而且完全不报错。这里改成先按当前阶段拼点路径再回退。
+
+        两种写法都支持：
+          * `ctx.cfg("iterations")`   -> 依次尝试 `train.iterations`、`iterations`
+          * `ctx.cfg("init.min_size")`-> 点路径直接生效（不拼阶段前缀）
+        """
         stage = self._stage
         if stage and "." not in key:
+            # 1) job 里的阶段参数字典，如 --set-json train='{"iterations":600}'
             stage_params = self.params.get(stage)
             if isinstance(stage_params, dict) and key in stage_params:
                 return stage_params[key]
+            # 2) job 里的点路径参数，如 --set train.iterations=600
+            dotted = f"{stage}.{key}"
+            if dotted in self.params:
+                return self.params[dotted]
+            # 3) config.toml 的该阶段小节
+            found = self.settings.get(dotted, _MISSING)
+            if found is not _MISSING:
+                return found
         if key in self.params and "." in key:
             return self.params[key]
         return self.settings.get(key, default)

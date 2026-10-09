@@ -100,7 +100,12 @@ DEFAULTS: dict[str, Any] = {
         "densify_quantile": 0.75,      # 取梯度范数的 (1-q) 分位作为自适应阈值
         "densify_grad_threshold": 1.5e-4,
         "densify_grad_max": 5e-3,
-        "split_scale_ratio": 1.0,      # 大于"中位尺度×该倍数"的走分裂，否则克隆
+        # 以下三个比例都相对 scene_scale（相机中心平均距离），取自官方 gsplat DefaultStrategy。
+        # prune_scale3d 是**防发散的关键约束**：漏掉它会让尺度无界增长（实测 log尺度到 739）。
+        "grow_scale3d": 0.01,          # 尺度 <= 0.01*scene_scale 走克隆，大于走分裂
+        "prune_scale3d": 0.1,          # 尺度 > 0.1*scene_scale 直接裁剪
+        "prune_scale_after_reset": True,  # 尺度裁剪只在 step > opacity_reset_interval 后启用
+        "revised_opacity": 0.1,        # 分裂出的高斯不透明度（官方 revised_opacity）
         "prune_opacity": 0.005,
         "opacity_reset_interval": 3000,
         "mask_loss_until": 0.25,       # 前 25% 迭代只在掩码内算损失

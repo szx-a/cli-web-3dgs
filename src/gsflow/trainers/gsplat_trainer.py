@@ -55,12 +55,23 @@ class TrainConfig:
     densify_quantile: float = 0.75
     densify_grad_threshold: float = 1.5e-4   # 自适应阈值的下限
     densify_grad_max: float = 5e-3           # 自适应阈值的上限
-    # 加密时"大尺度分裂 / 小尺度克隆"的分界（相对尺度中位数的倍数），官方 0.01*scene_scale
-    split_scale_ratio: float = 1.0
+    # 以下三个比例都相对 scene_scale（相机中心到均值距离），取自官方 DefaultStrategy：
+    #   grow_scale3d  = 0.01 -> 尺度 <= 0.01*scene_scale 走"克隆"
+    #   grow_scale3d  >  0.01 -> 走"分裂"
+    #   prune_scale3d = 0.1  -> 尺度 > 0.1*scene_scale 直接裁剪（防发散的关键约束）
+    grow_scale3d: float = 0.01
+    prune_scale3d: float = 0.1
+    # 与官方一致：尺度裁剪只在 step > opacity_reset_interval 之后启用
+    prune_scale_after_reset: bool = True
+    # 分裂出的高斯按官方做法把不透明度调低，避免分裂后过度堆积
+    revised_opacity: float = 0.1
     # 裁剪阈值：不透明度低于此值的高斯被删除（官方 0.005）
     prune_opacity: float = 0.005
     opacity_reset_interval: int = 3000
     eval: bool = True
+    # 少于这么多张图就不留评估集（留出 10% 会明显削弱小数据集训练），
+    # 改为在训练视图上算 PSNR 并在指标里标注，避免"PSNR 恒为 0"的误读。
+    min_imgs_for_holdout: int = 10
     eval_interval: int = 2000
     white_background: bool = False
     mask_loss_until: float = 0.25
@@ -259,11 +270,23 @@ def train(cfg: TrainConfig, ctx) -> dict:
     c2ws = torch.from_numpy(data["c2ws"]).float()
     viewmats = torch.linalg.inv(c2ws)
 
-    # 划分训练/评估
+    # 划分训练/评估。
+    #
+    # 踩坑：原来是 `if len(imgs) >= 10 else 0`，于是只有 7 个视图时评估集为空，
+    # evaluate() 直接返回 0.0，日志里永远是 "PSNR=0.00 dB"，看起来像渲染坏了。
+    # 正确做法：**视图太少时不留评估集**（留出 10% 会明显削弱训练），
+    # 改为在训练视图上算 PSNR，并在指标里标注 "train_views"，避免误读。
     perm = torch.randperm(len(imgs), generator=torch.Generator().manual_seed(cfg.seed)).tolist()
-    n_eval = max(1, len(imgs) // 10) if cfg.eval and len(imgs) >= 10 else 0
+    can_holdout = cfg.eval and len(imgs) >= cfg.min_imgs_for_holdout
+    n_eval = max(1, len(imgs) // 10) if can_holdout else 0
     eval_idx = set(perm[:n_eval])
     train_idx = [i for i in range(len(imgs)) if i not in eval_idx]
+    # 评估用的视图集合：有留出就用留出，否则退回训练视图（并标记）
+    psnr_idx = sorted(eval_idx) if eval_idx else list(range(len(imgs)))
+    psnr_on_train = not eval_idx
+    if psnr_on_train:
+        ctx.warn(f"仅 {len(imgs)} 个视图（< {cfg.min_imgs_for_holdout}），不留评估集；"
+                 f"PSNR 将在 {len(psnr_idx)} 个训练视图上计算（仅供趋势参考，不是泛化指标）")
 
     # ---- 高斯参数初始化 ----
     pts = data["points"]
@@ -288,6 +311,16 @@ def train(cfg: TrainConfig, ctx) -> dict:
     shs = torch.nn.Parameter(torch.zeros(n, sh_dim, 3, device=device))
     rgb0 = torch.from_numpy(cols).float().to(device) / 255.0
     shs.data[:, 0, :] = (rgb0 - 0.5) / 0.28209479177387814  # SH DC 反解
+
+    # scene_scale：**一次性**从相机位置估出（相机中心到其均值的平均距离），
+    # 与官方 DefaultStrategy.initialize_state 一致。
+    # 关键：它必须是常量。早期我在分裂判据里用"当前尺度中位数"当参照，
+    # 而每次分裂又把尺度除以 1.6 -> 阈值自增强 -> 尺度与位置双双发散
+    # （实测 log尺度到 739、坐标范围到 215）。
+    _cam_centers = c2ws[:, :3, 3]
+    scene_scale = float(torch.linalg.norm(_cam_centers - _cam_centers.mean(0), dim=1).mean()) + 1e-6
+    ctx.info(f"scene_scale = {scene_scale:.4f}（相机中心平均距离）；"
+             f"克隆上限 {cfg.grow_scale3d * scene_scale:.5f}，裁剪阈值 {cfg.prune_scale3d * scene_scale:.5f}")
 
     # 参数用字典管理，和官方 gsplat 一致：密度控制会**替换**参数对象并迁移优化器状态，
     # 所以不能像早期版本那样把参数绑死在闭包里的局部变量上。
@@ -364,29 +397,41 @@ def train(cfg: TrainConfig, ctx) -> dict:
             thr = min(max(q, cfg.densify_grad_threshold), cfg.densify_grad_max)
             is_grad_high = grad_norm > thr
 
-            # 官方 DefaultStrategy：梯度过阈者，小尺度克隆、大尺度分裂。
+            # 官方语义：按**绝对尺度阈值**（0.01 * scene_scale）区分克隆/分裂。
+            # 之前用"当前尺度中位数"作参照是错的：每次分裂把尺度除以 1.6，
+            # 中位数跟着下降 -> 阈值自增强 -> 无界分裂 + 尺度爆炸（实测 log尺度到 739）。
             scales_max = torch.exp(params["scales"].data).max(dim=-1).values
-            ref = float(scales_max.median()) if scales_max.numel() else 0.0
-            is_split = is_grad_high & (scales_max > cfg.split_scale_ratio * ref)
-            is_dup = is_grad_high & (~is_split)
+            is_small = scales_max <= cfg.grow_scale3d * scene_scale
+            is_dup = is_grad_high & is_small
+            is_split = is_grad_high & (~is_small)
+
             n_before = params["means"].shape[0]
             if cfg.cap_max and n_before >= cfg.cap_max:
                 is_dup = torch.zeros_like(is_dup)
                 is_split = torch.zeros_like(is_split)
 
-            n_dup, n_split = _grow(params, optimizers, is_dup, is_split)
+            n_dup, n_split = _grow(params, optimizers, is_dup, is_split,
+                                   revised_opacity=cfg.revised_opacity)
             refresh_params()
 
-            # 裁剪只用不透明度（官方做法）。早期把"尺度过大"也当裁剪条件，
-            # 会立刻删掉刚加密出来的点（427 -> 加密 46 -> 又被裁 78，做了负功）。
+            # 裁剪规则一：不透明度过低（官方 prune_opa）
             is_prune = torch.sigmoid(params["opacities"].data).squeeze(-1) < cfg.prune_opacity
+            # 裁剪规则二：尺度过大（官方 prune_scale3d）——**这条是防发散的关键，早期漏实现**。
+            # 官方只在 step > reset_every 之后启用，保持一致。
+            use_scale_prune = (not cfg.prune_scale_after_reset) or step > cfg.opacity_reset_interval
+            if use_scale_prune:
+                scales_now = torch.exp(params["scales"].data).max(dim=-1).values
+                is_prune = is_prune | (scales_now > cfg.prune_scale3d * scene_scale)
             n_prune = int(is_prune.sum())
             if n_prune:
                 _apply_keep(params, optimizers, ~is_prune)
                 refresh_params()
 
+            smax = torch.exp(params["scales"].data).max(dim=-1).values
             ctx.info(f"step {step} 密度：阈值={thr:.2e} 克隆 {n_dup} 分裂 {n_split} "
-                     f"裁剪 {n_prune} -> {params['means'].shape[0]} 个高斯")
+                     f"裁剪 {n_prune} -> {params['means'].shape[0]} 个高斯"
+                     f"（尺度 max={float(smax.max()):.4f} / scene_scale={scene_scale:.3f}"
+                     f"{'，已启用尺度裁剪' if use_scale_prune else ''}）")
             for p in params.values():
                 p.grad = None
         return n_dup + n_split, n_prune
@@ -537,15 +582,19 @@ def train(cfg: TrainConfig, ctx) -> dict:
                 masks=masks,
                 ks=ks,
                 viewmats=viewmats,
-                eval_idx=sorted(eval_idx),
+                eval_idx=sorted(psnr_idx),
                 sh_degree=cfg.sh_degree,
                 background=background,
                 device=device,
                 max_side=max_side,
+                # 只在最后一次评估时导出"渲染 vs 真值"对比图（诊断位姿约定用）
+                dump_dir=(cfg.out_dir / "diagnostics" / "render_vs_gt"
+                          if step == cfg.iterations else None),
             )
             psnr_log.append({"step": step, "psnr": round(psnr, 3)})
-            lvl = "info"
-            ctx.emit(f"step {step} 评估 PSNR={psnr:.2f} dB", level=lvl, progress=step / cfg.iterations)
+            tag = "（训练视图，非泛化指标）" if psnr_on_train else ""
+            ctx.emit(f"step {step} 评估 PSNR={psnr:.2f} dB{tag}", level="info",
+                     progress=step / cfg.iterations)
 
         if step % 5000 == 0 or step == cfg.iterations:
             # 关键字传参：位置传参出过一次静默错位（evaluate 的 PSNR 因此恒为 0）
@@ -580,6 +629,9 @@ def train(cfg: TrainConfig, ctx) -> dict:
         "resolution": [int(w), int(h)],
         "train_views": len(train_idx),
         "eval_views": len(eval_idx),
+        # 评估视图数（无留出时 = 训练视图数）；psnr_on_train 说明这个 PSNR 不是泛化指标
+        "psnr_views": len(psnr_idx),
+        "psnr_on_train": psnr_on_train,
         "elapsed_min": round((time.time() - t0) / 60, 2),
         "final_loss": loss_log[-1]["loss"] if loss_log else None,
         "psnr": psnr_log[-1]["psnr"] if psnr_log else None,
@@ -648,8 +700,15 @@ def _apply_keep(params: dict, optimizers: dict, keep) -> None:
 
 
 @torch.no_grad()
-def _grow(params: dict, optimizers: dict, duplicate_mask, split_mask) -> tuple[int, int]:
-    """加密：对 duplicate_mask 克隆、对 split_mask 分裂（官方 duplicate/split 模式）。"""
+def _grow(params: dict, optimizers: dict, duplicate_mask, split_mask,
+          revised_opacity: float = 0.1) -> tuple[int, int]:
+    """加密：对 duplicate_mask 克隆、对 split_mask 分裂（官方 duplicate/split 模式）。
+
+    split 的两个细节照官方：
+      * 尺度除以 1.6（`split` 的官方系数）；
+      * 分裂出的高斯**不透明度调低**（官方 `revised_opacity`，默认 0.1），
+        避免分裂后过度堆积。
+    """
     import torch
 
     n_dup = int(duplicate_mask.sum())
@@ -665,7 +724,7 @@ def _grow(params: dict, optimizers: dict, duplicate_mask, split_mask) -> tuple[i
 
         _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers,
                                      names=[k for k in params if k != "shs"])
-        # SH 的 DC 分量要一起复制，高阶分量为 0（与官方 split/duplicate 一致）
+        # SH 的 DC 分量一起复制，高阶分量为 0（与官方 split/duplicate 一致）
         shs = params["shs"]
         sh0 = torch.cat([shs[:, :1, :], shs[sel_d][:, :1, :]], dim=0)
         rest = torch.zeros((sh0.shape[0], shs.shape[1] - 1, 3), device=sh0.device, dtype=sh0.dtype)
@@ -677,7 +736,7 @@ def _grow(params: dict, optimizers: dict, duplicate_mask, split_mask) -> tuple[i
     if split_mask is not None and bool(split_mask.any()):
         sel_s = torch.where(split_mask)[0]
         n_split = int(sel_s.numel())
-        # 分裂：位置抖动 2*scale，尺度除以 1.6（官方做法）
+        # 分裂：位置抖动 2*scale，尺度除以 1.6，不透明度调低（官方做法）
         scales = torch.exp(params["scales"].data[sel_s])
         offsets = torch.randn_like(params["means"].data[sel_s]) * 2.0 * scales
 
@@ -687,6 +746,11 @@ def _grow(params: dict, optimizers: dict, duplicate_mask, split_mask) -> tuple[i
                 extra = extra + offsets
             elif name == "scales":
                 extra = torch.log(torch.exp(extra) / 1.6)
+            elif name == "opacities":
+                # logit(revised_opacity)：分裂出的高斯不透明度调低（官方 0.1）
+                import math
+
+                extra = torch.full_like(extra, math.log(revised_opacity / (1.0 - revised_opacity)))
             return torch.nn.Parameter(torch.cat([p, extra], dim=0), requires_grad=p.requires_grad)
 
         def optimizer_fn(key, v):
@@ -724,8 +788,13 @@ def _swap_param(name: str, new_tensor, params: dict, optimizers: dict, optimizer
 
 
 def evaluate(rasterization, means, quats, scales, opacities, shs, imgs, masks, ks, viewmats,
-             eval_idx, sh_degree, background, device, max_side):
-    """在评估视图上算 PSNR（dB）。
+             eval_idx, sh_degree, background, device, max_side, dump_dir=None):
+    """在评估视图上算 PSNR（dB），可选把"渲染 vs 真值"并排图写到 dump_dir。
+
+    dump_dir 的用途：位姿约定（cam_to_world 的轴翻转）一旦写错，
+    渲染在数值上仍可能有非零 PSNR，只看 PSNR 难以判断。
+    把两者并排存成 PNG 后可以直接肉眼确认几何是否对齐
+    ——比"盯着 loss 曲线猜"可靠得多。
 
     踩坑：调用方曾用位置参数按错误顺序传入（opacities 落到 scales 上、
     background 落到 masks 上），因为各张量形状恰好兼容，**不会报错**，
@@ -758,7 +827,27 @@ def evaluate(rasterization, means, quats, scales, opacities, shs, imgs, masks, k
             render = colors[0] + background * (1 - alphas[0])
             mse = torch.mean((render - gt) ** 2).clamp_min(1e-10)
             psnrs.append(float(10.0 * torch.log10(1.0 / mse)))
+            if dump_dir is not None:
+                _dump_compare(dump_dir, i, render, gt)
     return sum(psnrs) / len(psnrs)
+
+
+def _dump_compare(dump_dir, view_idx: int, render, gt) -> None:
+    """把 "渲染 | 真值 | 差异" 横向拼成一张 PNG（仅用于诊断）。"""
+    try:
+        from PIL import Image
+        import torch
+
+        r = (render.detach().clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+        g = (gt.detach().clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+        diff = (np.abs(r.astype(np.int16) - g.astype(np.int16))).astype(np.uint8)
+        diff = np.repeat(diff, 3, axis=2) if diff.ndim == 2 else diff
+        strip = np.concatenate([r, g, diff], axis=1)
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(strip).save(dump_dir / f"view_{view_idx:03d}_render_gt_diff.png")
+    except Exception:  # 诊断用，失败不影响训练
+        pass
+
 
 
 def save_ply(path: Path, means, scales, quats, opacities, shs, sh_degree: int) -> Path:

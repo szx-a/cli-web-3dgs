@@ -60,11 +60,15 @@ densify_interval = 100
 densify_quantile = 0.75
 densify_grad_threshold = 0.00015
 densify_grad_max = 0.005
-split_scale_ratio = 1.0
+grow_scale3d = 0.01
+prune_scale3d = 0.1
+prune_scale_after_reset = true
+revised_opacity = 0.1
 prune_opacity = 0.005
 opacity_reset_interval = 3000
 mask_loss_until = 0.25
 extra_args = ""
+split_scale_ratio = 1.0
 
 [export]
 formats = ["glb_points", "viewer_html"]
