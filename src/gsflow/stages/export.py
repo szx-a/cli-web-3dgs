@@ -1021,6 +1021,32 @@ class ExportStage(Stage):
         return path
 
     # ------------------------------------------------------------------ 预览
+    def _splat_kernel_ready(self) -> bool:
+        """gsplat 的 CUDA 内核是否**已就绪且不会触发编译**。
+
+        为什么要单独判断：`import gsplat` 之后第一次调用 `rasterization` 可能**现场
+        JIT 编译**内核（本机实测 80~140 秒）。预览图只是"顺手看一眼"的产物，
+        绝不该因为要出预览而触发一次重量级编译 ——
+        在测试里表现为单个用例从 5 秒变成 86 秒（实测踩到）。
+
+        判据：`paths.apply_runtime_env()` 是否已把预编译内核注册进 `sys.modules`
+        （它会同时注册 `gsplat_cuda` 与 `gsplat.csrc`，从而让 gsplat 跳过编译分支）。
+        这个判据与实际机制一致 —— 早期我写成"看扩展目录里有没有 `.pyd`"，
+        结果在没预加载的进程里**误判为就绪**，照样触发了 86 秒编译。
+        """
+        import sys as _sys
+
+        if _sys.modules.get("gsplat.csrc") is None:
+            return False
+        try:
+            import gsplat  # noqa: F401
+
+            from gsplat.cuda._backend import _C
+
+            return _C is not None
+        except Exception:  # noqa: BLE001
+            return False
+
     def _render_previews(self, ctx: StageContext, gauss: dict, out_dir: Path, count: int = 4) -> list[dict]:
         """生成预览图：优先用 **gsplat 真实渲染**，失败时退回 matplotlib 散点投影。
 
@@ -1028,8 +1054,12 @@ class ExportStage(Stage):
         得到的是一团点云，看不出重建质量（一个 PSNR 35dB 的好模型和一堆乱点长得一样）。
         真渲染能直接反映"模型看到的世界"，也是用户最关心的产物。
 
-        gsplat 不可用时（例如无 GPU 环境）自动退回散点图，保证导出阶段仍能独立跑通。
+        gsplat 内核未就绪或不可用时自动退回散点图，保证导出阶段仍能独立跑通，
+        且**不会**为了出预览而触发一次 80 秒级的内核编译。
         """
+        if not self._splat_kernel_ready():
+            ctx.info("gsplat CUDA 内核尚未构建，预览改用散点投影（避免触发 JIT 编译）")
+            return self._render_previews_scatter(ctx, gauss, out_dir, count)
         rendered = self._render_previews_splat(ctx, gauss, out_dir, count)
         if rendered:
             return rendered

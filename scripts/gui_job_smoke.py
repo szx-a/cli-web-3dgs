@@ -62,6 +62,9 @@ def main() -> int:
             "export.mesh_method": "poisson",
             "export.mesh_poisson_depth": 9,
             "export.mesh_target_triangles": 400000,
+            # 纹理烘焙相关（GUI 的「3.5 网格导出」卡片会带上这些）
+            "export.mesh_texture": "true",
+            "export.mesh_texture_size": 1024,
         },
     }
     res = post(base, "/api/run", body)

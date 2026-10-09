@@ -159,9 +159,23 @@
             <input id="p-mesh-densq" type="number" step="0.005" min="0" value="0">
           </label>
         </div>
+        <div class="row">
+          <label class="grow">纹理烘焙（贴图，比顶点色细腻）
+            <select id="p-mesh-texture">
+              <option value="false">关闭（只出顶点色）</option>
+              <option value="true">开启（额外出带贴图的 glb）</option>
+            </select>
+          </label>
+          <label class="grow">贴图分辨率
+            <input id="p-mesh-texsize" type="number" step="512" min="512" value="2048">
+          </label>
+        </div>
         <p class="hint">网格流程：渲染深度 → 按不透明度/深度一致性过滤 → <b>反投影成稠密点云</b>
-          → 体素下采样均匀化 → 泊松重建 → 平滑 → QEM 简化 → obj/ply/<b>网格 glb</b>。
-          <code>mesh</code> 会同时产出 <code>model_mesh.obj / .ply / .glb</code>，
+          → 体素下采样均匀化 → 泊松重建 → 平滑 → QEM 简化 → obj/ply/<b>网格 glb</b>
+          → （可选）<b>UV 展开 + 纹理烘焙</b>。
+          <code>mesh</code> 会产出 <code>model_mesh.obj / .ply / .glb</code>；
+          开启纹理烘焙后额外产出 <b><code>model_mesh_textured.glb</code></b>（贴图内嵌）、
+          <code>model_mesh_texture.png</code> 与 <code>model_mesh_uv.obj/.mtl</code>。
           网格 glb 可直接拖进 Blender、Unity、three.js 或 Windows「3D 查看器」。
           实测轮廓 IoU：深度反投影路线 <b>0.65</b>，明显优于直接把高斯中心喂给泊松（0.24，网格只有物体的 1/5 大）。</p>
       </div>

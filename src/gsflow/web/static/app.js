@@ -89,6 +89,8 @@ function collectParams() {
   put('export.mesh_width', $('p-mesh-width').value);
   put('export.mesh_max_views', $('p-mesh-views').value);
   put('export.mesh_density_quantile', $('p-mesh-densq').value);
+  put('export.mesh_texture', $('p-mesh-texture').value);
+  put('export.mesh_texture_size', $('p-mesh-texsize').value);
   return p;
 }
 
@@ -302,6 +304,8 @@ const CONFIG_KEYS = [
   ['export.mesh_density_quantile', '网格密度裁剪分位'],
   ['export.mesh_voxel_div', '网格体素细分'],
   ['export.mesh_min_alpha', '网格最小不透明度'],
+  ['export.mesh_texture', '纹理烘焙开关'],
+  ['export.mesh_texture_size', '贴图分辨率'],
   ['runtime.max_parallel_jobs', '并发作业数'],
 ];
 
@@ -393,7 +397,7 @@ $('btn-reset-config').onclick = async () => { await api('/api/config/reset', { m
   'p-frames-fps', 'p-frames-long', 'p-colmap-matcher', 'p-train-backend', 'p-train-iters',
   'p-train-res', 'p-train-cap', 'p-train-densify', 'p-train-maskloss',
   'p-export-formats', 'p-mesh-method', 'p-mesh-depth', 'p-mesh-tris', 'p-mesh-smooth',
-  'p-mesh-width', 'p-mesh-views', 'p-mesh-densq',
+  'p-mesh-width', 'p-mesh-views', 'p-mesh-densq', 'p-mesh-texture', 'p-mesh-texsize',
 ].forEach((id) => { const el = $(id); if (el) el.addEventListener('input', updateCliPreview); });
 
 /* ------------------------------------------------------------------ 启动 */

@@ -207,15 +207,221 @@ def _patch_torch_ninja_bypass() -> None:
         pass
 
 
+def find_vcvars64() -> Path | None:
+    """定位 MSVC 的 `vcvars64.bat`（cl.exe 必需）。
+
+    gsplat 的 CUDA 内核是 JIT 编译的：**光有 nvcc 不够，还要 cl.exe**。
+    没有 cl.exe 时 torch 会报 "Cannot find compiler 'cl.exe' in PATH"。
+    """
+    for p in (
+        r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat",
+        r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat",
+        r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat",
+        r"C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat",
+        r"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat",
+    ):
+        f = Path(p)
+        if f.exists():
+            return f
+    return None
+
+
+def _msvc_env_done() -> bool:
+    """本进程是否已经装载过 MSVC 环境（避免重复跑 vcvars64.bat）。
+
+    为什么要这个标记：`load_msvc_env()` 要起一个 cmd 子进程跑 vcvars64.bat
+    （实测单次 ~7 秒）。而 `apply_runtime_env()` 会被各入口反复调用
+    （测试套件里每个用例都会走一遍），没有这个短路的话
+    **测试从 3 秒变成 103 秒**（实测踩到）。
+    """
+    return bool(os.environ.get("VSCMD_ARG_TGT_ARCH") or os.environ.get("GSFLOW_MSVC_READY"))
+
+
+_MSVC_ENV_CACHE: dict[str, str] | None = None
+
+
+def load_msvc_env() -> dict[str, str]:
+    """解析 `vcvars64.bat` 导出的环境变量（在 Python 内完成，不依赖 cmd 包装）。
+
+    为什么要这样做：CLI 侧一直靠 `scripts\\gsflow_gpu.cmd` 先 `call vcvars64.bat`
+    再启动 Python，所以训练/导出都能编译内核；但 **Web GUI 是从 `scripts\\web.cmd`
+    启动的，没有这层包装**，于是同一份流程在 GUI 里跑就报
+    `'NoneType' object has no attribute 'CameraModelType'`（gsplat 内核没编译成）。
+
+    "能不能用"不该取决于用户从哪个脚本启动。所以在 Python 内直接解析
+    vcvars64.bat 的输出（`set` 列表），把变量装进当前进程，
+    CLI / GUI / 测试三条入口就都对等了。
+    """
+    global _MSVC_ENV_CACHE
+    if _MSVC_ENV_CACHE is not None:
+        return _MSVC_ENV_CACHE
+    vcvars = find_vcvars64()
+    if vcvars is None:
+        _MSVC_ENV_CACHE = {}
+        return _MSVC_ENV_CACHE
+    import subprocess
+
+    # 引号坑（踩了好几轮，这里记清楚）：
+    #   `subprocess.run(["cmd","/c", f'call "{p}" && set'])` 在本机拿不到输出 ——
+    #   含空格的绝对路径 + `call` + 重定向 + `&&` 叠在一起时，
+    #   引号会被各层（PowerShell / cmd / subprocess 的 list2cmdline）反复转义，
+    #   表现为 cmd 报 `'\"C:\\Program...' is not recognized` 或直接静默 rc=1。
+    #
+    # 最稳的做法：**生成一个临时 .bat**，把 vcvars 与 `set` 都写进文件里再执行。
+    # 文件里不需要任何转义，也没有多层引号问题。
+    try:
+        tmp = TMP_DIR / "_vcvars_dump.bat"
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(
+            "@echo off\r\n"
+            f'call "{vcvars}" >nul 2>&1\r\n'
+            "set\r\n",
+            encoding="ascii",
+        )
+        out = subprocess.run(
+            [str(tmp)], capture_output=True, text=True, errors="ignore", timeout=180,
+        ).stdout or ""
+    except Exception:  # noqa: BLE001
+        _MSVC_ENV_CACHE = {}
+        return _MSVC_ENV_CACHE
+
+    env: dict[str, str] = {}
+    for line in out.splitlines():
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if not k:
+            continue
+        # ⚠️ Windows 坑（踩过）：`set` 输出里路径变量名是 **`Path=`**（首字母大写），
+        # 而**环境变量名在 Windows 上不区分大小写**。
+        # 我一开始用 `k.upper() == k`（要求全大写）过滤，
+        # 结果把 `Path` 与 `VCToolsInstallDir` 这类含小写的名字全丢了 ——
+        # 表现为 INCLUDE/LIB 都对、唯独 cl.exe 不在 PATH，很难看出原因。
+        # 正确做法：统一**转大写**当作键（os.environ 在 Windows 上大小写不敏感，
+        # 赋值给 PATH 与给 Path 是等价的）。
+        if not (k[0].isalpha() or k[0] == "_"):
+            continue
+        env[k.upper()] = v
+    _MSVC_ENV_CACHE = env
+    return env
+
+
+def _preload_gsplat_kernel() -> bool:
+    """把已编译的 gsplat CUDA 内核加载成模块 `gsplat_cuda`，返回是否成功。
+
+    这是本环境能"秒级用上 gsplat"的关键，原因链条（都是实测踩出来的）：
+
+      1. gsplat 的 `cuda/_backend.py` 里 `load_extension()` **总是**调用
+         `_jit_compile()`，它指望 ninja 做增量构建来省时间。
+      2. 但本环境 **ninja 不退出**，我们换成了自己的构建器
+         （`build.py`，解析 build.ninja 直接调 cl/nvcc/link）。
+      3. 于是每次 `import gsplat` 都会走一次"重新链接"：
+         实测 80~140 秒，链接日志就是 `link.exe ... /out:gsplat_cuda.pyd`。
+      4. 更糟的是：如果我们**已经把这个 .pyd 加载进内存**（比如为了预加载），
+         链接器就无法覆盖它，报
+         `LINK : fatal error LNK1104: 无法打开文件"gsplat_cuda.pyd"`。
+         —— 这正是"先加载再让 gsplat 自己加载"这条错误路线的死法。
+
+    正确做法：**在 gsplat 之前**把 `.pyd` 加载好并注册成 `sys.modules["gsplat_cuda"]`，
+    这样 `_backend.py` 里 `from gsplat import csrc as _C` 直接命中缓存，
+    `except ImportError` 分支**根本不会被执行**，也就没有编译/链接。
+
+    两个必须注意的点：
+      * 模块名必须是 **`gsplat_cuda`** —— `.pyd` 导出的是 `PyInit_gsplat_cuda`，
+        换成别的名字会报
+        `dynamic module does not define module export function (PyInit_xxx)`。
+      * 必须在 `import torch` 之后加载 —— 它依赖 torch 的 DLL，
+        否则报 `DLL load failed ... 找不到指定的模块`。
+      * 还要**同时注册成 `gsplat.csrc`**。因为 `_backend.py` 的第一条路径是
+        `from gsplat import csrc as _C`，成功才会跳过 JIT；
+        只注册 `gsplat_cuda` 时这条导入仍然失败，于是照样进编译分支
+        （表现为"import gsplat 很快，但第一次调用 rasterization 就开始重编"）。
+    """
+    try:
+        import importlib.util
+        import sys as _sys
+
+        ext_root = TORCH_EXTENSIONS_DIR / "gsplat_cuda"
+        pyd = next((p for p in ext_root.glob("gsplat_cuda*.pyd") if p.stat().st_size > 0), None)
+        if pyd is None:
+            return False
+        mod = _sys.modules.get("gsplat_cuda")
+        if mod is None:
+            spec = importlib.util.spec_from_file_location("gsplat_cuda", str(pyd))
+            if spec is None or spec.loader is None:
+                return False
+            mod = importlib.util.module_from_spec(spec)
+            _sys.modules["gsplat_cuda"] = mod
+            spec.loader.exec_module(mod)
+        # 关键：让 `from gsplat import csrc as _C` 命中，从而跳过 JIT 分支
+        _sys.modules.setdefault("gsplat.csrc", mod)
+        return True
+    except Exception:  # noqa: BLE001
+        # 失败就退回"让 gsplat 自己处理"，不影响其它功能
+        return False
+
+
+def _patch_gsplat_win_cache() -> None:
+    """清掉 gsplat 构建目录里的残留锁，并尝试**预加载**已编译的内核。
+
+    顺序很重要：必须在 `_patch_torch_ninja_bypass()` **之前**预加载。
+    否则 torch 已经决定要重编，而库又被我们加载进内存 ->
+    链接器覆盖失败（`LNK1104`）。详见 `_preload_gsplat_kernel()` 的说明。
+    """
+    try:
+        ext_root = TORCH_EXTENSIONS_DIR / "gsplat_cuda"
+        if not ext_root.exists():
+            return
+        for lock in ("lock", ".ninja_lock"):
+            lp = ext_root / lock
+            if lp.exists():
+                try:
+                    lp.unlink()
+                except OSError:
+                    pass
+        _preload_gsplat_kernel()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def apply_runtime_env() -> None:
-    """把 runtime_env 应用到当前进程（必须在 import ultralytics / rembg / matplotlib 之前调用）。"""
+    """把 runtime_env 应用到当前进程（必须在 import ultralytics / rembg / matplotlib 之前调用）。
+
+    同时把**便携 CUDA 与 MSVC 环境**装进当前进程，这样无论从 CLI、GUI 还是测试进入，
+    需要 nvcc/cl.exe 的功能（gsplat JIT 内核编译）都能正常工作 ——
+    早期只有 `scripts\\gsflow_gpu.cmd` 做了这件事，导致 GUI 侧同一份流程失败。
+    """
     import os as _os
 
     ensure_dirs()
     for k, v in runtime_env().items():
         _os.environ.setdefault(k, v)
+
+    # 便携 CUDA：把 bin 加进 PATH（只在还没加过时加一次）
+    cuda = find_portable_cuda()
+    if cuda is not None:
+        _os.environ["CUDA_HOME"] = str(cuda)
+        _os.environ["CUDA_PATH"] = str(cuda)
+        _os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
+        cuda_bin = str(cuda / "bin")
+        if cuda_bin.lower() not in _os.environ.get("PATH", "").lower():
+            _os.environ["PATH"] = cuda_bin + _os.pathsep + _os.environ.get("PATH", "")
+
+    # MSVC：补齐 cl.exe / link.exe 需要的 include、lib、PATH。
+    # 用了短路标记：跑一次 vcvars64.bat 约 7 秒，反复调用会把测试拖慢几十倍。
+    if not _msvc_env_done():
+        msvc = load_msvc_env()
+        for k, v in msvc.items():
+            _os.environ[k] = v
+        _os.environ["GSFLOW_MSVC_READY"] = "1"
+
     _patch_rembg_home()
     _patch_torch_subprocess_decode()
+    # ⚠️ 顺序不能变：预加载内核必须在 `_patch_torch_ninja_bypass()` 之前。
+    # 先预加载 => gsplat 走 `from gsplat import csrc` 命中缓存，不进编译分支；
+    # 若反过来，torch 已决定重编，链接器又无法覆盖已加载的 .pyd，报 LNK1104。
+    _patch_gsplat_win_cache()
     _patch_torch_ninja_bypass()
 
 
