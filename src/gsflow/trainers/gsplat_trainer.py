@@ -69,6 +69,9 @@ class TrainConfig:
     prune_opacity: float = 0.005
     opacity_reset_interval: int = 3000
     eval: bool = True
+    # 相机轴约束：默认 False = 不翻转，与官方 gsplat 的 COLMAP 加载器一致。
+    # 只保留用于对照实验；正常流程不要打开。
+    flip_camera: bool = False
     # 少于这么多张图就不留评估集（留出 10% 会明显削弱小数据集训练），
     # 改为在训练视图上算 PSNR 并在指标里标注，避免"PSNR 恒为 0"的误读。
     min_imgs_for_holdout: int = 10
@@ -141,8 +144,25 @@ def find_model_dir(data_dir: Path) -> Path:
     return sparse / "0"
 
 
-def load_colmap_data(data_dir: Path, downscale: int = 1, white_background: bool = False):
-    """读取去畸变后的 COLMAP 数据，返回相机参数、位姿与点云。"""
+def load_colmap_data(data_dir: Path, downscale: int = 1, white_background: bool = False,
+                     flip_camera: bool = False):
+    """读取去畸变后的 COLMAP 数据，返回相机参数、位姿与点云。
+
+    **相机位姿不需要任何轴翻转** —— 这一点我错了很久，最后靠读官方实现才纠正：
+
+    官方 gsplat（examples/datasets/colmap.py）的做法是：
+        w2c = 由 COLMAP 的 qvec/tvec 拼成的 [[R|t],[0|1]]     # world -> camera
+        camtoworlds = np.linalg.inv(w2c)                      # 直接求逆，不做翻转
+    而本模块的 `Image.cam_to_world()` 返回 `(R.T, -R.T @ t)`，
+    正是 `inv([[R|t],[0|1]])` 的解析解 —— **两者完全等价**。
+    所以 `gsplat` 的 `rasterization` 直接接收 `viewmats = inv(c2w)` 即可。
+
+    早期我照抄 gsplat 示例里的 `c2w[0:3, 1:3] *= -1`，
+    以及后来"修"成的 `c2w[0:3, 1] *= -1`，**都是多余的**，会让几何错位，
+    表现为渲染与真值无法对齐、PSNR 卡在 13~14 dB 上不去。
+
+    flip_camera 仅保留用于对照实验（默认 False = 不翻转，与官方一致）。
+    """
     from ..gsdata.colmap_io import read_model
 
     model_dir = find_model_dir(data_dir)
@@ -169,14 +189,10 @@ def load_colmap_data(data_dir: Path, downscale: int = 1, white_background: bool 
         c2w = np.eye(4)
         c2w[:3, :3] = r
         c2w[:3, 3] = t
-        # COLMAP/OpenCV -> OpenGL 约定。
-        #
-        # 实测踩坑：早期按 gsplat 示例写成 `c2w[0:3, 1:3] *= -1`（y、z 都翻），
-        # 结果**所有高斯落在相机背后**（相机空间 z 全为负、alpha 恒为 0、
-        # 位置梯度恒为 0 → 自适应密度控制完全不触发，模型永远停在初始稀疏点）。
-        # 用 scripts/probe_pose_convention.py 扫过 4 种翻转组合后确认：
-        # 本流程的数据只需要翻 y。
-        c2w[0:3, 1] *= -1
+        # 与官方一致：c2w 直接由 COLMAP 的 w2c 求逆得到，**不做轴翻转**。
+        # 详见本函数 docstring。flip_camera 只用于对照实验。
+        if flip_camera:
+            c2w[0:3, 1] *= -1
         c2ws.append(c2w)
         ks.append(k)
         names.append(im.name)
@@ -249,7 +265,8 @@ def train(cfg: TrainConfig, ctx) -> dict:
     if free_vram_gb < 10:
         ctx.warn("显存 < 10GB：会自动降低分辨率并限制高斯数量（cap_max）")
 
-    data = load_colmap_data(cfg.data_dir, downscale=1, white_background=cfg.white_background)
+    data = load_colmap_data(cfg.data_dir, downscale=1, white_background=cfg.white_background,
+                            flip_camera=cfg.flip_camera)
     names = data["names"]
     ctx.info(f"已注册视图 {len(names)} 个，稀疏点 {len(data['points'])}")
 
