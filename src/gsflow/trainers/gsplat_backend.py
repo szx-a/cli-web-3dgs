@@ -34,7 +34,7 @@ class GsplatBackend:
 
     def available(self, ctx: StageContext) -> tuple[bool, str]:
         try:
-            import torch  # noqa: F401
+            import torch
         except ImportError:
             return False, "未安装 torch：pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128"
         try:
@@ -42,8 +42,6 @@ class GsplatBackend:
         except ImportError:
             return False, "未安装 gsplat：pip install gsplat"
         try:
-            import torch
-
             if not torch.cuda.is_available():
                 return False, "torch 看不到 CUDA 设备：确认装的是 cu128+ 轮子"
         except Exception as exc:  # pragma: no cover
@@ -56,8 +54,10 @@ class GsplatBackend:
         if not _has_nvcc():
             return False, (
                 "gsplat 需要 nvcc 现场编译 CUDA 内核，但当前找不到 CUDA Toolkit。"
-                "解决：先跑 `scripts\\download.cmd cuda` 下载安装包（约 3.3GB），"
-                "再以管理员身份运行 `powershell -ExecutionPolicy Bypass -File scripts\\install_cuda.ps1`。"
+                "解决（**不需要管理员权限**，推荐）："
+                "先 `scripts\\download.cmd cuda` 下载安装包，再跑 `scripts\\build_portable_cuda.cmd` "
+                "自动解包成 tools\\cuda（约 2 分钟）。"
+                "之后用 `scripts\\gsflow_gpu.cmd` 跑训练/导出（它会自动加载 MSVC + 便携 CUDA 环境）。"
             )
         return True, ""
 
@@ -77,7 +77,7 @@ class GsplatBackend:
             seed=int(ctx.cfg("seed", 42) or 42),
             # 密度控制参数（对齐官方 gsplat DefaultStrategy 的语义）
             densify_from=int(ctx.cfg("densify_from", 500) or 500),
-            densify_until=int(ctx.cfg("densify_until", 15000) or 15000),
+            densify_until=int(ctx.cfg("densify_until", 4000) or 4000),
             densify_interval=int(ctx.cfg("densify_interval", 100) or 100),
             densify_quantile=float(ctx.cfg("densify_quantile", 0.75) or 0.75),
             densify_grad_threshold=float(ctx.cfg("densify_grad_threshold", 1.5e-4) or 1.5e-4),

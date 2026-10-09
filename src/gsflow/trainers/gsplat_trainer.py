@@ -45,7 +45,17 @@ class TrainConfig:
     cap_max: int = 1_500_000
     ssim_weight: float = 0.2
     densify_from: int = 500
-    densify_until: int = 15000
+    # 密度控制窗口的**上界**。这是本项目在真实数据上最敏感的一个参数。
+    #
+    # 官方默认是 15000（面向几百~上千张视图的大场景）。但在**实物环绕拍摄**
+    # （几十~一两百张视图）上，后期加密纯粹是在过拟合，会显著劣化结果。
+    # 真实素材实测（122 视图，600px，10k 迭代，只改这一个参数）：
+    #     densify_until=15000(默认)  145,442 高斯   最终 20.88 dB（峰值 25.77 @8000，之后退化）
+    #     densify_until= 4000         74,447 高斯   最终 28.62 dB（不再退化）
+    #     densify_until= 2500         57,174 高斯   最终 28.71 dB（不再退化）
+    # 即"少一半高斯、PSNR 反而高 7.8 dB"。故默认下调到 4000，
+    # 大场景请显式调大（--set train.densify_until=15000）。
+    densify_until: int = 4000
     densify_interval: int = 100
     # 加密判据：位置梯度范数超过阈值。
     # 实测校准：某场景 step 500 时 grad_norm 均值约 2e-4、最大约 1.2e-2；
@@ -668,9 +678,9 @@ def train(cfg: TrainConfig, ctx) -> dict:
                 dump_dir=(cfg.out_dir / "diagnostics" / "render_vs_gt"
                           if step == cfg.iterations else None),
             )
-            psnr_log.append({"step": step, "psnr": round(psnr, 3)})
+            psnr_log.append({"step": step, "psnr": round(eval_res, 3)})
             tag = "（训练视图，非泛化指标）" if psnr_on_train else ""
-            ctx.emit(f"step {step} 评估 PSNR={psnr:.2f} dB{tag}", level="info",
+            ctx.emit(f"step {step} 评估 PSNR={eval_res:.2f} dB{tag}", level="info",
                      progress=step / cfg.iterations)
             # 记录/保存"最佳检查点"：
             # 3DGS 在小规模环绕拍摄上常出现"过训练"（后期加密导致拟合变差，

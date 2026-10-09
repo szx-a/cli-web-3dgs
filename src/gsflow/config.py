@@ -108,7 +108,12 @@ DEFAULTS: dict[str, Any] = {
         "seed": 42,
         # 密度控制（对齐官方 gsplat DefaultStrategy 的语义）
         "densify_from": 500,
-        "densify_until": 15000,
+        # 密度窗口上界：**实物环绕拍摄（几十~一两百视图）建议 2500~4000**。
+        # 真实素材实测只改这一个参数：15000 -> 最终 PSNR 20.88 dB（145k 高斯）；
+        # 4000 -> 28.62 dB（74k 高斯）；2500 -> 28.71 dB（57k 高斯）。
+        # 官方默认 15000 面向几百~上千视图的大场景，此时后期加密不是过拟合；
+        # 视图少时它纯粹在过拟合，所以默认下调。大场景请显式调回 15000。
+        "densify_until": 4000,
         "densify_interval": 100,
         "densify_quantile": 0.75,      # 取梯度范数的 (1-q) 分位作为自适应阈值
         "densify_grad_threshold": 1.5e-4,

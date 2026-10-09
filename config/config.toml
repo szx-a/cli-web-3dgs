@@ -55,7 +55,7 @@ eval = true
 fp16 = false
 seed = 42
 densify_from = 500
-densify_until = 15000
+densify_until = 4000
 densify_interval = 100
 densify_quantile = 0.75
 densify_grad_threshold = 0.00015
@@ -68,7 +68,6 @@ prune_opacity = 0.005
 opacity_reset_interval = 3000
 mask_loss_until = 0.25
 extra_args = ""
-split_scale_ratio = 1.0
 
 [export]
 formats = ["glb_points", "viewer_html"]

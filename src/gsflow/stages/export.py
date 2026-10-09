@@ -162,6 +162,16 @@ class ExportStage(Stage):
                              "size_mb": round(obj_path.stat().st_size / 1024 / 1024, 2),
                              "desc": "通用点云 OBJ"})
 
+        # 三角网格导出（用户反馈"点云没有实感"）
+        # 走 TSDF 融合：用已训练的 3DGS 渲深度+RGB -> open3d 融合出网格。
+        # 选型理由与 SuGaR/2DGS 的对比见 gsdata/mesh_export.py 顶部注释。
+        if "mesh" in formats or "obj_mesh" in formats or "mesh_obj" in formats:
+            try:
+                mesh_items = self._export_mesh(ctx, ply, out_dir)
+                produced.extend(mesh_items)
+            except Exception as exc:  # noqa: BLE001
+                ctx.warn(f"网格导出失败（不影响其它产物）：{type(exc).__name__}: {exc}")
+
         previews = self._render_previews(ctx, gauss, out_dir)
         produced.extend(previews)
 
@@ -291,6 +301,120 @@ class ExportStage(Stage):
             "xyz": xyz[order], "rgb": rgb[order], "opacity": op[order],
             "scales": scales[order], "quats": quats[order],
         }
+
+    # ------------------------------------------------------------------ 网格
+    def _export_mesh(self, ctx: StageContext, ply: Path, out_dir: Path) -> list[dict]:
+        """用 TSDF 融合从训练好的 3DGS 提取三角网格（`.obj` + 可选 `.ply`）。
+
+        流程：读取 PLY 的高斯 -> 取训练时的真实相机位姿 -> 渲染 RGB+期望深度
+              -> open3d ScalableTSDFVolume 融合 -> 去离群 -> 写 obj。
+        参数（都有合理默认，可用 --set 覆盖）：
+              export.mesh_voxel_div   体素细分（场景尺度/该值），默认 512，越小越粗越快
+              export.mesh_max_views   最多融合多少个视角，默认 80
+              export.mesh_width       渲染分辨率（正方形边长），默认 640
+              export.mesh_min_alpha   低于该不透明度的像素不参与融合，默认 0.35
+              export.mesh_largest_only 只保留最大连通块，默认 true（单物体）
+        """
+        import numpy as np
+        import torch
+
+        from ..gsdata.mesh_export import (clean_mesh, fuse_tsdf, render_depths,
+                                          to_largest_component, _scene_extent)
+
+        gauss = self._read_ply(ply, max_points=0)
+        n = len(gauss["xyz"])
+        ctx.info(f"网格导出：读取 {n} 个高斯，准备渲染深度 ...")
+
+        # 网格融合需要尽量多的视角覆盖表面（预览才只需要 4 个）
+        cams = self._training_cameras(ctx, out_dir, limit=int(ctx.cfg("mesh_max_views", 80) or 80))
+        if not cams:
+            ctx.warn("找不到训练相机位姿，无法做 TSDF 融合（需要 04_train/data/sparse）")
+            return []
+
+        c2ws = np.stack([c[0] for c in cams])
+        # 内参对应的原始尺寸（_training_cameras 已带回 cam.width/height）
+        src_wh = (int(cams[0][2]), int(cams[0][3]))
+        ks = np.stack([c[1] for c in cams])
+        pts = np.asarray(gauss["xyz"], dtype=np.float64)
+        center, extent = _scene_extent(c2ws, pts)
+        ctx.info(f"场景中心 {np.round(center, 3).tolist()}；尺度 {extent:.3f}")
+
+        width = int(ctx.cfg("mesh_width", 640) or 640)
+        height = width
+        max_views = int(ctx.cfg("mesh_max_views", 80) or 80)
+        # 体素尺寸按场景尺度自适应：extent / mesh_voxel_div
+        # （社区实现常用绝对值 0.002，但那是针对具体数据集的；这里自适应更通用）
+        voxel_div = float(ctx.cfg("mesh_voxel_div", 400.0) or 400.0)
+        min_alpha = float(ctx.cfg("mesh_min_alpha", 0.35) or 0.35)
+        largest_only = ctx.cfg("mesh_largest_only", True)
+        if isinstance(largest_only, str):
+            largest_only = largest_only.strip().lower() in ("1", "true", "yes", "on")
+
+        xyz = torch.as_tensor(gauss["xyz"], dtype=torch.float32, device="cuda")
+        scales_real = torch.as_tensor(gauss["scales"], dtype=torch.float32, device="cuda")
+        quats = torch.as_tensor(gauss["quats"], dtype=torch.float32, device="cuda")
+        opac = torch.as_tensor(gauss["opacity"], dtype=torch.float32, device="cuda").reshape(-1)
+        rgb = torch.as_tensor(gauss["rgb"], dtype=torch.float32, device="cuda") / 255.0
+        shs = ((rgb - 0.5) / 0.28209479177387814).reshape(n, 1, 3)
+
+        ctx.info(f"渲染深度：{min(max_views, len(c2ws))}/{len(c2ws)} 个视角 @ {width}px ...")
+        rendered, used_idx = render_depths(
+            means=xyz, quats=quats, scales_real=scales_real,
+            opacities=opac.clamp(0, 1), shs=shs,
+            c2ws=c2ws, ks=ks,
+            width=width, height=height, sh_degree=0,
+            src_wh=src_wh, max_views=max_views,
+        )
+
+        ctx.info(f"TSDF 融合（体素 = 尺度/{voxel_div:.0f} = {extent/voxel_div:.5f}）...")
+        mesh, info = fuse_tsdf(
+            rendered=rendered, c2ws=c2ws, view_idx=used_idx,
+            ks=ks, width=width, height=height, src_wh=src_wh,
+            center=center, extent=extent,
+            voxel_size=extent / max(voxel_div, 32.0), min_alpha=min_alpha,
+        )
+        ctx.info(f"融合完成：用了 {info['views_used']} 个视角，体素 {info['voxel']:.5f}"
+                 f"（设备 {info['device']}），"
+                 f"得到 {len(mesh.triangles)} 个三角形 / {len(mesh.vertices)} 个顶点")
+
+        removed = 0
+        if largest_only:
+            mesh, removed = to_largest_component(mesh)
+            ctx.info(f"只保留最大连通块，去掉 {removed} 个三角形")
+        else:
+            mesh, removed = clean_mesh(mesh)
+
+        if len(mesh.triangles) == 0:
+            ctx.warn("TSDF 没提取到任何三角形：可能是视角太少、深度无效，"
+                     "或体素过大。可试 --set export.mesh_voxel_div=800")
+            return []
+
+        out: list[dict] = []
+        obj_path = out_dir / "model_mesh.obj"
+        import open3d as o3d
+
+        o3d.io.write_triangle_mesh(str(obj_path), mesh, write_vertex_colors=True)
+        out.append({"kind": "mesh_obj", "path": obj_path.name,
+                    "size_mb": round(obj_path.stat().st_size / 1024 / 1024, 2),
+                    "desc": (f"三角网格 OBJ（{len(mesh.triangles)} 面，"
+                             f"TSDF 融合，{info['views_used']} 视角）")})
+        ctx.success(f"已导出 {obj_path.name}（{len(mesh.triangles)} 个三角形）")
+
+        # 附带一份网格 PLY：很多工具链（MeshLab / CloudCompare）读它比 obj 稳
+        ply_path = out_dir / "model_mesh.ply"
+        o3d.io.write_triangle_mesh(str(ply_path), mesh, write_vertex_colors=True)
+        out.append({"kind": "mesh_ply", "path": ply_path.name,
+                    "size_mb": round(ply_path.stat().st_size / 1024 / 1024, 2),
+                    "desc": "三角网格 PLY（与 OBJ 同源）"})
+
+        # 网格统计写进 manifest，便于判断质量
+        bb = mesh.get_axis_aligned_bounding_box()
+        out.append({"kind": "mesh_stats",
+                    "triangles": len(mesh.triangles), "vertices": len(mesh.vertices),
+                    "bbox_extent": [round(float(v), 4) for v in bb.get_extent()],
+                    "views_used": info["views_used"], "voxel": round(info["voxel"], 5),
+                    "desc": "网格统计（供质量判断）"})
+        return out
 
     # ------------------------------------------------------------------ GLB
     def _write_glb(self, path: Path, gauss: dict, shrink: float = 1.0) -> Path:
@@ -495,8 +619,12 @@ class ExportStage(Stage):
             ctx.info(f"已生成 {len(out)} 张真实渲染预览（gsplat）")
         return out
 
-    def _training_cameras(self, ctx: StageContext, out_dir: Path):
+    def _training_cameras(self, ctx: StageContext, out_dir: Path, limit: int = 4):
         """读取训练阶段用的 COLMAP 稀疏模型，取若干真实相机位姿（c2w）与 K。
+
+        limit：最多返回多少个位姿。**预览**只需要 4 个不同视角即可；
+        但 **TSDF 网格融合**需要尽量多的视角覆盖物体表面，所以调用方要传大值
+        （踩坑：早期这个方法硬抽 4 个，网格导出只有 4 个视角可用，融合质量极差）。
 
         为什么不用"自己估的环绕相机"：实测那样很容易取景失当
         （相机落在高斯云内部或太远），渲出来是一片背景色，
@@ -535,11 +663,11 @@ class ExportStage(Stage):
             c2w[:3, 3] = t
             poses.append((c2w.astype(np.float32), cam.intrinsics().astype(np.float32),
                           int(cam.width), int(cam.height), im.name))
-        # 均匀抽 4 个视角，避免都挤在同一侧
-        if len(poses) > 4:
-            idx = np.linspace(0, len(poses) - 1, 4).round().astype(int)
+        # 均匀抽取，避免都挤在同一侧
+        if limit and len(poses) > limit:
+            idx = np.linspace(0, len(poses) - 1, limit).round().astype(int)
             poses = [poses[i] for i in idx]
-        ctx.info(f"预览将使用 {len(poses)} 个训练相机位姿（来自 {model_dir.name}）")
+        ctx.info(f"读取到 {len(poses)} 个训练相机位姿（来自 {model_dir.name}）")
         return poses
 
     def _render_from_poses(self, ctx: StageContext, xyz, scales_real, quats, opac, rgb,
