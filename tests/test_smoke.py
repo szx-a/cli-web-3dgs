@@ -144,8 +144,14 @@ def test_frames_stage_imports_images(workdir: Path) -> None:
     assert len(list((job_dir / "01_images_raw").glob("*.jpg"))) == 3
 
 
-def test_export_picks_highest_iteration(workdir: Path) -> None:
-    """导出必须取迭代数最高的检查点（字典序会把 iteration_5000 排到最后）。"""
+def test_export_picks_best_checkpoint(workdir: Path) -> None:
+    """导出选检查点的优先级：best_ply > PSNR 峰值迭代 > 迭代数最高。
+
+    背景：3DGS 在小规模环绕拍摄上会"过训练"，最后一次迭代往往不是最好的
+    （真实素材实测 step8000 的 26.45 dB 退化到 step15000 的 21.26 dB），
+    所以不能固定导出最后一次迭代。
+    另外字典序会把 iteration_5000 排到 iteration_30000 之后，必须按数值比较。
+    """
     from gsflow.stages.export import ExportStage
 
     job = workdir / "job"
@@ -153,14 +159,47 @@ def test_export_picks_highest_iteration(workdir: Path) -> None:
         d = job / "04_train" / "point_cloud" / f"iteration_{n}"
         d.mkdir(parents=True)
         (d / "point_cloud.ply").write_bytes(b"x")
+
+    # 无 metrics.json -> 回退到迭代数最高（且必须按数值而非字典序）
     assert ExportStage._find_ply(job).parent.name == "iteration_30000"
 
-    # 有 metrics.json 时以它记录为准
-    (job / "04_train" / "metrics.json").write_text(
-        json.dumps({"ply": str(job / "04_train" / "point_cloud" / "iteration_10000" / "point_cloud.ply")}),
-        encoding="utf-8",
-    )
+    def write_metrics(payload: dict) -> None:
+        (job / "04_train" / "metrics.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    # 1) best_ply 优先
+    write_metrics({
+        "ply": str(job / "04_train" / "point_cloud" / "iteration_30000" / "point_cloud.ply"),
+        "best_ply": str(job / "04_train" / "point_cloud" / "iteration_5000" / "point_cloud.ply"),
+    })
+    assert ExportStage._find_ply(job).parent.name == "iteration_5000"
+
+    # 2) 没给 best_ply 时，按 psnr_curve 峰值迭代取
+    write_metrics({
+        "ply": str(job / "04_train" / "point_cloud" / "iteration_30000" / "point_cloud.ply"),
+        "psnr_curve": [{"step": 5000, "psnr": 20.0}, {"step": 10000, "psnr": 26.5},
+                       {"step": 30000, "psnr": 21.0}],
+    })
     assert ExportStage._find_ply(job).parent.name == "iteration_10000"
+
+    # 3) 峰值迭代没存检查点时，退到不超过峰值的最大检查点
+    for n in (10000,):
+        (job / "04_train" / "point_cloud" / f"iteration_{n}" / "point_cloud.ply").unlink()
+    write_metrics({
+        "ply": str(job / "04_train" / "point_cloud" / "iteration_30000" / "point_cloud.ply"),
+        "psnr_curve": [{"step": 5000, "psnr": 20.0}, {"step": 10000, "psnr": 26.5},
+                       {"step": 30000, "psnr": 21.0}],
+    })
+    assert ExportStage._find_ply(job).parent.name == "iteration_5000"
+
+    # 4) 空字符串 best_ply 不能被当成路径（Path("") 会解析成当前目录且 exists() 为真）
+    write_metrics({
+        "ply": str(job / "04_train" / "point_cloud" / "iteration_30000" / "point_cloud.ply"),
+        "best_ply": "",
+    })
+    assert ExportStage._find_ply(job).parent.name == "iteration_30000"
+
+    # 注意：metrics.json 的 `ply` 字段是"最后一步"的记录，**故意不参与选择**，
+    # 否则就等于又退回到"固定导出最后一次迭代"（那正是要修掉的问题）。
 
 
 def test_export_glb_roundtrip(workdir: Path) -> None:
