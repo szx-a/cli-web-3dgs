@@ -507,7 +507,7 @@ class ExportStage(Stage):
                 before = len(mesh.triangles)
                 mesh = simplify_mesh(mesh, target_triangles=target)
                 ctx.info(f"⑥ QEM 简化：{before} -> {len(mesh.triangles)} 面")
-            return self._finish_mesh(ctx, mesh, info, out_dir)
+            return self._finish_mesh(ctx, mesh, info, out_dir, cams=cams)
 
         # ---------------- 路线二：TSDF 融合 ----------------
         from ..gsdata.mesh_export import fuse_tsdf
@@ -589,10 +589,44 @@ class ExportStage(Stage):
                      "或体素过大。可试 --set export.mesh_voxel_div=800")
             return []
 
-        return self._finish_mesh(ctx, mesh, info, out_dir)
+        return self._finish_mesh(ctx, mesh, info, out_dir, cams=cams)
 
-    def _finish_mesh(self, ctx: StageContext, mesh, info: dict, out_dir: Path) -> list[dict]:
-        """网格后处理与落盘：去离群 -> 写 obj/ply -> 预览 -> 统计。"""
+    def _load_bake_inputs(self, ctx: StageContext, cams):
+        """纹理烘焙要用的原图与相机参数（与 cams 同序）。
+
+        用**去畸变后的训练图**（04_train/data/images）而不是 C+leaned 图：
+        它们的投影关系与 c2w/K 严格一致，采样不会错位。
+        """
+        import numpy as np
+        from PIL import Image
+
+        job_dir = Path(getattr(ctx, "job_dir", Path(".")))
+        img_dir = job_dir / "04_train" / "data" / "images"
+        images, c2ws, ks, whs = [], [], [], []
+        for c2w, K, w, h, name in cams:
+            p = img_dir / name
+            if not p.exists():
+                cands = list(img_dir.glob(Path(name).stem + ".*")) if img_dir.exists() else []
+                if not cands:
+                    continue
+                p = cands[0]
+            try:
+                with Image.open(p) as im:
+                    images.append(np.asarray(im.convert("RGB"), dtype=np.uint8))
+            except Exception:  # noqa: BLE001
+                continue
+            c2ws.append(np.asarray(c2w, dtype=np.float64))
+            ks.append(np.asarray(K, dtype=np.float64))
+            whs.append((int(w), int(h)))
+        return images, np.stack(c2ws), np.stack(ks), whs
+
+    def _finish_mesh(self, ctx: StageContext, mesh, info: dict, out_dir: Path,
+                     cams=None) -> list[dict]:
+        """网格后处理与落盘：去离群 -> 写 obj/ply/glb -> 可选纹理烘焙 -> 预览 -> 统计。
+
+        cams：训练相机位姿列表 [(c2w, K, w, h, name)]，给了才做纹理烘焙
+              （烘焙要从原图采样颜色）。
+        """
         import numpy as np
         import open3d as o3d
 
@@ -643,6 +677,49 @@ class ExportStage(Stage):
             ctx.success(f"已导出 {glb_path.name}（网格 glb，校验{'通过' if vres['ok'] else '未通过'}）")
         except Exception as exc:  # noqa: BLE001
             ctx.warn(f"网格 GLB 导出失败（obj/ply 已导出）：{type(exc).__name__}: {exc}")
+
+        # ---- 纹理烘焙（可选）：UV 展开 + 从原图烘焙漫反射贴图 ----
+        # 顶点色在细节上远不如贴图（顶点数决定颜色分辨率），
+        # 烘焙后模型能带"原图质感"，这是"实感"的最后一步。
+        if cams and ctx.cfg("mesh_texture", False):
+            try:
+                from ..gsdata.mesh_export import bake_texture_from_views, unwrap_uv
+
+                tex_size = int(ctx.cfg("mesh_texture_size", 2048) or 2048)
+                ctx.info(f"⑦ 纹理烘焙：UV 展开（xatlas）+ 从 {len(cams)} 个视角采样 @{tex_size}² ...")
+                uv_mesh, uv_tris, uv = unwrap_uv(mesh, tex_size=tex_size)
+
+                images, c2ws, ks, whs = self._load_bake_inputs(ctx, cams)
+                tex, tinfo = bake_texture_from_views(
+                    uv_mesh, uv_tris, uv, images, c2ws, ks, whs, tex_size=tex_size)
+                ctx.info(f"   贴图覆盖 UV 图集 {tinfo['coverage']*100:.1f}%")
+
+                o3d.io.write_triangle_mesh(str(out_dir / "model_mesh_uv.obj"), uv_mesh,
+                                           write_vertex_colors=True, write_triangle_uvs=True)
+                from PIL import Image as _Img
+
+                _Img.fromarray(tex).save(out_dir / "model_mesh_texture.png")
+                # 带贴图的 GLB：**必须自己拼**。open3d 写出带贴图网格时会报
+                # "This file format does not support writing textures and uv
+                # coordinates"，产出的 glb 里没有 images/textures/materials
+                # （实测解析确认），贴图会被丢掉。
+                tex_glb = out_dir / "model_mesh_textured.glb"
+                self._write_mesh_glb(tex_glb, uv_mesh, name="textured_mesh",
+                                     texture_png=(out_dir / "model_mesh_texture.png").read_bytes(),
+                                     corner_uv=np.asarray(uv_mesh.triangle_uvs))
+                out.append({"kind": "mesh_textured_glb", "path": tex_glb.name,
+                            "size_mb": round(tex_glb.stat().st_size / 1024 / 1024, 2),
+                            "coverage": round(tinfo["coverage"], 4),
+                            "desc": f"带贴图的网格 glTF 2.0（{tex_size}² 贴图，UV 展开）"})
+                out.append({"kind": "mesh_texture", "path": "model_mesh_texture.png",
+                            "size_mb": round((out_dir / 'model_mesh_texture.png').stat().st_size / 1024 / 1024, 2),
+                            "desc": "烘焙出的漫反射贴图"})
+                out.append({"kind": "mesh_uv_obj", "path": "model_mesh_uv.obj",
+                            "size_mb": round((out_dir / 'model_mesh_uv.obj').stat().st_size / 1024 / 1024, 2),
+                            "desc": "带 UV 的网格 OBJ（配 model_mesh_texture.png 使用）"})
+                ctx.success(f"已导出 {tex_glb.name}（带贴图网格）")
+            except Exception as exc:  # noqa: BLE001
+                ctx.warn(f"纹理烘焙失败（无贴图版本已导出）：{type(exc).__name__}: {exc}")
 
         bb = mesh.get_axis_aligned_bounding_box()
         out.append({"kind": "mesh_stats",
@@ -737,12 +814,19 @@ class ExportStage(Stage):
         return path
 
     # -------------------------------------------------------------- 网格 GLB
-    def _write_mesh_glb(self, path: Path, mesh, name: str = "mesh") -> Path:
+    def _write_mesh_glb(self, path: Path, mesh, name: str = "mesh",
+                        texture_png: bytes | None = None,
+                        corner_uv: "np.ndarray | None" = None) -> Path:
         """把三角网格写成 glTF 2.0 二进制（`.glb`），**TRIANGLES 图元 + 顶点色**。
 
-        为什么需要：点云 GLB 在通用查看器里只是"一堆点"，
-        而网格 GLB 是**带面的实体**，能直接进 Blender / Unity / three.js /
-        Windows 自带的"3D 查看器"，这才是用户要的"有实感"。
+        给了 `texture_png` 与 `corner_uv` 时，额外写入 `TEXCOORD_0` 与内嵌贴图
+        （`images`/`textures`/`samplers` + `baseColorTexture`）。
+
+        ⚠️ 为什么自己写而不用 open3d 的写出：
+        `o3d.io.write_triangle_mesh(..., write_triangle_uvs=True)` 遇到带贴图的
+        网格会打印 "This file format does not support writing textures and uv
+        coordinates"，产出的 .glb 里**没有 images/textures/materials**，贴图被丢掉
+        （实测解析 JSON 只有 POSITION/COLOR_0/NORMAL）。所以带贴图的 glb 必须自己拼。
 
         坐标约定：glTF 是 **Y 轴向上**，而 COLMAP / 我们的重建是 Y 向下，
         所以这里对 y、z 取反让模型正立（与点云 GLB 的处理保持一致）。
@@ -773,63 +857,135 @@ class ExportStage(Stage):
         n_face = np.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0])
         flip = (n_face * (v.mean(axis=1) + 1e-9)).sum(axis=1) < 0
         if flip.all():
-            tris = tris[:, ::-1]
+            # ⚠️ `tris[:, ::-1]` 会产生 **int64** 视图，tobytes() 会写 8 字节/元素，
+            # 而 glTF 声明的是 uint32 -> 查看器解析出天文数字索引。
+            # 实测被 validate_glb 抓到："索引越界 max=3907240675 >= 顶点数 33024"。
+            # 必须显式转回 uint32。
+            tris = np.ascontiguousarray(tris[:, ::-1].astype(np.uint32))
+
+        use_tex = texture_png is not None and corner_uv is not None
+        if use_tex:
+            # glTF 的 UV 原点在左上、v 向下；我们的 UV 已经是这个约定，直接用。
+            uv = np.asarray(corner_uv, dtype=np.float32).reshape(-1, 2)
+            if len(uv) != len(tris) * 3:
+                raise ValueError(f"UV 角数 {len(uv)} != 面数×3 {len(tris)*3}")
+
+        # 自检：索引必须落在顶点范围内。这里挡一道，比让查看器黑屏好。
+        # （踩坑：`tris[:, ::-1]` 会产生 int64 视图，tobytes() 写 8 字节/元素，
+        #   而 glTF 声明 uint32 -> 解析出天文数字索引，被 validate_glb 抓到。）
+        tris = np.ascontiguousarray(tris, dtype=np.uint32)
+        if int(tris.max(initial=0)) >= len(verts):
+            raise ValueError(f"网格索引越界：max={int(tris.max())} >= 顶点数 {len(verts)}")
 
         pos_b = verts.tobytes()
         col_b = cols.tobytes()
         idx_b = tris.reshape(-1).tobytes()
-        # 各段按 4 字节对齐
-        pos_pad = (-len(pos_b)) % 4
-        col_pad = (-len(col_b)) % 4
-        blob = pos_b + b"\x00" * pos_pad + col_b + b"\x00" * col_pad + idx_b
-        pos_len, col_len, idx_len = len(pos_b), len(col_b), len(idx_b)
-        col_off = pos_len + pos_pad
-        idx_off = col_off + col_len + col_pad
+        assert len(idx_b) == tris.size * 4, (len(idx_b), tris.size)
+        assert struct.unpack_from("<I", idx_b, 0)[0] < len(verts), \
+            f"索引首元素异常：{struct.unpack_from('<I', idx_b, 0)[0]}"
+        parts: list[bytes] = []
+        cur = 0
 
-        gltf = {
+        def _add(blob: bytes) -> tuple[int, int]:
+            """按 4 字节对齐追加一段二进制，返回 (起始偏移, 未加 padding 的长度)。
+
+            ⚠️ 踩坑（找了很久的一个低级错误）：最初写成 `parts = [pos_b]` 先把位置
+            数据放进列表，然后又调 `_add(pos_b)` 追加了一次 ——
+            等于**位置数据写了两遍**，索引整体后移，而各 bufferView 声明的 offset
+            仍按"只写一遍"推导，于是"头部自洽、内容错位"：
+            `validate_glb` 报 `索引越界 max=3223540644`（那其实是 float 的位模式）。
+            教训：**所有段落一律走同一个 `_add`**，不要在初始化时就预置元素。
+            """
+            nonlocal cur
+            pad = (-len(blob)) % 4
+            start = cur
+            parts.append(blob + b"\x00" * pad)
+            cur += len(blob) + pad
+            return start, len(blob)
+
+        pos_off, pos_len = _add(pos_b)
+        col_off, col_len = _add(col_b)
+        uv_off = uv_len = 0
+        if use_tex:
+            uv_off, uv_len = _add(uv.tobytes())
+        idx_off, idx_len = _add(idx_b)
+        img_off = img_len = 0
+        if use_tex:
+            img_off, img_len = _add(texture_png)
+        blob = b"".join(parts)
+
+        buffer_views = [
+            {"buffer": 0, "byteOffset": pos_off, "byteLength": pos_len, "target": 34962},
+            {"buffer": 0, "byteOffset": col_off, "byteLength": col_len, "target": 34962},
+        ]
+        accessors = [
+            {"bufferView": 0, "componentType": COMPONENT_FLOAT, "count": int(len(verts)),
+             "type": "VEC3",
+             "min": [float(verts[:, i].min()) for i in range(3)],
+             "max": [float(verts[:, i].max()) for i in range(3)]},
+            {"bufferView": 1, "componentType": 5121, "normalized": True,
+             "count": int(len(verts)), "type": "VEC3"},
+        ]
+        attributes = {"POSITION": 0, "COLOR_0": 1}
+        n_bv = 2
+        idx_accessor = None
+        if use_tex:
+            buffer_views.append({"buffer": 0, "byteOffset": uv_off,
+                                 "byteLength": uv_len, "target": 34962})
+            accessors.append({"bufferView": n_bv, "componentType": COMPONENT_FLOAT,
+                              "count": int(len(uv)), "type": "VEC2"})
+            attributes["TEXCOORD_0"] = n_bv
+            n_bv += 1
+        buffer_views.append({"buffer": 0, "byteOffset": idx_off,
+                             "byteLength": idx_len, "target": 34963})
+        accessors.append({"bufferView": n_bv, "componentType": 5125,
+                          "count": int(tris.size), "type": "SCALAR"})
+        idx_accessor = n_bv
+        n_bv += 1
+        if use_tex:
+            buffer_views.append({"buffer": 0, "byteOffset": img_off, "byteLength": img_len})
+
+        material = {
+            "name": "mesh_surface",
+            "pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1],
+                                     "metallicFactor": 0.0, "roughnessFactor": 0.8},
+            "doubleSided": True,
+        }
+        gltf: dict = {
             "asset": {"version": "2.0", "generator": "gsflow"},
             "scene": 0,
             "scenes": [{"nodes": [0]}],
             "nodes": [{"mesh": 0, "name": name}],
-            "meshes": [{
-                "name": name,
-                "primitives": [{
-                    "attributes": {"POSITION": 0, "COLOR_0": 1},
-                    "indices": 2,
-                    "mode": MODE_TRIANGLES,
-                    "material": 0,
-                }],
-            }],
-            "materials": [{
-                "name": "mesh_surface",
-                "pbrMetallicRoughness": {
-                    "baseColorFactor": [1, 1, 1, 1],
-                    "metallicFactor": 0.0,
-                    "roughnessFactor": 0.8,
-                },
-                "doubleSided": True,
-            }],
+            "meshes": [{"name": name, "primitives": [{
+                "attributes": attributes, "indices": idx_accessor,
+                "mode": MODE_TRIANGLES, "material": 0}]}],
             "buffers": [{"byteLength": len(blob)}],
-            "bufferViews": [
-                {"buffer": 0, "byteOffset": 0, "byteLength": pos_len, "target": 34962},
-                {"buffer": 0, "byteOffset": col_off, "byteLength": col_len, "target": 34962},
-                {"buffer": 0, "byteOffset": idx_off, "byteLength": idx_len, "target": 34963},
-            ],
-            "accessors": [
-                {"bufferView": 0, "componentType": COMPONENT_FLOAT, "count": int(len(verts)),
-                 "type": "VEC3",
-                 "min": [float(verts[:, i].min()) for i in range(3)],
-                 "max": [float(verts[:, i].max()) for i in range(3)]},
-                {"bufferView": 1, "componentType": 5121, "normalized": True,
-                 "count": int(len(verts)), "type": "VEC3"},
-                {"bufferView": 2, "componentType": 5125, "count": int(tris.size),
-                 "type": "SCALAR"},
-            ],
+            "bufferViews": buffer_views,
+            "accessors": accessors,
             "extras": {"triangles": int(len(tris)), "vertices": int(len(verts)),
-                       "source": "gsflow-mesh"},
+                       "textured": bool(use_tex), "source": "gsflow-mesh"},
         }
+        if use_tex:
+            gltf["materials"] = [material]
+            gltf["materials"][0]["pbrMetallicRoughness"]["baseColorTexture"] = {"index": 0}
+            gltf["textures"] = [{"source": 0, "sampler": 0}]
+            gltf["images"] = [{"bufferView": n_bv, "mimeType": "image/png"}]
+            gltf["samplers"] = [{"magFilter": 9729, "minFilter": 9987,
+                                 "wrapS": 10497, "wrapT": 10497}]
+        else:
+            gltf["materials"] = [material]
+
         json_bytes = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
         json_bytes += b" " * ((-len(json_bytes)) % 4)
+
+        # 写盘前自检：直接从**最终 blob**里按 accessor 读回索引并与内存比对。
+        # 结构与内容都自洽才允许落盘（这样就不会再把"声明对、内容错"的文件交出去）。
+        _bv = buffer_views[idx_accessor]["byteOffset"]
+        _back = np.frombuffer(blob[_bv:_bv + 16], dtype="<u4")
+        assert np.array_equal(_back, tris.reshape(-1)[:len(_back)]), (
+            "索引回读不一致：blob=" + str(_back.tolist())
+            + " vs tris=" + str(tris.reshape(-1)[:len(_back)].tolist()))
+        assert int(_back.max()) < len(verts), f"回读索引越界：{int(_back.max())} >= {len(verts)}"
 
         total = 12 + 8 + len(json_bytes) + 8 + len(blob)
         with path.open("wb") as fh:

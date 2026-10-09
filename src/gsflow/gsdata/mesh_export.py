@@ -485,6 +485,207 @@ def simplify_mesh(mesh, target_triangles: int = 0, voxel: float = 0.0):
     return mesh
 
 
+def unwrap_uv(mesh, tex_size: int = 2048):
+    """用 xatlas 做 UV 展开，返回 (新网格, 顶点 UV, 索引)。
+
+    UV 展开是纹理烘焙的前提：要把三维表面"摊平"到二维图集上。
+    open3d 没有自带展开（没有 `compute_uvatlas`），所以用社区标准的 **xatlas**
+    （纯 CPU、无需网络、wheel 直接装）。
+
+    注意 xatlas 会**重新索引顶点**（同一顶点在不同 UV 岛里要拆开），
+    所以返回的是新网格 + 新 UV，不要拿旧索引去对应。
+    """
+    import numpy as np
+    import open3d as o3d
+    import xatlas
+
+    verts = np.asarray(mesh.vertices, dtype=np.float32)
+    tris = np.asarray(mesh.triangles, dtype=np.uint32)
+    if len(verts) == 0 or len(tris) == 0:
+        raise ValueError("网格为空，无法做 UV 展开")
+
+    vmapping, new_tris, uvs = xatlas.parametrize(verts, tris)
+    if vmapping is None or len(new_tris) == 0:
+        raise RuntimeError("xatlas 展开失败")
+
+    new_verts = verts[vmapping]
+    out = o3d.geometry.TriangleMesh()
+    out.vertices = o3d.utility.Vector3dVector(new_verts.astype(np.float64))
+    out.triangles = o3d.utility.Vector3iVector(np.asarray(new_tris, dtype=np.int32))
+    if mesh.has_vertex_colors():
+        cols = np.asarray(mesh.vertex_colors)
+        out.vertex_colors = o3d.utility.Vector3dVector(cols[vmapping])
+    out.compute_vertex_normals()
+
+    # ⚠️ 两套 UV 约定要分清：
+    #   xatlas 返回的是**逐顶点** UV，长度 = 新顶点数
+    #   open3d 的 `triangle_uvs` 要的是**逐三角形-角** UV，长度 = 面数 × 3
+    # 直接赋值会报 "UV 数量不匹配：113923 != 236712"（我踩过）。
+    # 正确做法是按三角形索引把逐顶点 UV 展开成逐角。
+    uv = np.asarray(uvs, dtype=np.float64)
+    new_tris = np.asarray(new_tris, dtype=np.int64)
+    if uv.shape[0] == len(new_verts):
+        corner_uv = uv[new_tris].reshape(-1, 2)
+    elif uv.shape[0] == len(new_tris) * 3:
+        corner_uv = uv.reshape(-1, 2)
+    else:
+        raise RuntimeError(f"xatlas 返回的 UV 数量无法识别：{uv.shape[0]}"
+                           f"（顶点 {len(new_verts)}，面 {len(new_tris)}）")
+    out.triangle_uvs = o3d.utility.Vector2dVector(corner_uv)
+    out.triangle_material_ids = o3d.utility.IntVector(
+        np.zeros(len(new_tris), dtype=np.int32))
+    return out, new_tris, corner_uv
+
+
+def bake_texture_from_views(mesh, uv_tris, uv, images, c2ws, ks, src_whs,
+                            tex_size: int = 2048, batch: int = 200,
+                            margin_px: int = 2, max_views: int = 60):
+    """从多视角图像给网格烘焙一张漫反射贴图。
+
+    做法（社区常用思路，不依赖可微渲染器）：
+      1. xatlas 展开得到 UV 图集
+      2. 遍历图集里的三角形，在 UV 空间的包围盒内逐像素填色
+      3. 每个像素用重心坐标反推到三维点，投影到**所有视角**，
+         在"可见且拍摄方向与法线夹角最小"的视角上采样颜色（最接近正对表面）
+      4. 边缘膨胀几次（dilate），避免采样时出现黑缝
+
+    ⚠️ 性能坑：一开始写成"逐三角形 + 逐视角"两层 Python 循环，
+    8 万面 × 29 视角要跑十几分钟。现在改成**按批处理**：
+    一批三角形（默认 200）先把所有像素铺平成一个大数组，
+    再对全部视角做一次**向量化**投影/采样，速度提升一到两个数量级。
+
+    返回 (H,W,3) uint8 贴图 与 统计。
+    """
+    import numpy as np
+
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    tris = np.asarray(uv_tris, dtype=np.int64)
+    uv = np.asarray(uv, dtype=np.float64).reshape(-1, 3, 2)
+    n_face = len(tris)
+    normal = np.asarray(mesh.vertex_normals, dtype=np.float64)
+
+    # 视角太多时均匀抽稀（烘焙不需要全部视角，正对表面才是关键）
+    if max_views and len(c2ws) > max_views:
+        idx = np.linspace(0, len(c2ws) - 1, max_views).round().astype(int)
+    else:
+        idx = np.arange(len(c2ws))
+
+    cams = []
+    for i in idx:
+        c2w = np.asarray(c2ws[i], dtype=np.float64)
+        cams.append((np.linalg.inv(c2w), c2w[:3, 3],
+                     np.asarray(ks[i], dtype=np.float64),
+                     src_whs[i][0], src_whs[i][1],
+                     images[i].astype(np.float32) / 255.0))
+
+    tex = np.zeros((tex_size, tex_size, 3), dtype=np.float32)
+    filled = np.zeros((tex_size, tex_size), dtype=bool)
+
+    # 大三角形优先（小碎面容易被覆盖，且大面贡献的像素多）
+    area = np.abs(
+        (uv[:, 1, 0] - uv[:, 0, 0]) * (uv[:, 2, 1] - uv[:, 0, 1]) -
+        (uv[:, 2, 0] - uv[:, 0, 0]) * (uv[:, 1, 1] - uv[:, 0, 1])) * 0.5
+    order = np.argsort(-area)
+    uv_px = uv * (tex_size - 1)
+
+    for s in range(0, n_face, int(batch)):
+        fid = order[s:s + int(batch)]
+        P_list, N_list, px_list, py_list = [], [], [], []
+        for f in fid:
+            t = uv_px[f]
+            x0 = max(int(np.floor(t[:, 0].min())) - 1, 0)
+            x1 = min(int(np.ceil(t[:, 0].max())) + 1, tex_size - 1)
+            y0 = max(int(np.floor(t[:, 1].min())) - 1, 0)
+            y1 = min(int(np.ceil(t[:, 1].max())) + 1, tex_size - 1)
+            if x1 < x0 or y1 < y0:
+                continue
+            xs, ys = np.meshgrid(np.arange(x0, x1 + 1), np.arange(y0, y1 + 1))
+            pts = np.stack([xs.ravel(), ys.ravel()], axis=1).astype(np.float64)
+            a, b, c = t[0], t[1], t[2]
+            v0, v1 = b - a, c - a
+            den = v0[0] * v1[1] - v1[0] * v0[1]
+            if abs(den) < 1e-12:
+                continue
+            v2 = pts - a
+            w1 = (v2[:, 0] * v1[1] - v1[0] * v2[:, 1]) / den
+            w2 = (v0[0] * v2[:, 1] - v2[:, 0] * v0[1]) / den
+            w0 = 1.0 - w1 - w2
+            inside = (w0 >= -0.002) & (w1 >= -0.002) & (w2 >= -0.002)
+            if not inside.any():
+                continue
+            w0, w1, w2 = w0[inside], w1[inside], w2[inside]
+            i0, i1, i2 = tris[f]
+            P_list.append(w0[:, None] * verts[i0] + w1[:, None] * verts[i1] + w2[:, None] * verts[i2])
+            nrm = (w0[:, None] * normal[i0] + w1[:, None] * normal[i1] + w2[:, None] * normal[i2])
+            N_list.append(nrm / np.maximum(np.linalg.norm(nrm, axis=1, keepdims=True), 1e-9))
+            px_list.append(pts[inside][:, 0].astype(np.int32))
+            py_list.append(pts[inside][:, 1].astype(np.int32))
+
+        if not P_list:
+            continue
+        P = np.concatenate(P_list, axis=0)
+        N = np.concatenate(N_list, axis=0)
+        px = np.concatenate(px_list)
+        py = np.concatenate(py_list)
+
+        best = np.full(len(P), -1.0)
+        col = np.zeros((len(P), 3), dtype=np.float32)
+        for w2c, ctr, K, iw, ih, img in cams:
+            vc = P @ w2c[:3, :3].T + w2c[:3, 3]
+            z = vc[:, 2]
+            ok = z > 1e-6
+            if not ok.any():
+                continue
+            u = (vc @ K[0, :3]) / np.maximum(z, 1e-9)
+            v = (vc @ K[1, :3]) / np.maximum(z, 1e-9)
+            ok &= (u >= 0) & (u < iw) & (v >= 0) & (v < ih)
+            vd = P - ctr
+            vd /= np.maximum(np.linalg.norm(vd, axis=1, keepdims=True), 1e-9)
+            facing = -(N * vd).sum(axis=1)
+            ok &= facing > 0.15
+            if not ok.any():
+                continue
+            sc = np.where(ok, facing, -1.0)
+            take = sc > best
+            if not take.any():
+                continue
+            sy = (img.shape[0] - 1) / max(ih - 1, 1)
+            sx = (img.shape[1] - 1) / max(iw - 1, 1)
+            ui = np.clip((u[take] * sx).astype(np.int32), 0, img.shape[1] - 1)
+            vi = np.clip((v[take] * sy).astype(np.int32), 0, img.shape[0] - 1)
+            col[take] = img[vi, ui]
+            best[take] = sc[take]
+
+        got = best >= 0
+        if got.any():
+            tex[py[got], px[got]] = col[got]
+            filled[py[got], px[got]] = True
+
+    # 边缘膨胀：填掉 UV 岛边界与未覆盖像素，避免采样出黑缝
+    for _ in range(max(1, int(margin_px))):
+        if filled.all():
+            break
+        acc = np.zeros_like(tex)
+        cnt = np.zeros(filled.shape, dtype=np.float32)
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                sh_t = np.roll(np.roll(tex, dy, axis=0), dx, axis=1)
+                sh_f = np.roll(np.roll(filled, dy, axis=0), dx, axis=1)
+                acc += sh_t * sh_f[..., None]
+                cnt += sh_f
+        fill_now = (~filled) & (cnt > 0)
+        if not fill_now.any():
+            break
+        tex[fill_now] = acc[fill_now] / cnt[fill_now][:, None]
+        filled[fill_now] = True
+
+    return ((np.clip(tex, 0, 1) * 255).astype(np.uint8),
+            {"tex_size": tex_size, "coverage": float(filled.mean()),
+             "views_used": len(cams)})
+
+
 def render_mesh_previews(mesh, out_dir, size: int = 512, views=None) -> list[dict]:
     """用 open3d 的离屏渲染器把网格渲成几张预览图。
 
