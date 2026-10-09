@@ -388,7 +388,9 @@ class ExportStage(Stage):
                 np.asarray(gauss["rgb"]),
                 normals=_gaussian_normals(gauss, ctx),
                 depth=int(ctx.cfg("mesh_poisson_depth", 9) or 9),
-                density_quantile=float(ctx.cfg("mesh_density_quantile", 0.03) or 0.0),
+                # 默认 0（不裁）。实测这是最敏感的参数：
+                # 0.03 会把轮廓 IoU 从 0.683 砍到 0.315。
+                density_quantile=float(ctx.cfg("mesh_density_quantile", 0.0) or 0.0),
             )
             ctx.info(f"泊松重建完成：depth={info['depth']}，"
                      f"用了 {info['points_used']} 个点，"

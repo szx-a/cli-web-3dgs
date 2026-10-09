@@ -409,7 +409,7 @@ def render_mesh_previews(mesh, out_dir, size: int = 512, views=None) -> list[dic
 
 
 def poisson_mesh(points, colors, normals=None, depth: int = 9,
-                 density_quantile: float = 0.03,
+                 density_quantile: float = 0.0,
                  knn: int = 30, statistical_nb: int = 20, statistical_std: float = 2.0,
                  orient: bool = True):
     """泊松表面重建：直接从高斯点云得到**闭合实体网格**。
@@ -469,7 +469,11 @@ def poisson_mesh(points, colors, normals=None, depth: int = 9,
         pcd, depth=int(depth))
     dens = np.asarray(densities)
 
-    # 4) 密度裁剪：低密度处是"没有观测数据的凭空外推"，必须去掉
+    # 4) 密度裁剪：低密度处是"没有观测数据的凭空外推"。
+    #    ⚠️ 但阈值必须很小 —— 实测这是**最敏感**的参数：
+    #       density_quantile=0.03 会把轮廓 IoU 从 0.683 砸到 0.315（砍半），
+    #       因为它连同大量**真实表面**一起裁掉了。
+    #       所以默认 0.0（不裁）；确实存在大鼓包时才用 0.005 级别的小值。
     if 0.0 < density_quantile < 1.0 and dens.size:
         thr = float(np.quantile(dens, density_quantile))
         mesh.remove_vertices_by_mask(dens < thr)
