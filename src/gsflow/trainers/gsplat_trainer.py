@@ -110,6 +110,19 @@ class TrainConfig:
     reset_opacity: float = 0.0
     # 重置后暂停精修的步数（0=不暂停）。建议设为训练图片数。
     pause_refine_after_reset: int = 0
+
+    # 密度控制策略：
+    #   "builtin"  —— 本项目自写的简化实现（3D 梯度 + 固定阈值，实测校准过）
+    #   "official" —— 直接复用官方 `gsplat.DefaultStrategy`（含 ops.py 的
+    #                 duplicate/split/remove/reset_opa，以及 grad2d/count 统计量）
+    #
+    # 为什么要提供 official：自写实现的判据（3D 世界空间梯度 + 固定绝对阈值）
+    # **不可跨分辨率迁移**，而且缺少配套的浮点抑制，导致渲染上出现半透明"雾"
+    # （诊断图证实：几何正确、但背景被浮点抬高 -> PSNR 掉到 14 dB）。
+    # 我试过零散抄官方的几个公式（grad2d/count、屏幕空间归一化），三次都失败
+    # （13~17 / 23.9 / 9.4 dB）—— 因为官方那套是**整体自洽**的机制，
+    # 拆一半移植比不移植更糟。所以正确做法是**直接复用官方类**。
+    densify_strategy: str = "builtin"
     eval: bool = True
     # 相机轴约束：默认 False = 不翻转，与官方 gsplat 的 COLMAP 加载器一致。
     # 只保留用于对照实验；正常流程不要打开。
@@ -118,6 +131,10 @@ class TrainConfig:
     # 改为在训练视图上算 PSNR 并在指标里标注，避免"PSNR 恒为 0"的误读。
     min_imgs_for_holdout: int = 10
     eval_interval: int = 2000
+    # 日志用的高频评估固定用几个留出视图（0=用全部留出视图）。
+    # 存在的理由：训练视图是循环取的，而 eval_interval 与循环长度不互质时会产生
+    # **度量混叠**（同一相位反复评估同一张难图 -> 曲线周期性骤降，误判训练不稳）。
+    eval_quick_views: int = 3
     white_background: bool = False
     mask_loss_until: float = 0.25
     seed: int = 42
@@ -371,6 +388,25 @@ def train(cfg: TrainConfig, ctx) -> dict:
     # 评估用的视图集合：有留出就用留出，否则退回训练视图（并标记）
     psnr_idx = sorted(eval_idx) if eval_idx else list(range(len(imgs)))
     psnr_on_train = not eval_idx
+    # ⚠️ 度量混叠（本项目一个很隐蔽的坑，见 docs/03 G32）：
+    # 训练视图是按 `train_idx[step % len(train_idx)]` **循环**取的，
+    # 而评估间隔 eval_interval 往往与循环长度 len(train_idx) 不互质
+    # （本机实测 1000 % 110 = 10），于是
+    #     6000 % 110 == 12000 % 110 == 60
+    # —— 两次评估恰好落在**循环里的同一相位**，看到的是同一张"难图"。
+    # 表现是 PSNR 曲线在固定步数反复骤降（6000/12000/...），
+    # 让人误判"训练不稳定"。实测内置密度控制与官方 DefaultStrategy **都**在同样步数降，
+    # 说明问题在**度量**而不是训练。
+    # 对策：日志用的高频评估**固定取前若干张**（确定性），
+    # 完整留出集只在最后一次评估时用（作为最终可信指标）。
+    quick_n = int(cfg.eval_quick_views)
+    if quick_n > 0 and len(psnr_idx) > quick_n:
+        psnr_idx_log = psnr_idx[:quick_n]
+    else:
+        psnr_idx_log = psnr_idx
+    if psnr_idx_log != psnr_idx:
+        ctx.info(f"评估：日志用固定 {len(psnr_idx_log)} 个视图（避免与训练循环混叠），"
+                 f"最后一次用全部 {len(psnr_idx)} 个留出视图")
     if psnr_on_train:
         ctx.warn(f"仅 {len(imgs)} 个视图（< {cfg.min_imgs_for_holdout}），不留评估集；"
                  f"PSNR 将在 {len(psnr_idx)} 个训练视图上计算（仅供趋势参考，不是泛化指标）")
@@ -446,9 +482,42 @@ def train(cfg: TrainConfig, ctx) -> dict:
         for k, opt in optimizers.items():
             for group in opt.param_groups:
                 group["lr"] = _LR[k] * factor
-
     optimizers = make_optimizers()
     sched = None  # 用 schedule_lrs 手动等价实现，避免替换参数后调度器失效
+
+    # ---- 可选：直接复用官方 `gsplat.DefaultStrategy` ----
+    # 这是"移植官方机制"的正确形态：整套复用（含 ops.py 的
+    # duplicate/split/remove/reset_opa 与 grad2d/count 统计量），而不是零散抄公式。
+    # 我试过零散移植三次都失败（见 docs/03 G31），根因就是机制的整体性。
+    gs_strategy = None
+    gs_state: dict = {}
+    if str(cfg.densify_strategy).lower() == "official":
+        try:
+            from gsplat import DefaultStrategy
+
+            gs_strategy = DefaultStrategy(
+                prune_opa=cfg.prune_opacity,
+                grow_grad2d=cfg.densify_grad_threshold,
+                grow_scale3d=cfg.grow_scale3d,
+                prune_scale3d=cfg.prune_scale3d,
+                refine_start_iter=cfg.densify_from,
+                refine_stop_iter=cfg.densify_until,
+                reset_every=(cfg.opacity_reset_interval or 3000),
+                refine_every=cfg.densify_interval,
+                pause_refine_after_reset=cfg.pause_refine_after_reset,
+                revised_opacity=bool(cfg.revised_opacity),
+                key_for_gradient="means2d",
+            )
+            gs_strategy.check_sanity(params, optimizers)
+            gs_state = gs_strategy.initialize_state(scene_scale=scene_scale)
+            ctx.info(f"密度控制：**官方 DefaultStrategy**（grow_grad2d={cfg.densify_grad_threshold}，"
+                     f"refine {cfg.densify_from}~{cfg.densify_until} 每 {cfg.densify_interval} 步，"
+                     f"reset_every={cfg.opacity_reset_interval or 3000}，"
+                     f"pause_refine_after_reset={cfg.pause_refine_after_reset}）")
+        except Exception as exc:  # noqa: BLE001
+            gs_strategy = None
+            ctx.warn(f"官方 DefaultStrategy 初始化失败，退回内置密度控制："
+                     f"{type(exc).__name__}: {exc}")
 
     def refresh_params() -> None:
         """密度控制替换参数对象后，把局部变量重新指向新对象。"""
@@ -627,6 +696,10 @@ def train(cfg: TrainConfig, ctx) -> dict:
         ssim_val = ssim_simple(render.permute(2, 0, 1)[None], gt.permute(2, 0, 1)[None])
         loss = (1.0 - cfg.ssim_weight) * l1 + cfg.ssim_weight * (1.0 - ssim_val)
 
+        # 官方策略要求在 backward 之前 retain 它需要的梯度（means2d）
+        if gs_strategy is not None:
+            gs_strategy.step_pre_backward(params, optimizers, gs_state, step, meta or {})
+
         # ---- 反向 ----
         loss.backward()
         # 缓存本步的位置梯度范数：密度控制需要它，但那时 .grad 已被 zero_grad 清掉。
@@ -685,34 +758,37 @@ def train(cfg: TrainConfig, ctx) -> dict:
         # ---- 结构更新（后向之后进行，官方称之为 post-backward step）----
         # 官方 simple_trainer.py 的顺序就是：
         #   optimizer.step() -> optimizer.zero_grad(set_to_none=True) -> strategy.step_post_backward(...)
-        #
+        if gs_strategy is not None:
+            # 官方整套：grow -> prune -> 清统计量 ->（按周期）重置不透明度
+            n_before = int(params["means"].shape[0])
+            gs_strategy.step_post_backward(params, optimizers, gs_state, step,
+                                           meta or {}, packed=False)
+            n_after = int(params["means"].shape[0])
+            if n_after != n_before:
+                refresh_params()
+                if step % 500 == 0 or abs(n_after - n_before) > 5000:
+                    ctx.info(f"step {step} 官方密度控制：{n_before} -> {n_after} 个高斯")
+            else:
+                refresh_params()
         # 判据必须在这里用缓存量：zero_grad 之后 means.grad 已是 None，
         # 直接读会恒为 None -> 一次都不加密（早期踩过）。
         # 传入的是 backward 之后缓存的位置梯度范数（zero_grad 之后就读不到了）。
-        if (cfg.densify_from <= step <= cfg.densify_until
+        elif (cfg.densify_from <= step <= cfg.densify_until
                 and step % cfg.densify_interval == 0
                 and (cfg.opacity_reset_interval <= 0
                      or step % cfg.opacity_reset_interval >= cfg.pause_refine_after_reset)):
             densify_and_prune(step, grad_norm_cache)
 
-        # ---- 透明度周期性重置（清除"漂浮"高斯）----
-        # 严格照官方 `DefaultStrategy.step_post_backward` 的两条规则：
-        #
-        #   1) 重置的**值**是 `prune_opa * 2.0`（默认 0.005*2 = 0.01），
-        #      **不是** `revised_opacity`（那个是"分裂出的子高斯调低到多少"，0.1，
-        #      而且官方默认 `revised_opacity=False` 不启用）。我早期把两者搞混了。
-        #   2) 重置后要**暂停精修** `pause_refine_after_reset` 步（官方建议设为图片数）：
-        #         step % reset_every >= pause_refine_after_reset 才允许 grow/prune。
-        #      缺了这条就会"刚压下去的不透明度立刻又长回来" ——
-        #      我早期实测重置导致 PSNR 从 36.28 崩到 19.02，很可能就是这个原因。
-        if cfg.opacity_reset_interval and step > 0 and step % cfg.opacity_reset_interval == 0:
-            with torch.no_grad():
-                reset_val = float(cfg.reset_opacity if cfg.reset_opacity > 0
-                                  else cfg.prune_opacity * 2.0)
-                opac.data.clamp_(max=float(torch.logit(torch.tensor(reset_val, device=device))))
-            if cfg.pause_refine_after_reset > 0:
-                ctx.info(f"step {step}：不透明度重置为 {reset_val:.3f}，"
-                         f"暂停精修 {cfg.pause_refine_after_reset} 步")
+        # ================= 不透明度重置：位置见"评估与保存"之后 =================
+        # ⚠️ 顺序红线：重置必须放在**保存检查点与评估之后**。
+        # 踩坑（很隐蔽，且污染所有下游产物）：重置把 logit 不透明度钳到
+        # `logit(prune_opa*2)`（默认 logit(0.01)）。而 step 15000 同时满足
+        # `15000 % 3000 == 0`（重置步）与"最后一步" ——
+        # 若重置在保存之前，"最终检查点"存下的就是**刚被重置完的状态**：
+        #     实测 iteration_15000 有 90.6% 的高斯不透明度被钉在 0.01、max 也是 0.01，
+        #     从该 PLY 渲染一片黑、逐视图 PSNR 仅 ~10 dB；
+        #     而同一时刻 trainer 内存里的模型（重置前）报 22~24 dB。
+        # 所以循环末尾（评估/保存之后）才做重置。
 
         # ---- 评估与日志 ----
         if step % cfg.log_every == 0 or step == cfg.iterations:
@@ -728,6 +804,10 @@ def train(cfg: TrainConfig, ctx) -> dict:
             loss_log.append({"step": step, "loss": round(ema_loss, 5), "gaussians": int(means.shape[0])})
 
         if cfg.eval and cfg.eval_interval and (step % cfg.eval_interval == 0 or step == cfg.iterations):
+            # 最后一次评估用**全部**留出视图（可信的最终指标）；
+            # 中途用固定的少数视图（确定性，避免与训练循环相位混叠）。
+            is_final = (step == cfg.iterations)
+            ev_idx_now = psnr_idx if is_final else psnr_idx_log
             # 全部用关键字传参：位置传参曾因顺序写错而静默失效（形状恰好兼容）
             eval_res = evaluate(
                 rasterization=rasterization,
@@ -740,18 +820,20 @@ def train(cfg: TrainConfig, ctx) -> dict:
                 masks=masks,
                 ks=ks,
                 viewmats=viewmats,
-                eval_idx=sorted(psnr_idx),
+                eval_idx=ev_idx_now,
                 sh_degree=cfg.sh_degree,
                 background=background,
                 device=device,
                 max_side=max_side,
                 # 只在最后一次评估时导出"渲染 vs 真值"对比图（诊断位姿约定用）
-                dump_dir=(cfg.out_dir / "diagnostics" / "render_vs_gt"
-                          if step == cfg.iterations else None),
+                dump_dir=(cfg.out_dir / "diagnostics" / "render_vs_gt" if is_final else None),
             )
-            psnr_log.append({"step": step, "psnr": round(eval_res, 3)})
+            psnr_log.append({"step": step, "psnr": round(eval_res, 3),
+                             "views": len(ev_idx_now), "final": is_final})
             tag = "（训练视图，非泛化指标）" if psnr_on_train else ""
-            ctx.emit(f"step {step} 评估 PSNR={eval_res:.2f} dB{tag}", level="info",
+            tag += "（全留出集）" if is_final and not psnr_on_train else ""
+            ctx.emit(f"step {step} 评估 PSNR={eval_res:.2f} dB "
+                     f"[{len(ev_idx_now)} 视图]{tag}", level="info",
                      progress=step / cfg.iterations)
             # 记录/保存"最佳检查点"：
             # 3DGS 在小规模环绕拍摄上常出现"过训练"（后期加密导致拟合变差，
@@ -774,6 +856,14 @@ def train(cfg: TrainConfig, ctx) -> dict:
                 best_ply = best_dir / "point_cloud.ply"
 
         if step % 5000 == 0 or step == cfg.iterations:
+            # ⚠️ 顺序红线：**保存检查点必须在"不透明度重置"之前**。
+            # 踩坑（很隐蔽，且影响所有下游产物）：重置会把 logit 不透明度钳到
+            # `logit(0.01)`，而 step 15000 恰好是 `15000 % 3000 == 0` 的重置步 ——
+            # 于是"最后保存的检查点"= "刚被重置完的状态"：
+            #     实测 iteration_15000 有 90.6% 的高斯不透明度被钉在 0.01、max 也是 0.01
+            #     从该 PLY 渲染出来**一片黑**，逐视图 PSNR 只有 ~10 dB，
+            #     而 trainer 内存里的同一模型（重置前）报 22~24 dB。
+            # 导出阶段优先用 best_ply（可以避开），但"最终模型"会被这个坏快照污染。
             # 关键字传参：位置传参出过一次静默错位（evaluate 的 PSNR 因此恒为 0）
             save_ply(
                 path=gs_dir / f"iteration_{step}" / "point_cloud.ply",
@@ -785,6 +875,29 @@ def train(cfg: TrainConfig, ctx) -> dict:
                 sh_degree=cfg.sh_degree,
             )
             ctx.info(f"已保存检查点 iteration_{step}")
+
+        # ================= 不透明度重置（必须在保存/评估之后）=================
+        # ⚠️ 顺序红线（踩过，且会污染所有下游产物）：
+        # 重置把 logit 不透明度钳到 `prune_opa*2` 的 logit（默认 logit(0.01)）。
+        # 而 step 15000 恰好满足 `15000 % 3000 == 0`，**同时也是最后一步** ——
+        # 若把重置放在保存之前，"最终检查点"保存的就是**刚被重置完的状态**：
+        #     实测 iteration_15000 有 90.6% 的高斯不透明度被钉在 0.01、max 也是 0.01，
+        #     从该 PLY 渲染出来一片黑、逐视图 PSNR 仅 ~10 dB；
+        #     而同一时刻 trainer 内存里的模型（重置前）报 22~24 dB。
+        # 两个对策：
+        #   1) 重置整体后移到"保存 + 评估"之后（本段的位置）
+        #   2) **最后一步跳过重置** —— 最后一步重置没有任何恢复机会，
+        #      只会让最终快照变差，没有任何好处
+        if (gs_strategy is None and cfg.opacity_reset_interval and step > 0
+                and step % cfg.opacity_reset_interval == 0
+                and step != cfg.iterations):
+            with torch.no_grad():
+                reset_val = float(cfg.reset_opacity if cfg.reset_opacity > 0
+                                  else cfg.prune_opacity * 2.0)
+                opac.data.clamp_(max=float(torch.logit(torch.tensor(reset_val, device=device))))
+            if cfg.pause_refine_after_reset > 0:
+                ctx.info(f"step {step}：不透明度重置为 {reset_val:.3f}，"
+                         f"暂停精修 {cfg.pause_refine_after_reset} 步")
 
     # ---- 收尾：保存最终模型与指标 ----
     final_dir = gs_dir / f"iteration_{cfg.iterations}"
