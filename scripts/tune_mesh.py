@@ -131,9 +131,10 @@ def main() -> int:
 
     # 第一轮：裁剪/密度/泊松层数（上一轮已定位 dens_q=0.0 最佳，这里继续找最优 depth 与 crop）
     combos = []
-    for crop_q in (None, 0.90, 0.95, 1.00):
-        for depth in (8, 9, 10):
-            combos.append(dict(crop_q=crop_q, dens_q=0.0, depth=depth))
+    for crop_q in (0.90, 0.95):
+        for depth in (9, 10):
+            for dens_q in (0.0, 0.001, 0.005):
+                combos.append(dict(crop_q=crop_q, dens_q=dens_q, depth=depth))
     # 第二轮（--extended）：法线方向与离群点阈值
     if args.extended:
         for stat_std in (1.0, 2.0, 3.5):

@@ -15,8 +15,8 @@
   },
   "memory": {
     "total_gb": 15.2,
-    "available_gb": 3.1,
-    "load_percent": 79.0
+    "available_gb": 3.7,
+    "load_percent": 75.0
   },
   "gpu": {
     "available": true,
@@ -26,15 +26,15 @@
         "name": "NVIDIA GeForce RTX 5060 Laptop GPU",
         "driver": "573.22",
         "vram_total_mb": 8151.0,
-        "vram_used_mb": 644.0,
+        "vram_used_mb": 1477.0,
         "compute_cap": "12.0"
       }
     ]
   },
   "cuda": {
-    "nvcc": "",
-    "CUDA_HOME": "",
-    "CUDA_PATH": "D:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8"
+    "nvcc": "F:\\3dgs-and-ai\\tools\\cuda\\bin\\nvcc.EXE",
+    "CUDA_HOME": "F:\\3dgs-and-ai\\tools\\cuda",
+    "CUDA_PATH": "F:\\3dgs-and-ai\\tools\\cuda"
   },
   "torch": {
     "installed": true,
@@ -57,17 +57,17 @@
     {
       "drive": "C:",
       "total_gb": 384.1,
-      "free_gb": 185.4
+      "free_gb": 180.5
     },
     {
       "drive": "D:",
       "total_gb": 400.0,
-      "free_gb": 154.4
+      "free_gb": 153.3
     },
     {
       "drive": "F:",
       "total_gb": 146.5,
-      "free_gb": 115.9
+      "free_gb": 110.9
     }
   ],
   "tools": [
@@ -184,7 +184,7 @@
     "download_pytorch_org_reachable": true,
     "huggingface_co_reachable": false,
     "hf-mirror_com_reachable": true,
-    "github_com_reachable": false,
+    "github_com_reachable": true,
     "huggingface_reachable": false
   },
   "paths": {
@@ -198,11 +198,6 @@
       "severity": "info",
       "item": "GPU 为 Blackwell（sm_120）",
       "action": "CUDA 必须 12.8+；torch 必须 cu128 及以上；不要使用文档里的 CUDA 11.8。"
-    },
-    {
-      "severity": "warn",
-      "item": "未检测到 nvcc（CUDA Toolkit）",
-      "action": "gsplat 纯 pip 路线可暂不装；若要官方 rasterizer 或自编译扩展，装 CUDA 12.8/12.9。"
     },
     {
       "severity": "warn",

@@ -15,8 +15,10 @@
 | ② AI 前景分割 / 背景清理 | ✅ 已实测 | 后端可插拔；合成图实测 IoU：rembg 0.977、classical 0.93~0.98 |
 | ③ COLMAP 稀疏重建 | ✅ 已实测 | 自带 COLMAP 3.12（CUDA）；自动匹配模式 + mask 接入 + 质量体检 |
 | ④ 3DGS 训练（gsplat） | ✅ 已实测 | 合成基准上 **PSNR 32.90 dB（留出视图）**；免管理员便携 CUDA 编译内核通过 |
-| ⑤ 导出（GLB / 查看器 / 预览图） | ✅ 已实测 | GLB 通过 glTF 2.0 结构校验；预览为 gsplat **真实渲染**（渲染｜真值并排） |
-| ⑥ 质量报告 | ✅ 已实测 | 注册率、平均重投影误差、掩码占比、清晰度、PSNR、改进建议 |
+| ⑤ 导出（点云 GLB / 查看器 / 预览图） | ✅ 已实测 | GLB 通过 glTF 2.0 结构校验；预览为 gsplat **真实渲染**（渲染｜真值并排） |
+| ⑥ **三角网格导出** | ✅ 已实测 | **深度反投影 → 泊松 → 平滑 → QEM 简化**；轮廓 IoU **0.66**；出 obj/ply/glb |
+| ⑦ **纹理烘焙** | ✅ 已实测 | xatlas UV 展开 + 多视角采样烘漫反射贴图；UV 图集覆盖 **86%**；出带贴图 glb |
+| ⑧ 质量报告 | ✅ 已实测 | 注册率、平均重投影误差、掩码占比、清晰度、PSNR、改进建议 |
 
 **合成基准上的实测结果**（36 视图环绕一块铺满纹理的平面）：
 
@@ -30,6 +32,25 @@
 
 > 注意：合成基准只能验证**流程是否正确**，用它评判真实场景的重建质量并不合适
 > （它是一块平面，几何本身很简单）。真实质量请用实拍数据。
+
+**真实数据上的网格质量**（122 视图环绕一个碗，`mask_loss_until=1.0`）：
+
+| 指标 | 数值 |
+|---|---|
+| 网格提取路线 | 深度反投影（75 视角 @640px）→ 泊松 depth=9 → Taubin 平滑 → QEM |
+| 反投影点云 / 下采样后 | 2,579,017 → 2,311,406 点 |
+| 最终面数 | 385,170（QEM 目标 40 万） |
+| **轮廓 IoU**（对比高斯渲染轮廓） | **0.66** |
+| 深度相对误差（中位数 / 均值 / p90） | 2.39% / 3.83% / 9.13% |
+| 纹理烘焙 | UV 图集覆盖 86.5%，1024² 贴图 |
+
+> 该模型（`cmp-maskfull`）用 `mask_loss_until=1.0` 训练，
+> 网格仍把碗和一大片桌面包在一起 —— **质量瓶颈在模型侧的背景污染，不在提取算法**。
+> 网格预览图（`preview_mesh_iso.png`）可肉眼确认。
+
+> 「轮廓 IoU」是本项目自建的可量化指标（本机 open3d 的离屏渲染在无窗口环境返回全黑，
+> "看图评估"不可用）。**单一指标不能作为唯一判据** —— 早期一条路线深度误差更小
+> （1.77%）却只覆盖物体 1/5 的面积，IoU 才 0.24。要**同时看覆盖度与精度**。
 
 **测试**：`30 passed`（含真实 COLMAP 二进制解析、mask 阶段契约、Web 路由、GLB 规范校验、导出选择逻辑）。
 
@@ -131,7 +152,9 @@ scripts\gsflow.cmd export <job_id>
 | `train.backend` | `gsplat` | `gsplat`（推荐/免编译）/ `official`（需自编译）/ `external`（自备脚本） |
 | `train.iterations` | 30000 | 8GB 卡建议 15000~30000 |
 | `train.resolution` | 1600 | 长边；OOM 会自动按 1600→1400→1200→1000→800→600 降档重试 |
-| `train.cap_max` | 1500000 | 高斯数量上限（显存守护），8GB 建议 ≤120 万 |
+| `train.cap_max` | 600000 | 高斯数量上限（显存守护），8GB 建议 ≤120 万 |
+| `train.densify_until` | **4000** | 密度控制窗口上界。官方默认 15000；实测改 4000 后高斯数**少 68%** 且不再过训练退化（PSNR 基本持平） |
+| `train.mask_loss_until` | **1.0** | 掩码内损失生效的迭代占比。**1.0=全程约束在掩码内**，模型轮廓更干净、网格更准 |
 | `train.sh_degree` | 3 | 球谐阶数，降低可省显存 |
 | `train.eval` | true | 是否留出评估集算 PSNR |
 
@@ -143,8 +166,72 @@ env\venv\Scripts\python.exe scripts\debug_train.py --iterations 100   :: 打完�
 scripts\gsflow.cmd jobs                    :: 看作业状态与失败原因
 ```
 
-> **踩坑提醒**：不要用 `scripts\gsflow.cmd` 跑训练。它不带 MSVC 环境，
-> nvcc 会报 `Cannot find compiler 'cl.exe' in PATH`。训练一律用 `scripts\gsflow_gpu.cmd`。
+> **关于 MSVC 环境**：`scripts\gsflow_gpu.cmd` 会先 `call vcvars64.bat` 再启动 Python。
+> 现在已经**不需要**依赖这一点 —— `paths.apply_runtime_env()` 会在 Python 内自动
+> 装配便携 CUDA 与 MSVC 环境（`vcvars64.bat` 的导出被解析并装入当前进程），
+> 所以 CLI / GUI / 测试三条入口的编译环境**完全对等**，
+> `scripts\gsflow.cmd` 与 `scripts\web.cmd` 也都能编译内核。
+
+---
+
+## 五之二、三角网格与纹理导出（把"点云"变成"有实感的实体"）
+
+```bat
+:: 网格 + 纹理烘焙（默认网格方法是泊松）
+scripts\gsflow_gpu.cmd run --job-id <job> --stages export --force export ^
+    --set export.formats=mesh --set export.mesh_texture=true
+
+:: 只重跑导出、不重训（复用已有 04_train）
+scripts\gsflow_gpu.cmd run --job-id <job> --stages export --force export --set export.formats=mesh
+```
+
+导出格式（`export.formats`，逗号分隔）：
+
+| 值 | 产物 | 说明 |
+|---|---|---|
+| `glb_points` | `model.glb` | 点云式 glTF（`POINTS` 图元 + 顶点色） |
+| `spz` | `model.spz` | 需装 `spz` 包；否则跳过 |
+| `obj` | `model.ply` | 原始高斯 PLY |
+| `viewer_html` | `viewer.html` | 自带 three.js 查看器（单文件） |
+| **`mesh`** | `model_mesh.obj/.ply/.glb` | **三角网格**（`TRIANGLES` 图元 + 顶点色），可直接进 Blender / Unity / three.js / Windows「3D 查看器」 |
+| `mesh` + `mesh_texture=true` | `model_mesh_textured.glb`、`model_mesh_texture.png`、`model_mesh_uv.obj/.mtl` | **带贴图的网格**（贴图内嵌在 glb 里） |
+
+网格相关参数：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `export.mesh_method` | `poisson` | `poisson`（深度反投影 + 泊松，推荐）/ `tsdf`（TSDF 融合） |
+| `export.mesh_width` | 640 | 渲深度用的分辨率（越大越慢、越细） |
+| `export.mesh_max_views` | 80 | 参与融合的视角上限 |
+| `export.mesh_poisson_depth` | 9 | 泊松八叉树深度。8 快 / 9 均衡 / 10 更细更慢 |
+| `export.mesh_density_quantile` | **0.0** | 密度裁剪分位。**这是最敏感的参数**：`0.03` 会把轮廓 IoU 从 0.68 砍到 0.32（连通真实表面一起裁了） |
+| `export.mesh_crop_quantile` | 0.90 | 自动聚焦到主体（按不透明度加权包围盒的分位） |
+| `export.mesh_target_triangles` | 400000 | QEM 简化目标面数（0=不简化） |
+| `export.mesh_smooth_iters` | 5 | Taubin 平滑迭代（比拉普拉斯好：不收缩体积） |
+| `export.mesh_texture` | false | 是否烘焙贴图 |
+| `export.mesh_texture_size` | 2048 | 贴图边长 |
+
+> 网格流程（对应社区标准做法）：渲深度 → 按不透明度/深度一致性过滤 →
+> **反投影成紧贴表面的稠密点云** → 体素下采样均匀化 → 泊松重建 →
+> Taubin 平滑 → QEM 简化 →（可选）UV 展开 + 纹理烘焙。
+>
+> **关键点**：不要把高斯中心直接当点云喂给泊松。高斯中心是"分布在表面附近的
+> 三维体"，不是薄壳，泊松会鼓包 + 过拟合 —— 实测那条路线网格只有物体的 1/5 大
+> （轮廓 IoU 0.24），而深度反投影路线是 **0.66**。
+>
+> **密度裁剪（`density_quantile`）要多加小心**：它的本意是"用密度图把低密度区域的
+> 包络面删掉"，但全局分位数会**误伤观测较少的侧面**（正对相机的区域密度高、
+> 侧面密度低，一个全局阈值切不平）。实测 `0.03` 直接把 IoU 从 0.68 砍到 0.32。
+> 泊松在"完全无数据"处的密度接近 0，所以阈值要取**很小**的值；默认 `0.0` 表示不裁。
+
+排障与调参脚本：
+
+```bat
+env\venv\Scripts\python.exe scripts\tune_mesh.py --job <job>              :: 在已有模型上秒级扫网格参数 + IoU 打分
+env\venv\Scripts\python.exe scripts\verify_mesh_quality.py --job <job>    :: 轮廓 IoU + 深度一致性
+env\venv\Scripts\python.exe scripts\dump_glb.py --path <file.glb>         :: 打印 GLB 结构，查"声明与内容是否自洽"
+env\venv\Scripts\python.exe scripts\check_mesh_indices.py --mesh <f.obj>  :: 查索引越界 / UV 数量
+```
 
 ---
 
@@ -157,15 +244,21 @@ scripts\web.cmd --port 9000    :: 换端口
 
 界面 5 个页签：
 
-1. **新建作业** —— 输入路径、勾阶段、调关键参数；右下角实时显示**等价的 CLI 命令**
+1. **新建作业** —— 输入路径、勾阶段、调关键参数；含**「3.5 网格导出」卡片**
+   （网格方法 / 导出格式 / 泊松深度 / 目标面数 / 平滑迭代 / 深度分辨率 / 视角上限 /
+   密度裁剪分位 / 纹理烘焙开关 / 贴图分辨率）；右下角实时显示**等价的 CLI 命令**
 2. **作业与进度** —— 实时日志 + 进度条 + 取消；历史作业可回看日志与产物链接
 3. **环境自检** —— 等于 `gsflow doctor`，上方是待办清单
-4. **设置 / API Key** —— HuggingFace Token、HF 镜像、代理、SAM3 Key，写入
-   `config/credentials.json`（已 gitignore，界面只回显尾 4 位）
+4. **设置 / API Key** —— HuggingFace Token、SAM3 API Key、其它预留 Key
+   （如 SD-inpaint）、HF 镜像、代理，写入 `config/credentials.json`
+   （已 gitignore，界面只回显尾 4 位）
 5. **说明** —— 流程与显存建议
 
 > GUI 与 CLI 共用同一个 Orchestrator、同一份 `job.json`、同一套事件总线：
 > GUI 提交的作业在 `gsflow jobs` 里能看到，反之亦然。
+>
+> 这条红线有**静态检查守门**：`scripts\check_gui_wiring.py` 校验 HTML 控件与
+> `app.js` 引用一一对应，防止"界面填了但提交时没带上"这类静默失真。
 
 ---
 
@@ -180,7 +273,7 @@ scripts\web.cmd --port 9000    :: 换端口
 ├─ docs/        00 环境核查与规划 / 01 架构 / 02 操作手册 / 03 踩坑记录 / 04 文件树
 ├─ scripts/     环境搭建、工具下载、启动器、验证脚本
 ├─ src/gsflow/  流程核心：pipeline / stages / segment / trainers / gsdata / tools / web
-├─ tests/       29 项测试
+├─ tests/       30 项测试
 ├─ tools/       自带 colmap / ffmpeg / 便携 cuda
 ├─ env/         虚拟环境、缓存、临时目录
 └─ workspace/   每个作业一个子目录（01_images_raw … 06_reports）
@@ -201,7 +294,25 @@ env\venv\Scripts\python.exe scripts\verify_mask_stage.py           :: mask 阶�
 env\venv\Scripts\python.exe scripts\mask_selftest.py               :: 各分割后端对比
 env\venv\Scripts\python.exe scripts\verify_export_stage.py         :: 导出 + GLB 规范校验
 env\venv\Scripts\python.exe scripts\verify_portable_cuda.py        :: 便携 CUDA 编译内核
+env\venv\Scripts\python.exe scripts\check_gui_wiring.py            :: GUI 控件与 app.js 接线一致性
 env\venv\Scripts\python.exe scripts\gui_job_smoke.py --port 8787   :: 经 GUI API 跑一次作业
+```
+
+需要 GPU / 已训练模型的脚本：
+
+```bat
+scripts\gpu_python.cmd scripts\verify_mesh_quality.py --job <job>   :: 轮廓 IoU + 深度一致性
+scripts\gpu_python.cmd scripts\tune_mesh.py --job <job>             :: 网格参数扫描 + IoU 打分
+scripts\gpu_python.cmd scripts\gui_mesh_smoke.py --port 8787 --job <job>  :: 经 GUI 出网格+贴图
+```
+
+排障脚本（排查环境与二进制格式问题）：
+
+```bat
+env\venv\Scripts\python.exe scripts\diag_msvc_env.py        :: MSVC 环境解析
+scripts\gpu_python.cmd scripts\diag_gsplat_preload.py       :: gsplat 内核预加载（应在 1s 内）
+env\venv\Scripts\python.exe scripts\dump_glb.py --path a.glb        :: GLB 结构
+env\venv\Scripts\python.exe scripts\check_mesh_indices.py --mesh a.obj :: 网格索引
 ```
 
 ---
@@ -213,9 +324,21 @@ env\venv\Scripts\python.exe scripts\gui_job_smoke.py --port 8787   :: 经 GUI AP
 | [环境核查与实施规划](docs/00-环境核查与实施规划.md) | 实测软硬件、与原始文档的偏差、分阶段计划 |
 | [架构说明](docs/01-架构说明.md) | 分层、模块地图、阶段契约、扩展点 |
 | [操作手册](docs/02-操作手册.md) | 一次性准备、CLI/GUI 用法、参数速查、典型工作流 |
-| [踩坑记录](docs/03-踩坑记录.md) | 全过程踩坑与解法（沙箱、CUDA、COLMAP、编码等） |
+| [踩坑记录](docs/03-踩坑记录.md) | 全过程踩坑与解法（A~I 共 27 类；沙箱、CUDA、COLMAP、编码、训练发散、网格/GLB、入口环境对等） |
 | [文件树](docs/04-文件树.md) | 工程结构与作业产物布局 |
 | [AGENTS.md](AGENTS.md) | 给协作者的既定事实与架构红线 |
+
+**踩坑记录里值得单独一提的几条**（都是花了很久才定位的）：
+
+| 编号 | 内容 | 一句话教训 |
+|---|---|---|
+| G17 | 泊松的 `density_quantile=0.03` 把网格质量砍半（IoU 0.68→0.32） | **先建立便宜的量化评分，再调参**；否则只能"改一行跑一次看图猜" |
+| G18 | 网格必须走**深度反投影**，不能拿高斯中心直接喂泊松 | 高斯中心是三维体不是薄壳；实测 IoU 0.24 → 0.65 |
+| G19 | 网格 GLB 的三个坑：uint32 索引 / y-z 取反 / 逆时针绕序 | 索引越界会让查看器**黑屏且不报错** |
+| G22 | GLB 的位置数据被写了两遍（`parts=[pos]` 又 `_add(pos)`） | **断言全过但结果不对 ⇒ 断言的层次选错了**，要断言最终产物 |
+| G23 | open3d 写出的"带贴图 glb"其实没有贴图 | 第三方库的静默降级要自己验证，别信日志 |
+| G25 | GUI 与 CLI 的编译环境不对等（GUI 用不了 gsplat） | **"能不能用"不能取决于用户从哪个脚本启动** |
+| G26 | gsplat 每次 import 都重编内核（80~140s → 0.2s） | 四个坑里有三个是**顺序**问题；靠"打印每步耗时"定位 |
 
 ---
 
@@ -227,3 +350,8 @@ env\venv\Scripts\python.exe scripts\gui_job_smoke.py --port 8787   :: 经 GUI AP
    训练后端（gsplat/official/external）都是接口。
 4. **失败要能自救**：缺工具 / 缺凭据 / COLMAP 失败都给出可执行的修复建议，而不是堆栈。
 5. **两端同构**：GUI 的每次提交都能翻译成一条可直接执行的 CLI 命令（有测试守门）。
+6. **入口环境对等**：CLI / GUI / 测试三条入口自动获得同样的编译环境
+   （`paths.apply_runtime_env()` 内装配便携 CUDA + MSVC），
+   不允许出现"某个入口少了一层包装所以某些功能不可用"。
+7. **产物要能被通用工具打开**：GLB 必须过 glTF 2.0 结构校验（含索引越界检查），
+   网格要能直接拖进 Blender / Unity / three.js / Windows「3D 查看器」。

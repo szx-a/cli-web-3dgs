@@ -392,7 +392,9 @@ class ExportStage(Stage):
         # 泊松对远处杂点比 TSDF 更敏感（会生成巨大的"鼓包"），所以默认裁得更紧。
         xyz_np = np.asarray(gauss["xyz"], dtype=np.float64)
         op_np = np.asarray(gauss["opacity"], dtype=np.float64).reshape(-1)
-        default_q = 0.90 if method == "poisson" else 0.98
+        # 自动聚焦默认分位 0.95：实测 0.90 偏紧（会切掉主体部分外缘），
+        # 同一模型同一验证脚本下轮廓 IoU 0.95 明显更好（0.750 vs 0.696）。
+        default_q = 0.95 if method == "poisson" else 0.98
         if ctx.cfg("mesh_auto_crop", True):
             lo, hi, cinfo = auto_crop_bounds(
                 xyz_np, op_np,
@@ -489,7 +491,12 @@ class ExportStage(Stage):
             mesh, info = poisson_mesh(
                 bp_pts, bp_cols, normals=bp_nrm,
                 depth=int(ctx.cfg("mesh_poisson_depth", 9) or 9),
-                density_quantile=float(ctx.cfg("mesh_density_quantile", 0.0) or 0.0),
+                # 默认 0.001 —— 不是 0（等于关掉密度裁剪），也不是 0.03。
+                # 实测（同一模型、5 视角、224px 的 tune_mesh 扫描）：
+                #   0.000 -> IoU 0.725 | 0.001 -> 0.750 | 0.005 -> 0.614 | 0.030 -> 0.315
+                # 0.03 这种"看起来合理"的分位数会把大量**真实表面**一起裁掉；
+                # 泊松在"完全无观测"处的密度接近 0，所以阈值必须取得很小。
+                density_quantile=float(ctx.cfg("mesh_density_quantile", 0.001) or 0.0),
                 orient=True,
             )
             info["method"] = "poisson_backproject"

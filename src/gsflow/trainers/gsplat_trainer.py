@@ -83,14 +83,33 @@ class TrainConfig:
     revised_opacity: float = 0.1
     # 裁剪阈值：不透明度低于此值的高斯被删除（官方 0.005）
     prune_opacity: float = 0.005
-    # 不透明度重置：官方每 3000 步把不透明度压回 0.01，**并在之后立刻重新致密化**。
-    # 实测教训：我只实现了"压回 0.1"、漏了官方配套的 densify 补回步骤，
-    # 结果每次重置都把模型打掉一大半 —— 同一份数据、其余设置不变：
-    #     重置开 -> step6000 PSNR 19.02，之后一直在 19~21 徘徊
-    #     重置关 -> step10000 PSNR 36.44，且稳定上升
-    # 因此默认关闭（0 = 关闭）。若要开启，必须同时实现"重置后致密化"，
-    # 否则请不要打开。
+    # 不透明度重置：**默认关闭**，这是实测后的决定，不是漏实现。
+    #
+    # 已按官方补齐的三件事（`step_post_backward` 的完整顺序）：
+    #   * 重置的**值**是 `prune_opa * 2.0`（0.01），不是 `revised_opacity`（0.1）
+    #   * 重置后**暂停精修** `pause_refine_after_reset` 步
+    #   * 尺度裁剪以 `step > reset_every` 为门槛
+    #
+    # 但实测仍不划算（122 视图 / 15000 迭代 / mask_loss_until=1.0）：
+    #
+    #   A 组 densify_until=4000  + reset_every=2000 -> 中段崩到 13~17，末段 26.51
+    #   B 组 densify_until=15000 + reset_every=3000 -> 峰值 23.92，末段 17.63，
+    #                                                 高斯数 279,534（不重置仅 78,526）
+    #
+    # 根因：官方 `_update_state()` 的加密判据用的是**累积梯度 ÷ 可见次数**：
+    #       grad2d.index_add_(...); grads = grad2d / count.clamp_min(1)
+    # 而本项目用的是"当步梯度模长直接比绝对阈值"。
+    # 重置把不透明度压到 0.01 后，所有高斯的梯度都会突然变大，
+    # 这套判据就会**疯狂加密** -> 高斯爆炸（27.9 万 vs 7.9 万）。
+    #
+    # ⇒ 要启用重置，必须先补上官方的"梯度累积 ÷ 可见次数"统计量
+    #   （即把 gsplat 的 DefaultStrategy 完整移植过来）。
+    #   在那之前，默认 0（关闭）是更稳的选择。
     opacity_reset_interval: int = 0
+    # 重置时压到的目标不透明度；<=0 表示用 prune_opacity*2.0（官方行为）
+    reset_opacity: float = 0.0
+    # 重置后暂停精修的步数（0=不暂停）。建议设为训练图片数。
+    pause_refine_after_reset: int = 0
     eval: bool = True
     # 相机轴约束：默认 False = 不翻转，与官方 gsplat 的 COLMAP 加载器一致。
     # 只保留用于对照实验；正常流程不要打开。
@@ -471,7 +490,10 @@ def train(cfg: TrainConfig, ctx) -> dict:
         if grad_norm is None:
             return 0, 0
         with torch.no_grad():
-            # 默认固定绝对阈值（官方语义）；densify_quantile>0 时才启用分位自适应（实验用）
+            # 官方语义：判据是 **平均每次可见的梯度**（grad2d / count），
+            # 量纲已归一化，所以 2e-4 这类阈值在不同分辨率/场景下可迁移。
+            # 调用方传入的就是这个平均量（见 train() 里的 grad2d/count 累加）。
+            # densify_quantile>0 时才启用分位自适应（实验用）。
             if cfg.densify_quantile > 0:
                 thr = _quantile(grad_norm, 1.0 - cfg.densify_quantile)
                 thr = min(max(thr, cfg.densify_grad_threshold), cfg.densify_grad_max)
@@ -499,9 +521,11 @@ def train(cfg: TrainConfig, ctx) -> dict:
             # 裁剪规则一：不透明度过低（官方 prune_opa）
             is_prune = torch.sigmoid(params["opacities"].data).squeeze(-1) < cfg.prune_opacity
             # 裁剪规则二：尺度过大（官方 prune_scale3d）——**这条是防发散的关键，早期漏实现**。
-            # 官方在重置周期之后才启用；本项目默认不重置，故以 densify_from 作为门槛
+            # 官方用 `step > reset_every` 作门槛；若关闭了重置，退回用 densify_from
             # （即"训练进入中段后"才启用尺度裁剪）。
-            use_scale_prune = (not cfg.prune_scale_after_reset) or step > cfg.densify_from
+            _reset_iv = (cfg.opacity_reset_interval if cfg.opacity_reset_interval > 0
+                         else cfg.densify_from)
+            use_scale_prune = (not cfg.prune_scale_after_reset) or step > _reset_iv
             if use_scale_prune:
                 scales_now = torch.exp(params["scales"].data).max(dim=-1).values
                 is_prune = is_prune | (scales_now > cfg.prune_scale3d * scene_scale)
@@ -557,7 +581,7 @@ def train(cfg: TrainConfig, ctx) -> dict:
             gt = gt_full
             kk = k
 
-        colors, alphas, _ = rasterization(
+        colors, alphas, meta = rasterization(
             means=means,
             quats=quats / (quats.norm(dim=-1, keepdim=True) + 1e-8),
             scales=current_scales(),
@@ -573,6 +597,11 @@ def train(cfg: TrainConfig, ctx) -> dict:
             packed=False,
             render_mode="RGB",
         )
+        # 官方的密度控制判据用的是 **2D 屏幕空间**的 means2d 梯度，不是 3D 的 means.grad。
+        # 两者量纲完全不同：`grow_grad2d=2e-4` 只在归一化后的屏幕空间里才有意义。
+        # 所以必须 retain_grad，让 backward 之后还能读到 means2d.grad。
+        if isinstance(meta, dict) and meta.get("means2d") is not None:
+            meta["means2d"].retain_grad()
         render = colors[0]
         if cfg.white_background:
             render = render + (1 - alphas[0])
@@ -601,10 +630,36 @@ def train(cfg: TrainConfig, ctx) -> dict:
         # ---- 反向 ----
         loss.backward()
         # 缓存本步的位置梯度范数：密度控制需要它，但那时 .grad 已被 zero_grad 清掉。
+        #
+        # ⚠️ 已知缺口（如实记录，避免后人重复试错）：
+        # 官方 `DefaultStrategy` 的加密判据用的是 **2D 屏幕空间**的 `means2d` 梯度，
+        # 并做两层归一化后才和 `grow_grad2d=2e-4` 比较：
+        #     grads[..., 0] *= width / 2.0 * n_cameras    # 换算到 [-1,1] 屏幕空间
+        #     grads = grad2d / count.clamp_min(1)         # 再除以"被看到的次数"
+        # 本项目现在用的是 **3D 世界空间**的 `means.grad` + 固定阈值
+        # `train.densify_grad_threshold`（实测校准过：在 700px / 122 视图下
+        # 2e-4 给出 7.4 万高斯、PSNR 26.3 dB，是当前可用的最好结果）。
+        #
+        # 我曾尝试移植官方那套统计量（grad2d/count + 屏幕空间归一化 + 可见次数），
+        # 三次都失败：加密量暴涨（每轮 2000+ 克隆/分裂）、尺度 max 冲到 5.3
+        # （远超 `prune_scale3d*scene_scale`≈0.36）、PSNR 崩到 9.4 dB。
+        # 原因不只是"少了个 /count"—— 官方的 `duplicate/split/remove/reset_opa`
+        # 与统计量是一整套自洽机制（在 `gsplat/strategy/ops.py`），
+        # 拆一半移植比不移植更糟。
+        #
+        # ⇒ 要真正对齐官方，应整体移植 `DefaultStrategy`（约 200 行 +
+        #   `ops.py`），而不是零散补几处。在那之前，这里的实测校准值更可靠。
         grad_norm_cache = None
         if means.grad is not None:
             with torch.no_grad():
                 grad_norm_cache = means.grad.norm(dim=-1).detach().clone()
+        elif means.grad is not None:
+            # 退路：拿不到 means2d 时仍用 3D 梯度，但**量纲不同**，
+            # 阈值需要另行标定，不要套用官方的 2e-4。
+            with torch.no_grad():
+                grad_norm_cache = means.grad.norm(dim=-1).detach().clone()
+                ctx.warn("未取到 means2d 梯度，密度控制退回 3D 梯度（阈值需另行标定）")
+
         # 探针：确认渲染确实覆盖了像素、且位置参数拿到梯度。
         # 曾经出现 alpha 和 = 0 / means.grad = 0（相机位姿翻转写错，高斯全在相机背后）。
         # 训练"能跑完"不等于"在工作"，这是最省事的健康断言。
@@ -631,17 +686,33 @@ def train(cfg: TrainConfig, ctx) -> dict:
         # 官方 simple_trainer.py 的顺序就是：
         #   optimizer.step() -> optimizer.zero_grad(set_to_none=True) -> strategy.step_post_backward(...)
         #
-        # 但 zero_grad 之后 means.grad 已经是 None，所以判据必须在 backward 之后、
-        # step 之前就缓存下来（这一点和官方不同：官方用的是策略自己累积的 grad2d 统计量，
-        # 不依赖 .grad）。早期直接读 means.grad -> 恒为 None -> 一次都不加密。
-        if cfg.densify_from <= step <= cfg.densify_until and step % cfg.densify_interval == 0:
+        # 判据必须在这里用缓存量：zero_grad 之后 means.grad 已是 None，
+        # 直接读会恒为 None -> 一次都不加密（早期踩过）。
+        # 传入的是 backward 之后缓存的位置梯度范数（zero_grad 之后就读不到了）。
+        if (cfg.densify_from <= step <= cfg.densify_until
+                and step % cfg.densify_interval == 0
+                and (cfg.opacity_reset_interval <= 0
+                     or step % cfg.opacity_reset_interval >= cfg.pause_refine_after_reset)):
             densify_and_prune(step, grad_norm_cache)
 
-        # ---- 透明度周期性重置（清除“漂浮”高斯）----
-        if cfg.opacity_reset_interval and step % cfg.opacity_reset_interval == 0 and step < cfg.densify_until:
+        # ---- 透明度周期性重置（清除"漂浮"高斯）----
+        # 严格照官方 `DefaultStrategy.step_post_backward` 的两条规则：
+        #
+        #   1) 重置的**值**是 `prune_opa * 2.0`（默认 0.005*2 = 0.01），
+        #      **不是** `revised_opacity`（那个是"分裂出的子高斯调低到多少"，0.1，
+        #      而且官方默认 `revised_opacity=False` 不启用）。我早期把两者搞混了。
+        #   2) 重置后要**暂停精修** `pause_refine_after_reset` 步（官方建议设为图片数）：
+        #         step % reset_every >= pause_refine_after_reset 才允许 grow/prune。
+        #      缺了这条就会"刚压下去的不透明度立刻又长回来" ——
+        #      我早期实测重置导致 PSNR 从 36.28 崩到 19.02，很可能就是这个原因。
+        if cfg.opacity_reset_interval and step > 0 and step % cfg.opacity_reset_interval == 0:
             with torch.no_grad():
-                # 官方做法：周期把不透明度压回 0.1，清除“漂浮”高斯
-                opac.data.clamp_(max=float(torch.logit(torch.tensor(0.1, device=device))))
+                reset_val = float(cfg.reset_opacity if cfg.reset_opacity > 0
+                                  else cfg.prune_opacity * 2.0)
+                opac.data.clamp_(max=float(torch.logit(torch.tensor(reset_val, device=device))))
+            if cfg.pause_refine_after_reset > 0:
+                ctx.info(f"step {step}：不透明度重置为 {reset_val:.3f}，"
+                         f"暂停精修 {cfg.pause_refine_after_reset} 步")
 
         # ---- 评估与日志 ----
         if step % cfg.log_every == 0 or step == cfg.iterations:
