@@ -86,6 +86,7 @@ mesh_crop_quantile = 0.95
 mesh_density_quantile = 0.001
 mesh_trim_sigma = 2.5
 mesh_target_triangles = 400000
+mesh_presimplify_ratio = 10.0
 mesh_smooth_iters = 5
 mesh_largest_only = true
 mesh_texture = false

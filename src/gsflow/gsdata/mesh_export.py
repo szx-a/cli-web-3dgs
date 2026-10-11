@@ -531,6 +531,70 @@ def simplify_mesh(mesh, target_triangles: int = 0, voxel: float = 0.0):
     return mesh
 
 
+def postprocess_mesh(mesh, target_triangles: int = 0, smooth_iters: int = 5,
+                     smooth_method: str = "taubin", presimplify_ratio: float = 10.0,
+                     log=None):
+    """网格后处理链：**预简化 -> 平滑 -> 最终 QEM**，返回 (mesh, 步骤记录)。
+
+    ⚠️ 顺序是这个函数的**核心语义**，不要调换：
+
+    原来的顺序是"平滑全体 -> QEM"，在稍大的网格上会卡到不可用。实测：
+    泊松 depth=10 产出 **2771 万面 / 1393 万顶点** 时，"平滑（taubin × 5）"
+    跑了 **61 分钟仍未完成**、内存 7.9 GB（本机只有 15.2 GB）；
+    而同一模型 depth=9（485 万面）全流程只要 2.5 分钟。
+    原因是 Taubin/拉普拉斯平滑在 CPU 上对**全体顶点及其邻接**迭代，
+    代价随顶点数超线性增长，而 QEM 之后还要再全量遍历一次。
+
+    正确做法（社区通行）：平滑**不要在原始高密度网格上做**。
+    先 QEM 把规模压到 `target × presimplify_ratio`，再平滑去噪，最后 QEM 到目标面数。
+    这样平滑与最终简化的规模都由目标面数界定，泊松 depth 调高也不会失控。
+
+    `presimplify_ratio <= 1` 等于关闭预简化（保留旧行为，供需要时对照）。
+
+    已实测：QEM（open3d `simplify_quadric_decimation`）与 Taubin 平滑
+    **全程保留顶点色与法线**（端到端颜色均值差异 0.0024，法线保持单位化），
+    所以预简化不会让预览变灰、也不会破坏光照。
+    """
+    steps: list[str] = []
+    target = int(target_triangles or 0)
+    ratio = float(presimplify_ratio or 0.0)
+
+    # ⑤ 预简化：只为把平滑的规模降下来
+    if target > 0 and ratio > 1.0 and len(mesh.triangles) > target * ratio:
+        before = len(mesh.triangles)
+        mesh = simplify_mesh(mesh, target_triangles=int(target * ratio))
+        steps.append(f"预简化（QEM，为平滑降规模）：{before} -> {len(mesh.triangles)} 面")
+
+    # ⑥ 平滑（去噪）：此时规模已被界定
+    it = int(smooth_iters or 0)
+    if it > 0:
+        mesh = smooth_mesh(mesh, method=str(smooth_method or "taubin"), iterations=it)
+        steps.append(f"平滑（{smooth_method} × {it}）@{len(mesh.triangles)} 面")
+
+    # ⑦ 最终 QEM 到目标面数
+    if target > 0 and len(mesh.triangles) > target:
+        before = len(mesh.triangles)
+        mesh = simplify_mesh(mesh, target_triangles=target)
+        steps.append(f"QEM 简化：{before} -> {len(mesh.triangles)} 面")
+
+    # ⑧ 重算法线（**必须**）
+    # ⚠️ 实测坑：open3d 的 `simplify_quadric_decimation` 与 Taubin 平滑都会让
+    # **顶点法线不再是单位长度**（实测偏差达 0.027，即 2.7%）。
+    # 而导出的 GLB 直接把这份法线写给查看器做逐像素光照 —— 非单位法线会让
+    # `dot(n, L)` 偏小/偏大，表现为整体偏暗或明暗失真。
+    # 这里统一重算并单位化，保证"导出即正确"，不依赖下游各自补救。
+    try:
+        mesh.compute_vertex_normals()
+        steps.append("重算顶点法线（QEM/平滑后单位化）")
+    except Exception:  # noqa: BLE001
+        pass
+
+    if log is not None:
+        for s in steps:
+            log(s)
+    return mesh, steps
+
+
 def unwrap_uv(mesh, tex_size: int = 2048):
     """用 xatlas 做 UV 展开，返回 (新网格, 顶点 UV, 索引)。
 

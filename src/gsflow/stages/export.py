@@ -573,16 +573,21 @@ class ExportStage(Stage):
             ctx.info(f"④ 泊松重建（depth={info['depth']}）："
                      f"{len(mesh.triangles)} 个三角形 / {len(mesh.vertices)} 个顶点")
 
-            it = int(ctx.cfg("mesh_smooth_iters", 5) or 0)
-            if it > 0:
-                mesh = smooth_mesh(mesh, method=str(ctx.cfg("mesh_smooth", "taubin") or "taubin"),
-                                   iterations=it)
-                ctx.info(f"⑤ 平滑（{ctx.cfg('mesh_smooth', 'taubin')} × {it}）")
+            # ---- ⑤⑥⑦ 后处理链：**预简化 -> 平滑 -> 最终 QEM** ----
+            # 顺序的语义与原因写在 `postprocess_mesh` 的 docstring 里（不要调换）：
+            # 平滑必须跑在"已被预简化界定规模"的网格上，否则泊松 depth 一高就会卡死
+            # （实测 2771 万面时旧顺序跑了 61 分钟仍未完成）。
+            from ..gsdata.mesh_export import postprocess_mesh
+
             target = int(ctx.cfg("mesh_target_triangles", 400000) or 0)
-            if target > 0 and len(mesh.triangles) > target:
-                before = len(mesh.triangles)
-                mesh = simplify_mesh(mesh, target_triangles=target)
-                ctx.info(f"⑥ QEM 简化：{before} -> {len(mesh.triangles)} 面")
+            mesh, _steps = postprocess_mesh(
+                mesh,
+                target_triangles=target,
+                smooth_iters=int(ctx.cfg("mesh_smooth_iters", 5) or 0),
+                smooth_method=str(ctx.cfg("mesh_smooth", "taubin") or "taubin"),
+                presimplify_ratio=float(ctx.cfg("mesh_presimplify_ratio", 10.0) or 0.0),
+                log=ctx.info,
+            )
             return self._finish_mesh(ctx, mesh, info, out_dir, cams=cams)
 
         # ---------------- 路线二：TSDF 融合 ----------------

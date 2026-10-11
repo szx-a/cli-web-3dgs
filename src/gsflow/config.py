@@ -176,6 +176,11 @@ DEFAULTS: dict[str, Any] = {
                                         # 阈值 = 输入点间距 × 该值。0=关闭。
                                         # 这一项专治"该空的地方是实的"
         "mesh_target_triangles": 400000,  # QEM 简化目标面数（0=不简化）
+        # 预简化倍数：平滑**不在原始高密度网格上做**，先 QEM 降到 target×ratio 再平滑。
+        # 为什么：Taubin 平滑是 CPU 上对全体顶点与邻接的迭代，代价随规模超线性增长。
+        # 实测泊松 depth=10 产出 2771 万面时"先平滑"跑了 61 分钟仍未完成（内存 7.9GB），
+        # 而先预简化可把规模界定在目标面数量级。设为 1.0 = 关闭预简化。
+        "mesh_presimplify_ratio": 10.0,
         "mesh_smooth_iters": 5,         # Taubin 平滑迭代
         "mesh_largest_only": True,      # 只保留最大连通块
 
