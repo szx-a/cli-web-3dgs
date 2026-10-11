@@ -1,7 +1,12 @@
-"""COLMAP 数据层测试：二进制解析 + 布局兼容。
+"""COLMAP 数据层测试：二进制解析 + 布局兼容 + 多模型选择。
 
 用真实 COLMAP 输出（合成数据的作业目录）验证；文件不存在时自动跳过。
-这些用例覆盖了两个曾经真实踩到的坑：sparse/ 布局差异、注册图像名匹配。
+这些用例覆盖了三个曾经真实踩到的坑：
+  1. sparse/ 布局差异（COLMAP 3.12 输出 sparse/ 而不是 sparse/0/）
+  2. 注册图像名匹配
+  3. **多模型选择**：mapper 会把不同初始种子对的重建写成 sparse/0、1、2…，
+     而 `sparse/0` 常常是**最小的那个** —— 无条件取 0 会丢掉最好的模型
+     （实测导致 242 帧只报 2 帧注册，训练用上垃圾位姿）。
 """
 
 from __future__ import annotations
@@ -123,3 +128,45 @@ def test_find_model_dir_layouts(workdir: Path) -> None:
 
     # 什么都没有时返回一个可读的错误路径，而不是抛异常
     assert find_model_dir(workdir / "c").name in ("0", "sparse")
+
+
+def test_colmap_stage_picks_largest_sparse_model(workdir: Path) -> None:
+    """`ColmapStage._find_model` 必须选**注册图像最多**的子模型，而不是无条件选 `sparse/0`。
+    回归测试：这里曾有一个影响很大的 bug —— 原实现第一行是
+        if (sparse / "0").exists(): return sparse / "0"
+    导致下面那段"取最大"的评分逻辑永远执行不到。而 COLMAP 的 mapper 会先把
+    第一个重建写进 `sparse/0`，随后的种子对写进 `sparse/1`、`2`，**最优重建往往
+    另存为新编号**。实测：242 帧的作业里 `sparse/0` 只有 2 张图、
+    `sparse/2` 有 241 张，结果报告出"注册率 0.8%"并让训练用了垃圾位姿。
+
+    这里用文件体积模拟（`images.bin` 大小近似正比于注册图像数，实现也正是这么评分的）。
+    """
+    from gsflow.stages.colmap import ColmapStage
+
+    sparse = workdir / "sparse"
+    # sparse/0 存在但**很小**；sparse/2 最大 —— 必须选 2
+    sizes = {"0": 100, "1": 200, "2": 9000}
+    for name, n in sizes.items():
+        d = sparse / name
+        d.mkdir(parents=True)
+        (d / "images.bin").write_bytes(b"x" * n)
+        (d / "points3D.bin").write_bytes(b"x" * n)
+
+    picked = ColmapStage()._find_model(sparse)
+    assert picked is not None
+    assert picked.name == "2", f"应选最大的 sparse/2，实际选了 sparse/{picked.name}"
+
+    # 只有一个模型时照常返回它
+    only = workdir / "s1"
+    (only / "0").mkdir(parents=True)
+    (only / "0" / "images.bin").write_bytes(b"y" * 10)
+    assert ColmapStage()._find_model(only).name == "0"
+
+    # 空目录 / 没有任何 images.bin -> None（而不是抛异常）
+    empty = workdir / "s2"
+    empty.mkdir()
+    assert ColmapStage()._find_model(empty) is None
+    noimg = workdir / "s3"
+    (noimg / "0").mkdir(parents=True)
+    (noimg / "0" / "cameras.bin").write_bytes(b"z")
+    assert ColmapStage()._find_model(noimg) is None

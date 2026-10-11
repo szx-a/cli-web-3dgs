@@ -249,17 +249,42 @@ class ColmapStage(Stage):
         return "exhaustive"
 
     def _find_model(self, sparse: Path) -> Path | None:
-        if (sparse / "0").exists():
-            return sparse / "0"
-        subs = [d for d in sparse.iterdir() if d.is_dir()] if sparse.exists() else []
+        """在 `sparse/` 下选出**注册图像最多**的子模型。
+
+        ⚠️ 这里曾有一个**影响很大的 bug**：原来第一行是
+            if (sparse / "0").exists(): return sparse / "0"
+        也就是只要 `sparse/0` 存在就无条件返回它 —— 下面那段"取注册最多"的
+        评分逻辑**永远不会执行**。
+
+        而 COLMAP 的 `mapper` 行为是：**先把第一个重建写进 `sparse/0`**，
+        随后发现的其它初始种子对会写进 `sparse/1`、`sparse/2`…
+        并且**最后会把最优重建另存为一个新编号**。
+        所以 `sparse/0` 经常是**最小的那个**。
+
+        实测后果（IMG2 牌楼，242 帧）：COLMAP 日志明确写着
+        `Registering image #169 (num_reg_frames=241)` 与
+        `Keeping successful reconstruction`，即**实际注册了 241 帧**；
+        但 `sparse/0` 里只有 2 张图，我们就把这个 2 张图的模型当成结果，
+        报出"注册率 0.8%"并让后续训练用垃圾位姿。
+        （`Mapper.multiple_models` 关闭并不能避免多编号输出。）
+
+        现在改为：**扫描所有子目录，按 `images.bin` 体积取最大者**
+        （`images.bin` 大小与注册图像数近似成正比，且不必解析二进制）。
+        """
+        if not sparse.exists():
+            return None
+        subs = [d for d in sparse.iterdir() if d.is_dir()]
         if not subs:
             return None
-        # 取注册图像最多的那个子模型
+
         def score(d: Path) -> int:
             f = d / "images.bin"
             return f.stat().st_size if f.exists() else 0
 
-        return max(subs, key=score)
+        best = max(subs, key=score)
+        if score(best) == 0:
+            return None
+        return best
 
     def _quality_report(self, ctx: StageContext, images_dir: Path, text_dir: Path) -> dict:
         """统计注册率与平均重投影误差。
