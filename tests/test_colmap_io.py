@@ -33,12 +33,22 @@ WORKSPACE = ROOT / "workspace"
 
 
 def _find_job_with_model() -> Path | None:
+    """找一个含可用 COLMAP 模型的作业（用于真实数据回归）。
+
+    ⚠️ 这里必须用共享的 `pick_sparse_model()`，不能硬编码 `sparse/0`。
+    实测教训：COLMAP 会把**最优**重建写到 `sparse/1`、`sparse/2`，而 `sparse/0`
+    常常是最小的那个（img2-03 里 `sparse/0` 只有 2 张图）。
+    原来这里写死 `sparse/0`，于是在这种作业上会拿到坏模型 ——
+    测试要么读到垃圾、要么**静默跳过**（假绿）。
+    """
+    from gsflow.stages.colmap import pick_sparse_model
+
     if not WORKSPACE.exists():
         return None
     for job in sorted(WORKSPACE.iterdir(), reverse=True):
-        for cand in (job / "03_colmap" / "sparse" / "0", job / "03_colmap" / "sparse"):
-            if (cand / "cameras.bin").exists() and (cand / "images.bin").exists():
-                return cand
+        m = pick_sparse_model(job / "03_colmap" / "sparse")
+        if m is not None and (m / "cameras.bin").exists() and (m / "images.bin").exists():
+            return m
     return None
 
 

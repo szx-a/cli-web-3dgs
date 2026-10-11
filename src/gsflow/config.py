@@ -137,6 +137,15 @@ DEFAULTS: dict[str, Any] = {
         # 掩码内损失生效的迭代占比：1.0 = 全程约束在掩码内。
         # （同样是曾与 trainer 不一致的一项：这里 0.25、trainer 1.0。）
         "mask_loss_until": 1.0,
+        # 正则项（参考 Faster-GS / 3DGS-MCMC 的做法）。
+        # 开启后能压制"半透明浮点" —— 即点云/网格周围那圈雾状杂点。
+        # 论文里配合 MCMC 密度控制使用 0.01；默认 0 表示不启用（保持既有行为不变，
+        # 待实测确认收益后再考虑改默认）。
+        "opacity_reg": 0.0,
+        "scale_reg": 0.0,
+        # 收尾清理：训练结束时删掉不透明度低于此值的高斯。
+        # Faster-GS 用 MIN_OPACITY_AFTER_TRAINING = 1/255 ≈ 0.0039。
+        "min_opacity_final": 0.0,
         "extra_args": "",
     },
     "export": {

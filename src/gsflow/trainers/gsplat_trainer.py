@@ -140,6 +140,14 @@ class TrainConfig:
     eval_quick_views: int = 3
     white_background: bool = False
     mask_loss_until: float = 1.0
+    # ---- 正则项（参考 Faster-GS / 3DGS-MCMC；默认 0 = 不启用，保持既有行为不变）----
+    # 开启后能显著压制"半透明浮点"（表现为点云/网格周围的雾状杂点）。
+    # 3DGS-MCMC 论文与 Faster-GS 都用 0.01（两者同时开）。
+    opacity_reg: float = 0.0
+    scale_reg: float = 0.0
+    # 训练结束时的最小不透明度清理（Faster-GS: MIN_OPACITY_AFTER_TRAINING = 1/255）。
+    # 不透明度低于该值的高斯在收尾时直接删掉；0 表示不清理。
+    min_opacity_final: float = 0.0
     seed: int = 42
     log_every: int = 200
 
@@ -699,6 +707,20 @@ def train(cfg: TrainConfig, ctx) -> dict:
         ssim_val = ssim_simple(render.permute(2, 0, 1)[None], gt.permute(2, 0, 1)[None])
         loss = (1.0 - cfg.ssim_weight) * l1 + cfg.ssim_weight * (1.0 - ssim_val)
 
+        # ---- 正则项（参考 Faster-GS / 3DGS-MCMC 的做法）----
+        # 为什么需要：3DGS 在"背景无人约束"或"视图偏少"时会用**大量半透明浮点**
+        # 去凑像素 —— 表现为点云/网格周围一圈雾状杂点（用户反馈的"杂乱"）。
+        # 官方 3DGS 与 3DGS-MCMC 都加了不透明度 L1 正则来抑制它：
+        #   MCMC 论文用 LAMBDA_OPACITY_REGULARIZATION=0.01（配合 scale 正则 0.01），
+        #   Faster-GS 沿用同一套（见其 Trainer.py 顶部常量）。
+        # 这里按"平均不透明度"做 L1：对**每个高斯**都要为它的不透明度付出代价，
+        # 于是"开着但不贡献有效像素"的浮点会被优化掉。
+        if cfg.opacity_reg > 0:
+            loss = loss + float(cfg.opacity_reg) * current_opacities().mean()
+        if cfg.scale_reg > 0:
+            # 尺度正则：抑制个别高斯长到过大（也是浮点的常见形态）
+            loss = loss + float(cfg.scale_reg) * current_scales().mean()
+
         # 官方策略要求在 backward 之前 retain 它需要的梯度（means2d）
         if gs_strategy is not None:
             gs_strategy.step_pre_backward(params, optimizers, gs_state, step, meta or {})
@@ -915,6 +937,31 @@ def train(cfg: TrainConfig, ctx) -> dict:
         shs=shs,
         sh_degree=cfg.sh_degree,
     )
+
+    # ---- 收尾清理：删掉不透明度低于阈值的高斯（Faster-GS 的 MIN_OPACITY_AFTER_TRAINING）----
+    # 为什么放在最后单独做：这些高斯对渲染几乎无贡献，但会出现在导出的点云/网格里
+    # （表现为"周围一圈雾状杂点"）。训练中途删它们会扰动密度控制，收尾删最稳妥。
+    # Faster-GS 用 1/255 ≈ 0.0039。
+    pruned_final = 0
+    if cfg.min_opacity_final > 0:
+        with torch.no_grad():
+            keep = current_opacities().reshape(-1) >= float(cfg.min_opacity_final)
+            pruned_final = int((~keep).sum())
+            if pruned_final:
+                _apply_keep(params, optimizers, keep)
+                refresh_params()
+                final_ply.parent.mkdir(parents=True, exist_ok=True)
+                save_ply(
+                    path=final_ply,
+                    means=params["means"],
+                    scales=current_scales(),
+                    quats=params["quats"],
+                    opacities=current_opacities(),
+                    shs=params["shs"],
+                    sh_degree=cfg.sh_degree,
+                )
+                ctx.info(f"收尾清理：删除 {pruned_final} 个不透明度 < "
+                         f"{cfg.min_opacity_final:.4f} 的高斯，剩 {params['means'].shape[0]} 个")
 
     metrics = {
         "iterations": cfg.iterations,

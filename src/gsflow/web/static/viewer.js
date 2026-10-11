@@ -135,6 +135,9 @@ function glbToRenderable(buf, textureResolver) {
   let color = attrs.COLOR_0 !== undefined ? accessorToFloat(gltf, bin, attrs.COLOR_0) : null;
   if (color && color.length / 3 !== position.length / 3) color = null;
   const uv = attrs.TEXCOORD_0 !== undefined ? accessorToFloat(gltf, bin, attrs.TEXCOORD_0) : null;
+  // NORMAL：有就用（平滑着色）；没有则留空，着色器退回一个固定方向
+  let normal = attrs.NORMAL !== undefined ? accessorToFloat(gltf, bin, attrs.NORMAL) : null;
+  if (normal && normal.length / 3 !== position.length / 3) normal = null;
   let indices = null;
   if (prim.indices !== undefined) {
     const a = readAccessor(gltf, bin, prim.indices);
@@ -156,7 +159,8 @@ function glbToRenderable(buf, textureResolver) {
       textureUrl = textureResolver ? textureResolver(img.uri) : img.uri;
     }
   }
-  return { mode: prim.mode === undefined ? 4 : prim.mode, position, color, uv, indices, textureUrl };
+  return { mode: prim.mode === undefined ? 4 : prim.mode, position, color, uv, normal,
+           indices, textureUrl };
 }
 
 /* ============================ PLY 解析（点云） ============================ */
@@ -258,29 +262,34 @@ const VS = `
 attribute vec3 aPos;
 attribute vec3 aCol;
 attribute vec2 aUV;
+attribute vec3 aNrm;
 uniform mat4 uMVP;
 uniform float uPointSize;
 uniform bool uUseCol;
-uniform bool uUseUV;
+uniform bool uUseNrm;
 varying vec3 vCol;
 varying vec2 vUV;
+varying vec3 vNrm;
 void main() {
   gl_Position = uMVP * vec4(aPos, 1.0);
   gl_PointSize = uPointSize;
   vCol = uUseCol ? aCol : vec3(0.82, 0.84, 0.88);
   vUV = aUV;
+  vNrm = uUseNrm ? aNrm : vec3(0.0, 0.0, 1.0);
 }`;
 
 const FS = `
 precision mediump float;
 uniform bool uUseTex;
 uniform bool uUseCol;
+uniform bool uUseNrm;
 uniform bool uRound;      // 点云用圆点
 uniform bool uGray;       // 网格无顶点色时用灰色
 uniform vec3 uLight;
 uniform sampler2D uTex;
 varying vec3 vCol;
 varying vec2 vUV;
+varying vec3 vNrm;
 void main() {
   if (uRound) {
     vec2 d = gl_PointCoord - vec2(0.5);
@@ -291,8 +300,14 @@ void main() {
     vec4 t = texture2D(uTex, vUV);
     base = t.rgb;
   }
-  // 简单的半球光照，让三角面有体积感（纯顶点色会显得很平）
-  float lam = 0.55 + 0.45 * max(dot(normalize(uLight), vec3(0.0, 0.0, 1.0)), 0.0);
+  // ⚠️ 光照必须用**逐像素的法线**。原来写的是
+  //     lam = 0.55 + 0.45 * max(dot(normalize(uLight), vec3(0,0,1)), 0)
+  //   两个方向都与像素无关 -> 全屏同一个常数 -> 等于**没有光照**，
+  //   网格看上去就是一片死平的色块（用户反馈"白/杂乱"的观感来源之一）。
+  // 现在用顶点法线（半兰伯特 + 环境项），并叠一点点边缘增强让面结构可辨。
+  vec3 n = normalize(vNrm);
+  float diff = max(dot(n, normalize(uLight)), 0.0);
+  float lam = 0.30 + 0.70 * diff;
   gl_FragColor = vec4(base * lam, 1.0);
 }`;
 
@@ -318,12 +333,13 @@ function createRenderer(canvas) {
   }
   gl.useProgram(prog);
   const U = {};
-  ['uMVP', 'uPointSize', 'uUseCol', 'uUseTex', 'uRound', 'uGray', 'uLight', 'uTex']
-    .forEach((n) => { U[n] = gl.getUniformLocation(prog, n); });
+  ['uMVP', 'uPointSize', 'uUseCol', 'uUseTex', 'uRound', 'uGray', 'uLight', 'uTex',
+   'uUseNrm'].forEach((n) => { U[n] = gl.getUniformLocation(prog, n); });
   const A = {
     pos: gl.getAttribLocation(prog, 'aPos'),
     col: gl.getAttribLocation(prog, 'aCol'),
     uv: gl.getAttribLocation(prog, 'aUV'),
+    nrm: gl.getAttribLocation(prog, 'aNrm'),
   };
   gl.enable(gl.DEPTH_TEST);
   gl.clearColor(0.02, 0.03, 0.045, 1);
@@ -349,6 +365,12 @@ function makeMesh(R, model, wireframe) {
     gl.bindBuffer(gl.ARRAY_BUFFER, ubuf);
     gl.bufferData(gl.ARRAY_BUFFER, model.uv, gl.STATIC_DRAW);
   }
+  let nbuf = null;
+  if (model.normal) {
+    nbuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, nbuf);
+    gl.bufferData(gl.ARRAY_BUFFER, model.normal, gl.STATIC_DRAW);
+  }
   let ibuf = null, indexCount = 0;
   if (model.indices) {
     ibuf = gl.createBuffer();
@@ -367,10 +389,11 @@ function makeMesh(R, model, wireframe) {
   }
   const center = [(mn[0]+mx[0])/2, (mn[1]+mx[1])/2, (mn[2]+mx[2])/2];
   const radius = Math.max(1e-6, 0.5 * Math.hypot(mx[0]-mn[0], mx[1]-mn[1], mx[2]-mn[2]));
-  return { vbuf, cbuf, ubuf, ibuf, indexCount,
+  return { vbuf, cbuf, ubuf, nbuf, ibuf, indexCount,
            count: model.position.length / 3, mode: model.mode,
            center, radius, wireframe,
-           useCol: !!model.color, useUV: !!model.uv, texture: null };
+           useCol: !!model.color, useUV: !!model.uv, useNrm: !!model.normal,
+           texture: null };
 }
 
 function uploadTexture(R, url) {
@@ -435,6 +458,7 @@ window.GsViewer = (function () {
     gl.uniform1i(R.U.uUseTex, obj.texture ? 1 : 0);
     gl.uniform1i(R.U.uRound, obj.mode === 0 ? 1 : 0);
     gl.uniform1i(R.U.uGray, (obj.mode !== 0 && !obj.useCol && !obj.texture) ? 1 : 0);
+    gl.uniform1i(R.U.uUseNrm, obj.useNrm ? 1 : 0);
     gl.uniform3f(R.U.uLight, 0.4, 0.7, 0.6);
 
     gl.bindBuffer(gl.ARRAY_BUFFER, obj.vbuf);
@@ -456,6 +480,14 @@ window.GsViewer = (function () {
     } else {
       gl.disableVertexAttribArray(R.A.uv);
       gl.vertexAttrib2f(R.A.uv, 0, 0);
+    }
+    if (obj.nbuf) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, obj.nbuf);
+      gl.enableVertexAttribArray(R.A.nrm);
+      gl.vertexAttribPointer(R.A.nrm, 3, gl.FLOAT, false, 0, 0);
+    } else {
+      gl.disableVertexAttribArray(R.A.nrm);
+      gl.vertexAttrib3f(R.A.nrm, 0, 0, 1);
     }
     if (obj.texture) {
       gl.activeTexture(gl.TEXTURE0);

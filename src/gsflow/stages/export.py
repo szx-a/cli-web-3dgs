@@ -969,6 +969,34 @@ class ExportStage(Stage):
         pos_b = verts.tobytes()
         col_b = cols.tobytes()
         idx_b = tris.reshape(-1).tobytes()
+
+        # ⚠️ **必须写 NORMAL 属性**（踩坑，直接对应"网格杂乱、尖锐"的观感）：
+        # 早先这里只写了 POSITION + COLOR_0。glTF 规范下**没有 NORMAL 就是逐面平面着色**，
+        # 于是每个三角形亮度单独跳变 —— 在查看器里看去就是"碎、乱、尖锐"，
+        # 而模型本身其实没那么糟。加上顶点法线后查看器才能做平滑着色。
+        # 顺带：mesh_export 里算过一致的顶点法线（orient_normals_consistent_tangent_plane），
+        # 这里直接取用；取不到就现场算一次。
+        try:
+            nrm = np.asarray(mesh.vertex_normals, dtype=np.float32)
+            if len(nrm) != len(verts):
+                raise ValueError("法线数量与顶点不一致")
+        except Exception:  # noqa: BLE001
+            try:
+                import open3d as _o3d
+
+                m2 = _o3d.geometry.TriangleMesh()
+                m2.vertices = _o3d.utility.Vector3dVector(verts.astype(np.float64))
+                m2.triangles = _o3d.utility.Vector3iVector(tris.astype(np.int32))
+                m2.compute_vertex_normals()
+                nrm = np.asarray(m2.vertex_normals, dtype=np.float32)
+            except Exception:  # noqa: BLE001
+                nrm = np.zeros_like(verts, dtype=np.float32)
+        # 导出时 y、z 已取反，法线必须同步取反，否则光照方向整体反掉
+        nrm = np.ascontiguousarray(nrm)
+        nrm[:, 1] *= -1
+        nrm[:, 2] *= -1
+        nrm_b = nrm.tobytes()
+
         assert len(idx_b) == tris.size * 4, (len(idx_b), tris.size)
         assert struct.unpack_from("<I", idx_b, 0)[0] < len(verts), \
             f"索引首元素异常：{struct.unpack_from('<I', idx_b, 0)[0]}"
@@ -994,6 +1022,7 @@ class ExportStage(Stage):
 
         pos_off, pos_len = _add(pos_b)
         col_off, col_len = _add(col_b)
+        nrm_off, nrm_len = _add(nrm_b)
         uv_off = uv_len = 0
         if use_tex:
             uv_off, uv_len = _add(uv.tobytes())
@@ -1006,6 +1035,7 @@ class ExportStage(Stage):
         buffer_views = [
             {"buffer": 0, "byteOffset": pos_off, "byteLength": pos_len, "target": 34962},
             {"buffer": 0, "byteOffset": col_off, "byteLength": col_len, "target": 34962},
+            {"buffer": 0, "byteOffset": nrm_off, "byteLength": nrm_len, "target": 34962},
         ]
         accessors = [
             {"bufferView": 0, "componentType": COMPONENT_FLOAT, "count": int(len(verts)),
@@ -1014,9 +1044,11 @@ class ExportStage(Stage):
              "max": [float(verts[:, i].max()) for i in range(3)]},
             {"bufferView": 1, "componentType": 5121, "normalized": True,
              "count": int(len(verts)), "type": "VEC3"},
+            {"bufferView": 2, "componentType": COMPONENT_FLOAT,
+             "count": int(len(verts)), "type": "VEC3"},
         ]
-        attributes = {"POSITION": 0, "COLOR_0": 1}
-        n_bv = 2
+        attributes = {"POSITION": 0, "COLOR_0": 1, "NORMAL": 2}
+        n_bv = 3
         idx_accessor = None
         if use_tex:
             buffer_views.append({"buffer": 0, "byteOffset": uv_off,
