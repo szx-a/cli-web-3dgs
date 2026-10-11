@@ -64,7 +64,17 @@ class Segmenter:
 
     # --- 对外统一入口 ---
     def segment(self, image_paths: list[Path], on_progress=None) -> dict[str, np.ndarray]:
-        from ..imageops import load_rgb
+        """逐张分割，并在**基类统一**做后处理（连通域/小面积过滤）。
+
+        ⚠️ 为什么后处理必须放在基类：原来只有 fastsam / sam2 / sam3 各自调了
+        `largest_component`，而 **rembg 完全没有** —— 于是同一个配置
+        （`mask.keep_largest=true`）在不同后端下**行为不一致**。
+        实测后果：用 rembg 跑一个牌楼素材时，掩码把物体拆成主楼 + 左上 + 右下三块，
+        碎块全被带进 COLMAP，干扰位姿估计（重投影误差从 0.955px 恶化到 1.212px）。
+        放到基类后，"要不要只留最大连通块"对所有后端语义一致；
+        子类里已有的同名调用变成幂等操作（对最大连通块再取一次最大，结果不变）。
+        """
+        from ..imageops import drop_small_components, largest_component, load_rgb
 
         self.load()
         out: dict[str, np.ndarray] = {}
@@ -77,7 +87,16 @@ class Segmenter:
                 raise
             except Exception as exc:
                 raise GsflowError(f"[{self.name}] 分割失败 {p.name}: {type(exc).__name__}: {exc}") from exc
-            out[p.name] = np.asarray(mask, dtype=bool)
+            m = np.asarray(mask, dtype=bool)
+            if m.size:
+                # 顺序：先去零散小块，再取最大连通块。
+                # `min_area_ratio` 此前是个**空参数**（从未实现），这里按本意补上：
+                # 删的是"小连通块"，不是整帧 —— 见 imageops.drop_small_components 的说明。
+                if self.opt.min_area_ratio > 0:
+                    m = drop_small_components(m, self.opt.min_area_ratio)
+                if self.opt.keep_largest and m.any():
+                    m = largest_component(m)
+            out[p.name] = m
             if on_progress:
                 on_progress(i, total, p.name)
         return out
