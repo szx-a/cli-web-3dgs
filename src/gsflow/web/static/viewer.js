@@ -50,8 +50,18 @@ function m4perspective(fovy, aspect, near, far) {
 
 function m4lookAt(eye, center, up) {
   const z = norm(sub(eye, center));
-  const x = norm(cross(up, z));
-  const y = cross(z, x);
+  let x = cross(up, z);
+  // ⚠️ 共线退化保护。当相机方向与 up=(0,1,0) 共线（正上方/正下方俯视）时
+  // `cross(up, z)` 是零向量，而 `norm()` 的兜底是 `|| 1` —— 于是得到 [0,0,0]，
+  // 整个视图矩阵含 NaN，画面直接消失。这正是"转到某个方向就转不动/变黑"的成因。
+  // 这里在退化时换一个不平行的参考轴重新求 x。
+  if (Math.hypot(x[0], x[1], x[2]) < 1e-6) {
+    const alt = Math.abs(z[1]) > 0.9 ? [0, 0, 1] : [0, 1, 0];
+    x = cross(alt, z);
+    if (Math.hypot(x[0], x[1], x[2]) < 1e-6) x = [1, 0, 0];
+  }
+  x = norm(x);
+  const y = norm(cross(z, x));
   return new Float32Array([
     x[0], y[0], z[0], 0,
     x[1], y[1], z[1], 0,
@@ -450,6 +460,15 @@ function uploadTexture(R, url) {
 /* ============================ 对外接口 ============================ */
 window.GsViewer = (function () {
   let R = null, canvas = null, obj = null;
+  // ---- 轨道相机角度 ----
+  // ⚠️ pitch 原来被**硬夹在 ±1.5 rad（±86°）**，这正是用户反馈的"转到某个方向就转不动了"：
+  // 相机绕 Y 轴轨道运动，pitch 接近 ±90° 时 eye 与 up=(0,1,0) 共线，
+  // lookAt 里的 cross(up, z) 退化为零向量 -> 矩阵出现 NaN -> 画面消失。
+  // 修复做法不是继续硬夹，而是：
+  //   1) 允许转到 ±90°（用 π/2 减去一个极小量，留出数值余量）
+  //   2) 在 m4lookAt 里对"共线"情形给出稳定的 up（见那里的保护）
+  //   3) 拖拽时用 pointer capture，拖出画布也不丢事件
+  const PITCH_LIMIT = Math.PI / 2 - 1e-4;
   let yaw = 0.6, pitch = 0.45, dist = 3, target = [0, 0, 0];
   let dragging = 0, lastX = 0, lastY = 0, wire = false;
   let onStatus = null;
@@ -559,15 +578,21 @@ window.GsViewer = (function () {
     canvas.addEventListener('mousedown', (e) => {
       dragging = (e.button === 2 || e.shiftKey) ? 2 : 1;
       lastX = e.clientX; lastY = e.clientY;
+      // 指针捕获：拖出画布/移到窗口外也不丢事件（否则"转着转着就断了"）
+      try { canvas.setPointerCapture?.(e.pointerId); } catch { /* 老浏览器忽略 */ }
+      e.preventDefault();
     });
     window.addEventListener('mouseup', () => { dragging = 0; });
+    window.addEventListener('blur', () => { dragging = 0; });
     window.addEventListener('mousemove', (e) => {
       if (!dragging) return;
       const dx = e.clientX - lastX, dy = e.clientY - lastY;
       lastX = e.clientX; lastY = e.clientY;
       if (dragging === 1) {
         yaw -= dx * 0.008;
-        pitch = Math.max(-1.5, Math.min(1.5, pitch + dy * 0.008));
+        // 用 PITCH_LIMIT（略小于 π/2）而不是原来的 ±1.5：
+        // 旧值把竖直方向锁死，转不过顶/底，观感就是"转到某个方向就转不动了"。
+        pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, pitch + dy * 0.008));
       } else {
         // 平移：沿相机的右/上方向在屏幕平面内移动目标点
         const s = dist * 0.0016;
@@ -577,6 +602,23 @@ window.GsViewer = (function () {
       }
       draw();
     });
+    // 触摸旋转（单指）；双指留给缩放
+    canvas.addEventListener('touchstart', (e) => {
+      if (e.touches.length === 1) {
+        dragging = 1; lastX = e.touches[0].clientX; lastY = e.touches[0].clientY;
+      }
+    }, { passive: true });
+    canvas.addEventListener('touchmove', (e) => {
+      if (!dragging || e.touches.length !== 1) return;
+      const t = e.touches[0];
+      const dx = t.clientX - lastX, dy = t.clientY - lastY;
+      lastX = t.clientX; lastY = t.clientY;
+      yaw -= dx * 0.008;
+      pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, pitch + dy * 0.008));
+      draw();
+      e.preventDefault();
+    }, { passive: false });
+    canvas.addEventListener('touchend', () => { dragging = 0; });
     canvas.addEventListener('wheel', (e) => {
       e.preventDefault();
       dist = Math.max(0.02, dist * (1 + Math.sign(e.deltaY) * 0.12));

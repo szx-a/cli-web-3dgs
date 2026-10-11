@@ -17,6 +17,8 @@ if (!glb) { console.error('用法: node scripts/probe_viewer_runtime.mjs <file.g
 
 const calls = [];
 let uniformNulls = [];
+let mvpFinite = [];
+let quiet = false;      // 大量拖拽采样时关掉逐条打印
 const PROG = { id: 'prog' };
 
 function mkGlStub() {
@@ -66,10 +68,11 @@ function mkGlStub() {
       if (l && l.n === 'uMVP' && m) {
         const vals = Array.from(m);
         const finite = vals.every(Number.isFinite);
-        // MVP 是否退化：全 0 或含 NaN 都会导致什么都画不出来
-        const nonzero = vals.filter((v) => v !== 0).length;
-        console.log('  [uMVP] 有限=' + finite + ' 非零元素=' + nonzero + '/16');
-        console.log('        ' + vals.map((v) => v.toFixed(3)).join(', '));
+        mvpFinite.push(finite);
+        if (!quiet) {
+          const nonzero = vals.filter((v) => v !== 0).length;
+          console.log('  [uMVP] 有限=' + finite + ' 非零元素=' + nonzero + '/16');
+        }
       }
     },
     uniform1f: (l, v) => calls.push(['uniform1f', l && l.n, v]),
@@ -97,16 +100,30 @@ function mkGlStub() {
 }
 
 // ---- DOM / window stubs ----
-const canvas = {
+// 事件监听要真的记下来，才能模拟拖拽（万向锁回归依赖它）
+const listeners = { canvas: {}, window: {} };
+function mkTarget(store) {
+  return {
+    addEventListener: (t, fn) => { (store[t] = store[t] || []).push(fn); },
+    removeEventListener: () => {},
+    setPointerCapture: () => {},
+    getBoundingClientRect: () => ({ left: 0, top: 0, width: 800, height: 600 }),
+  };
+}
+const canvas = Object.assign(mkTarget(listeners.canvas), {
   clientWidth: 800, clientHeight: 600, width: 800, height: 600,
   getContext: () => mkGlStub(),
-  addEventListener: () => {},
-};
-const windowStub = {
-  devicePixelRatio: 1,
-  addEventListener: () => {},
-};
+});
+const windowStub = Object.assign(mkTarget(listeners.window), { devicePixelRatio: 1 });
 const documentStub = { getElementById: () => canvas };
+
+/** 模拟一次鼠标拖拽（按下 -> 移动 -> 抬起） */
+function draggingSim(target, dx, dy) {
+  const fire = (store, type, ev) => (store[type] || []).forEach((f) => f(ev));
+  fire(listeners.canvas, 'mousedown', { button: 0, shiftKey: false, clientX: 400, clientY: 300, preventDefault() {} });
+  fire(listeners.window, 'mousemove', { clientX: 400 + dx, clientY: 300 + dy });
+  fire(listeners.window, 'mouseup', {});
+}
 
 globalThis.window = windowStub;
 globalThis.document = documentStub;
@@ -177,6 +194,32 @@ try {
 } catch (e) {
   console.log('**toggleWire() 第二次抛出**: ' + e.message);
 }
+
+// 万向锁回归：拖到 pitch = ±90°（相机方向与 up 共线）时，
+// 原实现 `norm(cross(up, z))` 得到零向量 -> 视图矩阵含 NaN -> 画面消失。
+// 这里模拟"用户一直往下拖"直到越界，确认矩阵始终有限。
+console.log('\n--- 万向锁回归（拖过顶/底）---');
+calls.length = 0;
+mvpFinite = [];
+quiet = true;
+// 模拟连续拖拽：每次向下拖 200px（0.008 rad/px -> 1.6 rad，足以越过 ±π/2）
+try {
+  for (let i = 0; i < 6; i++) {
+    draggingSim(canvas, 0, 200);
+  }
+  for (let i = 0; i < 12; i++) {
+    draggingSim(canvas, 0, -200);
+  }
+} catch (e) {
+  console.log('**拖拽模拟抛出**: ' + e.message);
+}
+quiet = false;
+const bad = mvpFinite.filter((x) => !x).length;
+console.log(`  采样 ${mvpFinite.length} 次 uMVP，含 NaN/Inf 的次数 = ${bad}`
+            + (bad ? '  **仍有退化**' : '  （全部有限，万向锁已修）'));
+
+// 退出码：供 pytest 做回归（非 0 表示有退化）
+process.exitCode = (bad > 0 || mvpFinite.length === 0) ? 1 : 0;
 
 console.log('\n--- 渲染调用序列（关键项）---');
 for (const c of calls) {

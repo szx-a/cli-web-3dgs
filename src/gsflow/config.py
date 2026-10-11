@@ -146,6 +146,11 @@ DEFAULTS: dict[str, Any] = {
         # 收尾清理：训练结束时删掉不透明度低于此值的高斯。
         # Faster-GS 用 MIN_OPACITY_AFTER_TRAINING = 1/255 ≈ 0.0039。
         "min_opacity_final": 0.0,
+        # 不透明度学习率。官方 3DGS 用 0.05，但那**配合每 3000 步的重置**；
+        # 我们默认关闭重置，0.05 会让不透明度一路被压向 0、
+        # 退化成"一大团极低不透明度的薄雾"（轮廓指标正常但深度失效 → 网格成碎片）。
+        # Faster-GS / 3DGS-MCMC 用 0.025，这里对齐。
+        "lr_opacities": 0.025,
         "extra_args": "",
     },
     "export": {

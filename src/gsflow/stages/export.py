@@ -528,10 +528,12 @@ class ExportStage(Stage):
             bp_pts, bp_cols, bp_nrm, bp_stat = backproject_depth_to_points(
                 rendered=rendered, c2ws=c2ws, view_idx=used_idx, ks=ks, src_wh=src_wh,
                 width=width, height=width,
-                depth_stride=int(ctx.cfg("mesh_depth_stride", 2) or 1),
-                min_alpha=float(ctx.cfg("mesh_min_alpha", 0.5) or 0.5),
-                erode_px=int(ctx.cfg("mesh_erode_px", 1) or 0),
-                grad_thresh_ratio=float(ctx.cfg("mesh_grad_thresh", 0.06) or 0.0),
+                # 用 cfgt 而不是 `... or 默认值`：`or` 会把合法的 0 当成缺省，
+                # 于是"显式配成 0 = 关闭该步"永远无法生效（mesh_depth_stride 就踩过）。
+                depth_stride=ctx.cfgt("mesh_depth_stride", 2, int),
+                min_alpha=ctx.cfgt("mesh_min_alpha", 0.5, float),
+                erode_px=ctx.cfgt("mesh_erode_px", 1, int),
+                grad_thresh_ratio=ctx.cfgt("mesh_grad_thresh", 0.06, float),
             )
             if len(bp_pts) < 1000:
                 ctx.warn(f"反投影只得到 {len(bp_pts)} 个点，太少，放弃网格导出")

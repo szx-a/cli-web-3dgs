@@ -78,3 +78,107 @@ def test_mask_defaults_are_wired() -> None:
     from gsflow.imageops import drop_small_components, largest_component
 
     assert callable(drop_small_components) and callable(largest_component)
+
+
+def test_train_config_injection_preserves_zero_and_false() -> None:
+    """后端注入 `TrainConfig` 时，**合法的 0 / False 不能被默认值吞掉**。
+
+    回归测试：`GsplatBackend` 原先逐个参数写 `ctx.cfg("k", d) or d`。
+    `or` 把 0 当假值 ⇒ 配置里 `opacity_reset_interval = 0`（关闭重置）
+    被 `int(0 or 3000)` 变成 **3000** —— "已关闭重置"这个修复从未生效，
+    训练一直每 3000 步重置不透明度，末次重置状态被存成最终检查点，
+    模型退化成"薄雾"（PSNR 看着还行，但深度失效、网格成碎片）。
+
+    这里直接验证注入结果与配置一致（0 就是 0，False 就是 False）。
+    """
+    from pathlib import Path
+
+    from gsflow.trainers.gsplat_backend import _build_cfg
+
+    class _Ctx:
+        """最小上下文：只实现 cfg()，模拟 config.toml 里的取值。"""
+
+        values = {
+            "opacity_reset_interval": 0,     # 必须保持 0
+            "prune_scale_after_reset": False,  # 必须保持 False
+            "densify_quantile": 0.0,         # 必须保持 0.0
+            "mask_loss_until": 1.0,
+            "lr_opacities": 0.025,
+            "opacity_reg": 0.01,
+            "iterations": 1234,
+        }
+
+        def cfg(self, key, default=None):
+            return self.values.get(key, default)
+
+    cfg = _build_cfg(_Ctx(), Path("d"), Path("o"), 1234)
+    assert cfg.opacity_reset_interval == 0, (
+        f"opacity_reset_interval 被默认值吞掉了：{cfg.opacity_reset_interval}（应为 0）")
+    assert cfg.prune_scale_after_reset is False, (
+        "prune_scale_after_reset 被吞掉了：应为 False")
+    assert cfg.densify_quantile == 0.0
+    assert cfg.mask_loss_until == 1.0
+    assert cfg.lr_opacities == 0.025
+    assert cfg.opacity_reg == 0.01
+    assert cfg.iterations == 1234
+    # 配置里没有的字段应回落到 dataclass 默认值，而不是变成 None
+    assert cfg.ssim_weight == 0.2
+    assert cfg.densify_strategy == "builtin"
+
+
+def test_all_train_config_fields_are_reachable_from_config() -> None:
+    """`TrainConfig` 的**每个**字段都必须能通过配置设置（否则改了不生效还不报错）。
+
+    原来后端手写注入 19 个字段、dataclass 却有 36 个 —— 其余字段改配置**无效**。
+    现在 `_build_cfg` 按字段循环注入，这条测试确保覆盖不退化。
+    """
+    import dataclasses
+    from pathlib import Path
+
+    from gsflow.trainers.gsplat_backend import _build_cfg
+    from gsflow.trainers.gsplat_trainer import TrainConfig
+
+    explicit = {"data_dir", "out_dir", "iterations"}
+
+    class _Sentinel:
+        """任何键都返回一个可区分的哨兵值，用来确认该键**确实被读取**。"""
+
+        def __init__(self) -> None:
+            self.seen: set[str] = set()
+
+        def cfg(self, key, default=None):
+            self.seen.add(key)
+            return default  # 保持默认值，只记录被读过
+
+    ctx = _Sentinel()
+    _build_cfg(ctx, Path("d"), Path("o"), 10)
+    missing = {f.name for f in dataclasses.fields(TrainConfig)} - explicit - ctx.seen
+    assert not missing, f"这些 TrainConfig 字段没有从配置读取（改配置无效）：{sorted(missing)}"
+
+
+def test_cfgt_does_not_swallow_zero_and_false() -> None:
+    """`StageContext.cfgt()` 必须保留合法的 0 / False（这是 `or` 陷阱的正解）。"""
+    from pathlib import Path
+
+    from gsflow.pipeline.context import StageContext
+
+    class _Settings:
+        vals = {"mesh_depth_stride": 0, "mesh_min_alpha": 0.5, "flag": False,
+                "s_zero": "0", "s_true": "true", "bad": "abc"}
+
+        def get(self, key, default=None):
+            return self.vals.get(key, default)
+
+    ctx = StageContext(job_id="t", job_dir=Path("t"), settings=_Settings(), events=None)  # type: ignore[arg-type]
+
+    # 关键：显式的 0 必须原样返回，而不是回落到默认值
+    assert ctx.cfgt("mesh_depth_stride", 2, int) == 0
+    assert ctx.cfgt("flag", True, bool) is False
+    # 缺键才回落默认
+    assert ctx.cfgt("not_there", 80, int) == 80
+    # --set 传进来的是字符串
+    assert ctx.cfgt("s_zero", 3, int) == 0
+    assert ctx.cfgt("s_true", False, bool) is True
+    # 无法转换时回落默认，而不是抛异常
+    assert ctx.cfgt("bad", 7, int) == 7
+    assert ctx.cfgt("mesh_min_alpha", 0.1, float) == 0.5

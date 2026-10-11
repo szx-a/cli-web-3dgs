@@ -98,6 +98,39 @@ class StageContext:
             return self.params[key]
         return self.settings.get(key, default)
 
+    def cfgt(self, key: str, default: Any, cast: Any = None) -> Any:
+        """**类型化**读配置：返回已按 `cast` 转换的值，且**不会吞掉合法的 0 / False**。
+
+        为什么需要它（这个坑造成了很难发现的严重问题）：
+        阶段里到处写 `int(ctx.cfg("k", d) or d)`，而 `or` 把 `0` / `False` 当成缺省 ——
+        配置里 `opacity_reset_interval = 0`（明确表示"关闭不透明度重置"）
+        被 `int(0 or 3000)` 变成 **3000**，于是"已关闭重置"这个修复**从未生效**，
+        训练每 3000 步重置一次不透明度，末次重置状态被存成最终检查点，
+        模型退化成"一大团极低不透明度的薄雾"（PSNR/IoU 看着正常，但深度失效、网格成碎片）。
+
+        `cfg()` 本身已经是"键存在就用配置值、否则用 default"，所以**不需要也不该再加 `or`**。
+        这里额外做类型转换，因为 `--set` 传进来的值都是字符串。
+
+        用法：
+            vds = ctx.cfgt("mesh_voxel_downsample", 0.0, float)   # 0 就是 0
+            n   = ctx.cfgt("max_views", 80, int)
+        """
+        val = self.cfg(key, _MISSING)
+        if val is _MISSING or val is None:
+            return default
+        if cast is bool:
+            if isinstance(val, str):
+                return val.strip().lower() in ("1", "true", "yes", "on")
+            return bool(val)
+        if cast is None:
+            return val
+        try:
+            if cast is int:
+                return int(float(val))
+            return cast(val)
+        except (TypeError, ValueError):
+            return default
+
     # --- 作业清单 ---
     def read_job(self) -> dict[str, Any]:
         f = self.job_dir / "job.json"

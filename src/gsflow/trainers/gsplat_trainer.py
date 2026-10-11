@@ -148,6 +148,10 @@ class TrainConfig:
     # 训练结束时的最小不透明度清理（Faster-GS: MIN_OPACITY_AFTER_TRAINING = 1/255）。
     # 不透明度低于该值的高斯在收尾时直接删掉；0 表示不清理。
     min_opacity_final: float = 0.0
+    # 不透明度学习率。官方 3DGS 用 0.05，但那**配合每 3000 步的不透明度重置**；
+    # 我们默认关闭重置，0.05 会导致不透明度持续塌陷成"薄雾"（见 G43）。
+    # Faster-GS / 3DGS-MCMC 用 0.025，这里对齐。
+    lr_opacities: float = 0.025
     seed: int = 42
     log_every: int = 200
 
@@ -475,7 +479,18 @@ def train(cfg: TrainConfig, ctx) -> dict:
         "opacities": opac,
         "shs": shs,
     }
-    _LR = {"means": 1.6e-4, "scales": 5e-3, "quats": 1e-3, "opacities": 5e-2, "shs": 2.5e-3}
+    # 各参数的学习率。
+    # ⚠️ opacities 从官方默认的 5e-2 **降到 2.5e-2**：官方 3DGS 的 0.05 配合"每 3000 步重置
+    # 不透明度"才成立；我们**默认关闭重置**（实测重置会污染末次检查点），
+    # 此时 0.05 会让不透明度一路被压向 0，退化成"一大团极低不透明度的薄雾"：
+    # 轮廓指标（PSNR / IoU）仍然正常，但深度完全模糊 -> 深度反投影失效 -> 网格成碎片。
+    # 实测（img2-04，242 帧 / 35000 迭代）：opacity 中位数 0.0165 -> 0.0138，
+    # 最终 >0.02 的高斯只剩 0.2%。
+    # Faster-GS 与 3DGS-MCMC 都用 0.025（见其 Trainer.py 的 LEARNING_RATE_OPACITIES），
+    # 这里对齐。
+    _LR = {"means": 1.6e-4, "scales": 5e-3, "quats": 1e-3,
+           "opacities": float(getattr(cfg, "lr_opacities", 0.025) or 0.025),
+           "shs": 2.5e-3}
     _gamma = 0.01 ** (1 / max(cfg.iterations, 1))
 
     def make_optimizers():

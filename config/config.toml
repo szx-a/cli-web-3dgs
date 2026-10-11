@@ -70,6 +70,7 @@ mask_loss_until = 1.0
 opacity_reg = 0.0
 scale_reg = 0.0
 min_opacity_final = 0.0
+lr_opacities = 0.025
 extra_args = ""
 
 [export]
