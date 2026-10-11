@@ -14,6 +14,14 @@
  */
 'use strict';
 
+/* ---------------------------------------------------------------------------
+ * ⚠️ 支持的容器格式（**界面层必须先过滤**，否则会"打不开且只显示黑"）：
+ *     .glb   glTF 2.0 二进制（TRIANGLES / POINTS + COLOR_0 + NORMAL + TEXCOORD_0）
+ *     .ply   binary_little_endian 点云（x/y/z + red/green/blue 或 f_dc_*）
+ *   **不支持 .obj / .spz** —— 虽然我们也会导出它们（给 Blender 等外部工具用），
+ *   但要把它们从"可查看"列表里排除，不能让用户点了才发现打不开。
+ * ------------------------------------------------------------------------- */
+
 /* ============================ 数学（列主序 4x4） ============================ */
 function m4identity() { return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]); }
 
@@ -298,7 +306,8 @@ void main() {
   vec3 base = uGray ? vec3(0.72, 0.74, 0.78) : vCol;
   if (uUseTex) {
     vec4 t = texture2D(uTex, vUV);
-    base = t.rgb;
+    // PNG 是 sRGB 编码，而顶点色按线性处理 —— 不做 sRGB->线性会显得发灰发白
+    base = pow(t.rgb, vec3(2.2));
   }
   // ⚠️ 光照必须用**逐像素的法线**。原来写的是
   //     lam = 0.55 + 0.45 * max(dot(normalize(uLight), vec3(0,0,1)), 0)
@@ -308,7 +317,9 @@ void main() {
   vec3 n = normalize(vNrm);
   float diff = max(dot(n, normalize(uLight)), 0.0);
   float lam = 0.30 + 0.70 * diff;
-  gl_FragColor = vec4(base * lam, 1.0);
+  vec3 lin = base * lam;
+  // 线性 -> sRGB，否会整体偏亮、发白
+  gl_FragColor = vec4(pow(clamp(lin, 0.0, 1.0), vec3(1.0 / 2.2)), 1.0);
 }`;
 
 function createRenderer(canvas) {
@@ -378,6 +389,25 @@ function makeMesh(R, model, wireframe) {
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, model.indices, gl.STATIC_DRAW);
     indexCount = model.indices.length;
   }
+  // 线框用的线段索引：每个三角形贡献 3 条边 (a-b, b-c, c-a)。
+  // 必须单独建缓冲 —— 直接拿三角形索引去 drawElements(gl.LINES) 会报
+  // INVALID_OPERATION（索引数不是 2 的倍数）并让**整帧不画**。
+  let lineIbuf = null, lineIndexCount = 0;
+  if (model.indices && model.indices.length >= 3) {
+    const tri = model.indices;
+    const nTri = Math.floor(tri.length / 3);
+    const lines = new Uint32Array(nTri * 6);
+    for (let t = 0; t < nTri; t++) {
+      const a = tri[t * 3], b = tri[t * 3 + 1], c = tri[t * 3 + 2];
+      lines[t * 6] = a; lines[t * 6 + 1] = b;
+      lines[t * 6 + 2] = b; lines[t * 6 + 3] = c;
+      lines[t * 6 + 4] = c; lines[t * 6 + 5] = a;
+    }
+    lineIbuf = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, lineIbuf);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, lines, gl.STATIC_DRAW);
+    lineIndexCount = lines.length;
+  }
   // 包围盒 -> 自动取景
   let mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
   for (let i = 0; i < model.position.length; i += 3) {
@@ -389,7 +419,7 @@ function makeMesh(R, model, wireframe) {
   }
   const center = [(mn[0]+mx[0])/2, (mn[1]+mx[1])/2, (mn[2]+mx[2])/2];
   const radius = Math.max(1e-6, 0.5 * Math.hypot(mx[0]-mn[0], mx[1]-mn[1], mx[2]-mn[2]));
-  return { vbuf, cbuf, ubuf, nbuf, ibuf, indexCount,
+  return { vbuf, cbuf, ubuf, nbuf, ibuf, lineIbuf, indexCount, lineIndexCount,
            count: model.position.length / 3, mode: model.mode,
            center, radius, wireframe,
            useCol: !!model.color, useUV: !!model.uv, useNrm: !!model.normal,
@@ -497,12 +527,30 @@ window.GsViewer = (function () {
 
     if (obj.mode === 0) {
       gl.drawArrays(gl.POINTS, 0, obj.count);
+    } else if (wire && obj.lineIbuf) {
+      // ⚠️ 线框**必须用专门的线段索引缓冲**。踩坑：原先直接
+      //     drawElements(gl.LINES, obj.indexCount, ...)
+      //   把"三角形索引表"当成线段表用 —— 索引数不是 2 的倍数时
+      //   WebGL 会报 INVALID_OPERATION 并且**整帧什么都不画**（表现为全黑），
+      //   而不是画错。现在改为在载入时预生成 (3*面数) 条边的 LINES 索引。
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, obj.lineIbuf);
+      gl.drawElements(gl.LINES, obj.lineIndexCount, gl.UNSIGNED_INT, 0);
     } else if (obj.ibuf) {
       gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, obj.ibuf);
-      gl.drawElements(wire ? gl.LINES : gl.TRIANGLES, obj.indexCount,
-                      gl.UNSIGNED_INT, 0);
+      gl.drawElements(gl.TRIANGLES, obj.indexCount, gl.UNSIGNED_INT, 0);
     } else {
       gl.drawArrays(gl.TRIANGLES, 0, obj.count);
+    }
+
+    // 把 WebGL 错误暴露出来 —— 否则一切静默失败，界面只剩"黑"，无从排查。
+    const err = gl.getError();
+    if (err !== 0) {
+      const names = { 1280: 'INVALID_ENUM', 1281: 'INVALID_VALUE', 1282: 'INVALID_OPERATION',
+                      1285: 'OUT_OF_MEMORY', 1286: 'INVALID_FRAMEBUFFER_OPERATION',
+                      37442: 'CONTEXT_LOST_WEBGL' };
+      const msg = (names[err] || ('0x' + err.toString(16)));
+      if (onStatus) onStatus('⚠ WebGL 错误: ' + msg);
+      if (window.console) console.error('[GsViewer] WebGL error', msg);
     }
   }
 
@@ -558,17 +606,36 @@ window.GsViewer = (function () {
       if (!R) throw new Error('查看器未初始化');
       if (onStatus) onStatus('载入中…');
       const res = await fetch(url);
-      if (!res.ok) throw new Error('下载失败 HTTP ' + res.status);
+      if (!res.ok) throw new Error('下载失败 HTTP ' + res.status
+                                   + '（文件可能已被删除 —— 重跑一次导出即可）');
       const buf = await res.arrayBuffer();
+      if (!buf || buf.byteLength < 64) {
+        throw new Error('文件为空或过小（' + (buf ? buf.byteLength : 0)
+                        + ' 字节）—— 该产物可能未成功导出');
+      }
       let model;
-      if (kind === 'glb' || url.toLowerCase().endsWith('.glb')) {
-        model = glbToRenderable(buf, null);
-      } else {
-        model = parsePly(buf);
+      try {
+        const low = url.toLowerCase();
+        if (kind === 'glb' || low.endsWith('.glb')) {
+          model = glbToRenderable(buf, null);
+        } else if (low.endsWith('.ply')) {
+          model = parsePly(buf);
+        } else {
+          // ⚠️ 只支持 glb / ply 两种容器。OBJ / SPZ 等**必须在界面层就过滤掉** ——
+          // 否则这里会走进 GLB 解析分支、抛一个含糊的错误，用户只看到"黑"。
+          throw new Error('查看器不支持该格式（仅 GLB 与 PLY）：'
+                          + url.split('/').pop());
+        }
+      } catch (e) {
+        throw new Error('解析失败：' + e.message);
+      }
+      if (!model || !model.position || model.position.length < 3) {
+        throw new Error('解析后没有任何顶点（文件可能只含空网格）');
       }
       if (obj) {
         const { gl } = R;
-        [obj.vbuf, obj.cbuf, obj.ubuf, obj.ibuf].forEach((b) => { if (b) gl.deleteBuffer(b); });
+        [obj.vbuf, obj.cbuf, obj.ubuf, obj.nbuf, obj.ibuf, obj.lineIbuf]
+          .forEach((b) => { if (b) gl.deleteBuffer(b); });
         if (obj.texture) gl.deleteTexture(obj.texture);
       }
       obj = makeMesh(R, model, wire);
@@ -576,7 +643,8 @@ window.GsViewer = (function () {
       this.reset();
       draw();
       return { vertices: obj.count, triangles: obj.indexCount / 3,
-               mode: obj.mode, textured: !!obj.texture, colors: obj.useCol };
+               mode: obj.mode, textured: !!obj.texture, colors: obj.useCol,
+               normals: obj.useNrm };
     },
   };
 })();

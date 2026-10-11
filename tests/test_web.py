@@ -116,10 +116,21 @@ def test_models_endpoint_classifies_three_modes(client, workdir: Path, monkeypat
         a = c.get("/api/models/jobA").json()
         assert a["manifest"] is True
         assert a["counts"]["points"] == 1, a
-        assert a["counts"]["mesh"] == 3, a
-        assert a["counts"]["textured"] == 2, a   # 带贴图 glb + 贴图 png
+        # 查看列表里**只放查看器支持的容器**（GLB / PLY）。
+        # `model_mesh.obj` 虽然也导出了，但查看器解析不了 OBJ ——
+        # 放进列表会让用户点了只看到黑屏，所以它应出现在 downloadable 里。
+        assert a["counts"]["mesh"] == 2, a          # model_mesh.glb + model_mesh.ply
+        assert a["counts"]["textured"] == 1, a      # 只算 model_mesh_textured.glb
+        # 贴图 PNG 不是模型容器，应归到可下载
+        dl = {d["name"] for d in (a.get("downloadable") or [])}
+        assert "model_mesh.obj" in dl, a
+        assert "model_mesh_texture.png" in dl, a
         names = {i["name"] for i in a["modes"]["textured"]}
         assert "model_mesh_textured.glb" in names
+        # 列表里绝不能出现查看器不支持的扩展名
+        for mode, items in a["modes"].items():
+            for it in items:
+                assert it["name"].lower().endswith((".glb", ".ply")), (mode, it)
 
         b = c.get("/api/models/jobB").json()
         assert b["manifest"] is False

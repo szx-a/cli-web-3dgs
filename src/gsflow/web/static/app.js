@@ -472,22 +472,42 @@ function renderModeFiles() {
   if (!MODELS) { box.innerHTML = '<div class="hint">先选择一个作业。</div>'; return; }
   const files = (MODELS.modes && MODELS.modes[ACTIVE_MODE]) || [];
   if (!files.length) {
-    box.innerHTML = '<div class="hint">该模式下没有产物。'
-      + '（点云/网格/贴图分别对应 export.formats 里的 glb_points 与 mesh，'
+    box.innerHTML = '<div class="hint">该模式下没有<b>可查看</b>的产物。'
+      + '（点云/网格对应 export.formats 里的 glb_points 与 mesh；'
       + '带贴图网格还需 export.mesh_texture=true）</div>';
-    return;
+  } else {
+    files.forEach((f) => {
+      const el = document.createElement('div');
+      el.className = 'item';
+      el.innerHTML = `<div class="top"><span class="jid">${f.name}</span>`
+        + `<span class="muted">${f.size_mb} MB</span></div>`
+        + `<div class="meta">${f.desc || f.kind}</div>`;
+      el.onclick = () => loadModelFile(f);
+      box.appendChild(el);
+    });
+    // 自动载入第一个，省一次点击
+    loadModelFile(files[0]);
   }
-  files.forEach((f) => {
-    const el = document.createElement('div');
-    el.className = 'item';
-    el.innerHTML = `<div class="top"><span class="jid">${f.name}</span>`
-      + `<span class="muted">${f.size_mb} MB</span></div>`
-      + `<div class="meta">${f.desc || f.kind}</div>`;
-    el.onclick = () => loadModelFile(f);
-    box.appendChild(el);
-  });
-  // 自动载入第一个，省一次点击
-  loadModelFile(files[0]);
+
+  // 「可下载但不可查看」的产物（OBJ / SPZ / 贴图 PNG）单独列出。
+  // 它们仍然有用（Blender 等外部工具），但查看器解析不了 —— 藏起来会让用户以为丢了。
+  const dl = MODELS.downloadable || [];
+  if (dl.length) {
+    const h = document.createElement('div');
+    h.className = 'hint';
+    h.style.marginTop = '10px';
+    h.textContent = '可下载（查看器不支持该格式，请用 Blender / MeshLab 等打开）：';
+    box.appendChild(h);
+    dl.forEach((f) => {
+      const el = document.createElement('div');
+      el.className = 'item';
+      el.innerHTML = `<div class="top"><span class="jid">${f.name}</span>`
+        + `<span class="muted">${f.size_mb} MB</span></div>`
+        + `<div class="meta">${f.desc || f.kind}</div>`;
+      el.onclick = () => window.open(f.url, '_blank');
+      box.appendChild(el);
+    });
+  }
 }
 
 async function loadModelFile(f) {
@@ -500,9 +520,12 @@ async function loadModelFile(f) {
     if (info.triangles) parts.push(`${info.triangles} 面`);
     if (info.textured) parts.push('带贴图');
     else if (info.colors) parts.push('顶点色');
+    if (info.normals) parts.push('法线');
     $('m-status').textContent = f.name + ' · ' + parts.join(' · ');
   } catch (e) {
+    // 失败必须显示出来 —— 之前只把 overlay 留着，用户看到的就是一片黑
     $('m-overlay').textContent = '载入失败：' + e.message;
+    $('m-status').textContent = '失败';
   }
 }
 

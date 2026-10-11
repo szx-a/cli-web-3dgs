@@ -49,7 +49,12 @@ def create_app():
     @app.get("/", response_class=HTMLResponse)
     def index() -> HTMLResponse:
         html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
-        return HTMLResponse(html)
+        # ⚠️ 必须显式禁用缓存。默认 `HTMLResponse` 不带 Cache-Control，
+        # 浏览器会**启发式缓存**首页；而我们改前端（index.html/app.js/viewer.js）很频繁，
+        # 结果就是"代码改了、界面没变" —— 用户会以为修复没生效。
+        # 用 `no-cache` 而不是 `no-store`：仍然允许条件请求（ETag/Last-Modified），
+        # 命中就返回 304，不牺牲性能，但保证不会用过期的副本。
+        return HTMLResponse(html, headers={"Cache-Control": "no-cache, must-revalidate"})
 
     @app.get("/static/{name}")
     def static_file(name: str):
@@ -57,7 +62,9 @@ def create_app():
         if not p.exists() or p.parent != STATIC_DIR:
             raise HTTPException(404, "not found")
         media = "text/css" if name.endswith(".css") else "application/javascript" if name.endswith(".js") else "text/plain"
-        return FileResponse(p, media_type=media)
+        # 同上：静态资源也要 no-cache，否则前端改动在浏览器里看不到
+        return FileResponse(p, media_type=media,
+                            headers={"Cache-Control": "no-cache, must-revalidate"})
 
     # ------------------------------------------------------------------ 环境
     @app.get("/api/health")
@@ -248,11 +255,29 @@ def create_app():
             if arts:
                 info["note"] = info.get("note") or "manifest 缺失，已按目录扫描兜底"
 
+        # 查看器只支持 GLB 与 PLY 两种容器（见 static/viewer.js 顶部说明）。
+        # OBJ / SPZ 仍然导出（给 Blender 等外部工具用），但**不能放进"可查看"列表** ——
+        # 否则用户点进去只会看到一片黑，却不知道是格式不支持。
+        VIEWABLE = {".glb", ".ply"}
+
         def _add(mode: str, kind: str, name: str, desc: str = "") -> None:
             p = out / name
             if not p.exists():
                 return
+            if p.suffix.lower() not in VIEWABLE:
+                return
             modes[mode].append({
+                "kind": kind, "name": name, "desc": desc,
+                "size_mb": round(p.stat().st_size / 1024 / 1024, 2),
+                "url": f"/api/artifacts/{job_id}/05_export/{name}",
+            })
+
+        def _add_download(kind: str, name: str, desc: str = "") -> None:
+            """记录一个**可下载但不可查看**的产物（OBJ/SPZ 等）。"""
+            p = out / name
+            if not p.exists():
+                return
+            info.setdefault("downloadable", []).append({
                 "kind": kind, "name": name, "desc": desc,
                 "size_mb": round(p.stat().st_size / 1024 / 1024, 2),
                 "url": f"/api/artifacts/{job_id}/05_export/{name}",
@@ -268,7 +293,8 @@ def create_app():
             elif low.endswith(".glb") and "mesh" in low:
                 _add("mesh", "glb_mesh", name, desc or "三角网格 glTF（顶点色）")
             elif low.endswith(".obj") and "mesh" in low:
-                _add("mesh", "obj_mesh", name, desc or "三角网格 OBJ")
+                # 三角网格 OBJ：查看器不解析 OBJ，只能提供下载
+                _add_download("obj_mesh", name, desc or "三角网格 OBJ（用 Blender 等打开）")
             elif low.endswith(".ply") and "mesh" in low:
                 _add("mesh", "ply_mesh", name, desc or "三角网格 PLY")
             elif low.endswith(".glb"):
@@ -276,9 +302,11 @@ def create_app():
             elif low.endswith(".ply"):
                 _add("points", "ply", name, desc or "3DGS 点云 PLY")
             elif low.endswith(".spz"):
-                _add("points", "spz", name, desc or "SPZ 压缩点云")
+                _add_download("spz", name, desc or "SPZ 压缩点云（查看器不支持）")
+            elif low.endswith(".obj"):
+                _add_download("obj", name, desc or "点云 OBJ（查看器不支持）")
             elif low.endswith(".png") and "texture" in low:
-                _add("textured", "texture_png", name, desc or "烘焙贴图")
+                _add_download("texture_png", name, desc or "烘焙贴图（贴图文件）")
             elif low.endswith("viewer.html"):
                 info["viewer"] = f"/api/artifacts/{job_id}/05_export/{name}"
 
