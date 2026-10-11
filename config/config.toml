@@ -70,10 +70,23 @@ mask_loss_until = 0.25
 extra_args = ""
 
 [export]
-formats = ["glb_points", "viewer_html"]
+formats = ["glb_points", "mesh", "viewer_html"]
 glb_max_points = 800000
 glb_shrink = 1.0
 viewer_cdn = ""
+mesh_method = "poisson"
+mesh_width = 640
+mesh_max_views = 80
+mesh_poisson_depth = 9
+mesh_crop_quantile = 0.95
+mesh_density_quantile = 0.001
+mesh_trim_sigma = 2.5
+mesh_target_triangles = 400000
+mesh_smooth_iters = 5
+mesh_largest_only = true
+mesh_texture = false
+mesh_texture_size = 2048
+mesh_texture_timeout = 300
 
 [metrics]
 enabled = true

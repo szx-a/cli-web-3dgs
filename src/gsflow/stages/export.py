@@ -33,6 +33,44 @@ MODE_POINTS = 0
 MODE_TRIANGLES = 4
 
 
+def _unwrap_uv_with_timeout(unwrap_fn, mesh, tex_size: int, timeout_s: float):
+    """带超时地做 UV 展开。超时返回 (None, None, None, 已用秒数)。
+
+    为什么需要这层：`xatlas.parametrize` 是**单个 C 调用，没法从外面中断**。
+    实测它在泊松网格上耗时超线性 —— 9,940 面 0.61s，79,808 面 **813s**，
+    107,635 面 >20 分钟未完成。如果没有超时保护，导出阶段会**卡死**，
+    结果连 manifest.json 都写不出来（已导出的 glb/obj/ply 成了孤儿产物）。
+
+    做法：把展开放进 **daemon 线程**，主线程 `join(timeout)`。
+    * 超时就返回 None，让调用方跳过纹理烘焙、继续走完导出；
+    * 那个线程是 daemon，进程退出时不会阻止退出；
+    * 副作用是它会继续占一个核直到结束 —— 相比"整个导出卡死"这是可接受的取舍，
+      而且我们会明确告诉用户"已跳过、可调面数或调大超时"。
+    """
+    import threading
+    import time as _time
+
+    box: dict = {}
+
+    def _work():
+        try:
+            box["res"] = unwrap_fn(mesh, tex_size=tex_size)
+        except Exception as exc:  # noqa: BLE001
+            box["err"] = exc
+
+    t0 = _time.time()
+    th = threading.Thread(target=_work, daemon=True)
+    th.start()
+    th.join(None if timeout_s <= 0 else float(timeout_s))
+    dt = _time.time() - t0
+    if th.is_alive():
+        return None, None, None, dt
+    if "err" in box:
+        raise box["err"]
+    m, tris, uv = box.get("res", (None, None, None))
+    return m, tris, uv, dt
+
+
 def validate_glb(path: Path) -> dict:
     """按 glTF 2.0 规范校验我们导出的 GLB，返回 {ok, problems, info}。
 
@@ -520,6 +558,8 @@ class ExportStage(Stage):
                 # 0.03 这种"看起来合理"的分位数会把大量**真实表面**一起裁掉；
                 # 泊松在"完全无观测"处的密度接近 0，所以阈值必须取得很小。
                 density_quantile=float(ctx.cfg("mesh_density_quantile", 0.001) or 0.0),
+                # 按"到输入点的距离"裁掉泊松桥接出来的面（自适应阈值 = 输入点间距 × sigma）
+                trim_distance_sigma=float(ctx.cfg("mesh_trim_sigma", 2.5) or 0.0),
                 orient=True,
             )
             info["method"] = "poisson_backproject"
@@ -712,13 +752,32 @@ class ExportStage(Stage):
         # 顶点色在细节上远不如贴图（顶点数决定颜色分辨率），
         # 烘焙后模型能带"原图质感"，这是"实感"的最后一步。
         if cams and ctx.cfg("mesh_texture", False):
-            try:
-                from ..gsdata.mesh_export import bake_texture_from_views, unwrap_uv
+          try:
+            from ..gsdata.mesh_export import bake_texture_from_views, unwrap_uv
 
-                tex_size = int(ctx.cfg("mesh_texture_size", 2048) or 2048)
-                ctx.info(f"⑦ 纹理烘焙：UV 展开（xatlas）+ 从 {len(cams)} 个视角采样 @{tex_size}² ...")
-                uv_mesh, uv_tris, uv = unwrap_uv(mesh, tex_size=tex_size)
-
+            tex_size = int(ctx.cfg("mesh_texture_size", 2048) or 2048)
+            # ⚠️ UV 展开是**单个 C 调用，无法中断**，而且实测耗时超线性：
+            #     xatlas 在 9,940 面的合成球体上 0.61s，
+            #     但在 79,808 面的泊松网格上要 **813 秒（13.5 分钟）** ——
+            #     面数只多 8 倍，时间多 1330 倍；107,635 面时更久（实测 >20 分钟未完成）。
+            # 后果不只是慢：manifest.json 原来写在所有步骤之后，
+            # 一旦烘焙卡住/被中断，已导出的 glb/obj/ply 会变成**没有清单的孤儿产物**。
+            # 对策：给 UV 展开加**超时**（放进线程，超时就跳过纹理烘焙、流程继续），
+            # 让"纹理"成为可选的加分项，而不是阻塞整条导出的必经环节。
+            timeout_s = float(ctx.cfg("mesh_texture_timeout", 300) or 0)
+            n_tri_now = len(mesh.triangles)
+            ctx.info(f"⑦ 纹理烘焙：UV 展开（xatlas）+ 从 {len(cams)} 个视角采样 @{tex_size}²"
+                     f"（网格 {n_tri_now} 面，超时 {timeout_s:.0f}s）...")
+            uv_mesh, uv_tris, uv, uw_sec = _unwrap_uv_with_timeout(
+                unwrap_uv, mesh, tex_size, timeout_s)
+            if uv_mesh is None:
+                ctx.warn(
+                    f"UV 展开超时（>{timeout_s:.0f}s，网格 {n_tri_now} 面），**跳过纹理烘焙**；"
+                    f"网格与点云产物不受影响。可降低面数"
+                    f"（--set export.mesh_target_triangles=40000）、降低贴图分辨率，"
+                    f"或调大 --set export.mesh_texture_timeout=1200")
+            else:
+                ctx.info(f"   UV 展开完成：{uw_sec:.1f}s")
                 images, c2ws, ks, whs = self._load_bake_inputs(ctx, cams)
                 tex, tinfo = bake_texture_from_views(
                     uv_mesh, uv_tris, uv, images, c2ws, ks, whs, tex_size=tex_size)
@@ -748,8 +807,8 @@ class ExportStage(Stage):
                             "size_mb": round((out_dir / 'model_mesh_uv.obj').stat().st_size / 1024 / 1024, 2),
                             "desc": "带 UV 的网格 OBJ（配 model_mesh_texture.png 使用）"})
                 ctx.success(f"已导出 {tex_glb.name}（带贴图网格）")
-            except Exception as exc:  # noqa: BLE001
-                ctx.warn(f"纹理烘焙失败（无贴图版本已导出）：{type(exc).__name__}: {exc}")
+          except Exception as exc:  # noqa: BLE001
+            ctx.warn(f"纹理烘焙失败（无贴图版本已导出）：{type(exc).__name__}: {exc}")
 
         bb = mesh.get_axis_aligned_bounding_box()
         out.append({"kind": "mesh_stats",

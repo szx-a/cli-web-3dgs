@@ -130,11 +130,37 @@ DEFAULTS: dict[str, Any] = {
         "extra_args": "",
     },
     "export": {
-        # glb_points（纯 Python，离线可用）| spz | splat | viewer_html
-        "formats": ["glb_points", "viewer_html"],
+        # 产物格式（逗号分隔）：
+        #   glb_points  点云 glTF（纯 Python 写出，离线可用）
+        #   mesh        三角网格：同时产出 model_mesh.obj / .ply / .glb
+        #   viewer_html 单文件离线查看器
+        #   spz / splat 需额外依赖；obj 为点云 OBJ
+        # 默认给出用户要求的三种查看产物：点云(ply/glb) + 网格 + （可选）带贴图网格
+        "formats": ["glb_points", "mesh", "viewer_html"],
         "glb_max_points": 800000,
         "glb_shrink": 1.0,
         "viewer_cdn": "",         # 留空则用本地静态查看器
+
+        # ---- 网格提取（深度反投影 -> 泊松 -> 平滑 -> QEM 简化）----
+        "mesh_method": "poisson",       # poisson（推荐）| tsdf
+        "mesh_width": 640,              # 渲深度用的分辨率
+        "mesh_max_views": 80,           # 参与融合的视角上限
+        "mesh_poisson_depth": 9,        # 泊松八叉树深度：8 快 / 9 均衡 / 10 更细更慢
+        "mesh_crop_quantile": 0.95,     # 自动聚焦到主体（0.90 偏紧、0.95 实测更好）
+        "mesh_density_quantile": 0.001, # 密度裁剪；**极敏感**，0.03 会把质量砍半
+        "mesh_trim_sigma": 2.5,         # 按"到输入点距离"裁掉泊松桥接面；
+                                        # 阈值 = 输入点间距 × 该值。0=关闭。
+                                        # 这一项专治"该空的地方是实的"
+        "mesh_target_triangles": 400000,  # QEM 简化目标面数（0=不简化）
+        "mesh_smooth_iters": 5,         # Taubin 平滑迭代
+        "mesh_largest_only": True,      # 只保留最大连通块
+
+        # ---- 纹理烘焙（可选，"实感"的最后一步）----
+        # ⚠️ 依赖 xatlas UV 展开，而它在大网格上可能极慢（实测 10 万面级别会卡住），
+        #    所以默认关闭 + 带超时保护（超时即跳过，不影响其它产物）。
+        "mesh_texture": False,
+        "mesh_texture_size": 2048,
+        "mesh_texture_timeout": 300,    # UV 展开超时（秒）；超时跳过纹理烘焙
     },
     "metrics": {
         "enabled": True,
