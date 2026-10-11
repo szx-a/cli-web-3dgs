@@ -31,6 +31,36 @@ MODEL_DIR = "sparse/0"
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 
+def pick_sparse_model(sparse: Path) -> Path | None:
+    """在 `sparse/` 下选出**注册图像最多**的子模型（无合适者返回 None）。
+
+    为什么需要这个函数（而不是各处自己写）：COLMAP 的 `mapper` 会先把第一个重建写进
+    `sparse/0`，随后用其它初始种子对继续重建、写进 `sparse/1`、`sparse/2`…，
+    **并且最后把最优重建另存为新编号** —— 所以 `sparse/0` 经常是**最小的那个**。
+    （`Mapper.multiple_models=0` 并不能阻止多编号输出：那个开关控制的是
+     "是否继续寻找更多模型"，不是"写到哪个目录"。）
+
+    实测（IMG2 牌楼，242 帧）：`sparse/0` 只有 2 张图，`sparse/2` 有 241 张。
+    无条件取 `sparse/0` 会把 242 帧的作业报成"注册率 0.8%"。
+
+    判据用 `images.bin` 的体积（近似正比于注册图像数），避免解析二进制。
+    供 `ColmapStage` 与 `TrainStage` **共用** —— 这个逻辑曾有两份，
+    改了一处漏另一处（train 阶段就还留着硬编码 `sparse/0`）。
+    """
+    if not sparse.exists():
+        return None
+    subs = [d for d in sparse.iterdir() if d.is_dir()]
+    if not subs:
+        return None
+
+    def score(d: Path) -> int:
+        f = d / "images.bin"
+        return f.stat().st_size if f.exists() else 0
+
+    best = max(subs, key=score)
+    return best if score(best) > 0 else None
+
+
 class ColmapStage(Stage):
     name = "colmap"
     title = "③ COLMAP 稀疏重建"
@@ -249,42 +279,12 @@ class ColmapStage(Stage):
         return "exhaustive"
 
     def _find_model(self, sparse: Path) -> Path | None:
-        """在 `sparse/` 下选出**注册图像最多**的子模型。
+        """在 `sparse/` 下选出注册图像最多的子模型。
 
-        ⚠️ 这里曾有一个**影响很大的 bug**：原来第一行是
-            if (sparse / "0").exists(): return sparse / "0"
-        也就是只要 `sparse/0` 存在就无条件返回它 —— 下面那段"取注册最多"的
-        评分逻辑**永远不会执行**。
-
-        而 COLMAP 的 `mapper` 行为是：**先把第一个重建写进 `sparse/0`**，
-        随后发现的其它初始种子对会写进 `sparse/1`、`sparse/2`…
-        并且**最后会把最优重建另存为一个新编号**。
-        所以 `sparse/0` 经常是**最小的那个**。
-
-        实测后果（IMG2 牌楼，242 帧）：COLMAP 日志明确写着
-        `Registering image #169 (num_reg_frames=241)` 与
-        `Keeping successful reconstruction`，即**实际注册了 241 帧**；
-        但 `sparse/0` 里只有 2 张图，我们就把这个 2 张图的模型当成结果，
-        报出"注册率 0.8%"并让后续训练用垃圾位姿。
-        （`Mapper.multiple_models` 关闭并不能避免多编号输出。）
-
-        现在改为：**扫描所有子目录，按 `images.bin` 体积取最大者**
-        （`images.bin` 大小与注册图像数近似成正比，且不必解析二进制）。
+        实现已抽到模块级 `pick_sparse_model()`，供 train 阶段共用（见那里的说明）。
+        这里保留一层薄封装，方便脚本与测试直接调用实例方法。
         """
-        if not sparse.exists():
-            return None
-        subs = [d for d in sparse.iterdir() if d.is_dir()]
-        if not subs:
-            return None
-
-        def score(d: Path) -> int:
-            f = d / "images.bin"
-            return f.stat().st_size if f.exists() else 0
-
-        best = max(subs, key=score)
-        if score(best) == 0:
-            return None
-        return best
+        return pick_sparse_model(sparse)
 
     def _quality_report(self, ctx: StageContext, images_dir: Path, text_dir: Path) -> dict:
         """统计注册率与平均重投影误差。

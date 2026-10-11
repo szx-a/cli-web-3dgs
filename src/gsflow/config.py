@@ -115,8 +115,10 @@ DEFAULTS: dict[str, Any] = {
         # 视图少时它纯粹在过拟合，所以默认下调。大场景请显式调回 15000。
         "densify_until": 4000,
         "densify_interval": 100,
-        "densify_quantile": 0.75,      # 取梯度范数的 (1-q) 分位作为自适应阈值
-        "densify_grad_threshold": 1.5e-4,
+        # 0 = 关闭"分位自适应阈值"，用固定绝对阈值（与 trainer 默认一致）。
+        # 实测分位自适应会导致无界增长，已回退。
+        "densify_quantile": 0.0,
+        "densify_grad_threshold": 2e-4,
         "densify_grad_max": 5e-3,
         # 以下三个比例都相对 scene_scale（相机中心平均距离），取自官方 gsplat DefaultStrategy。
         # prune_scale3d 是**防发散的关键约束**：漏掉它会让尺度无界增长（实测 log尺度到 739）。
@@ -125,8 +127,16 @@ DEFAULTS: dict[str, Any] = {
         "prune_scale_after_reset": True,  # 尺度裁剪只在 step > opacity_reset_interval 后启用
         "revised_opacity": 0.1,        # 分裂出的高斯不透明度（官方 revised_opacity）
         "prune_opacity": 0.005,
-        "opacity_reset_interval": 3000,
-        "mask_loss_until": 0.25,       # 前 25% 迭代只在掩码内算损失
+        # ⚠️ 不透明度重置：**默认关闭（0）**，这是实测结论。
+        # 这里曾长期是 3000，而 trainer 的 dataclass 默认早已改为 0 —— **两份默认值不一致**，
+        # 运行时以本文件为准，导致"我在 trainer 里关掉了重置"根本没生效：
+        # 训练一直每 3000 步压一次不透明度，末次重置后的状态被存成最终检查点，
+        # 实测 PLY 的不透明度中位数被压到 0.012（正常应 ~0.5），渲染出一张**近乎全白**的图。
+        # 教训见 docs/03 G39：默认值只能有**一处**权威来源。
+        "opacity_reset_interval": 0,
+        # 掩码内损失生效的迭代占比：1.0 = 全程约束在掩码内。
+        # （同样是曾与 trainer 不一致的一项：这里 0.25、trainer 1.0。）
+        "mask_loss_until": 1.0,
         "extra_args": "",
     },
     "export": {
@@ -161,6 +171,8 @@ DEFAULTS: dict[str, Any] = {
         "mesh_texture": False,
         "mesh_texture_size": 2048,
         "mesh_texture_timeout": 300,    # UV 展开超时（秒）；超时跳过纹理烘焙
+        # 按"到输入点距离"裁掉泊松桥接出来的面（阈值 = 输入点间距 × 该值；0=关闭）
+        "mesh_trim_sigma": 2.5,
     },
     "metrics": {
         "enabled": True,

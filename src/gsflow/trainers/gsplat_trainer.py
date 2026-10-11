@@ -42,7 +42,10 @@ class TrainConfig:
     resolution: int = 1600            # 长边
     sh_degree: int = 3
     data_device: str = "cuda"
-    cap_max: int = 1_500_000
+    # 高斯数量上限（显存守护）。**必须与 config.DEFAULTS['train']['cap_max'] 保持一致** ——
+    # 运行时以配置系统为准，dataclass 只是兜底；两处不一致会造成"改了不生效"的错觉。
+    # （`tests/test_defaults_consistency.py` 会钉住这条。）
+    cap_max: int = 600_000
     ssim_weight: float = 0.2
     densify_from: int = 500
     # 密度控制窗口的**上界**。这是本项目在真实数据上最敏感的一个参数。
@@ -136,7 +139,7 @@ class TrainConfig:
     # **度量混叠**（同一相位反复评估同一张难图 -> 曲线周期性骤降，误判训练不稳）。
     eval_quick_views: int = 3
     white_background: bool = False
-    mask_loss_until: float = 0.25
+    mask_loss_until: float = 1.0
     seed: int = 42
     log_every: int = 200
 

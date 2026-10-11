@@ -42,22 +42,53 @@ class TrainStage(Stage):
         out_dir = ctx.stage_dir("04_train")
         data_dir = out_dir / "data"
 
-        # 1) 准备去畸变数据（幂等：已存在且完整则复用）
-        info_file = out_dir / "undistort_info.json"
+        # 1) 准备去畸变数据
+        #
+        # ⚠️ 这里有两个曾经真实踩到的缺陷：
+        #   a) 原来硬编码 `03_colmap/sparse/0` —— 与 colmap 阶段同一个坑：
+        #      COLMAP 会把最优重建写到别的编号（sparse/2），无条件取 0 会拿到垃圾位姿。
+        #      现在统一走 `pick_sparse_model()`（与 colmap 阶段**共用同一份逻辑**）。
+        #   b) 原来的 `data_ready` 只检查"目录/文件是否存在"，**不检查数量是否与当前
+        #      COLMAP 结果一致**。实测后果：COLMAP 修好后重跑 train，去畸变数据仍是上一次
+        #      失败留下的 **2 张图**，于是"复用已有的去畸变数据"，训练只用 2 张图、
+        #      报出 42.8 dB 这种**过拟合 2 张图的假高分**（eval_views=0）。
+        #      现在把"注册图像数"也纳入就绪判据，数量不符就重新去畸变。
+        from ..stages.colmap import pick_sparse_model
         from ..trainers.gsplat_trainer import find_model_dir
 
-        data_ready = (find_model_dir(data_dir) / "cameras.bin").exists() and (data_dir / "images").exists()
+        out_dir = ctx.stage_dir("04_train")
+        data_dir = out_dir / "data"
+        info_file = out_dir / "undistort_info.json"
+
+        colmap_dir = ctx.job_dir / "03_colmap"
+        model = pick_sparse_model(colmap_dir / "sparse")
+        if model is None:
+            raise StageError(self.name, "找不到 COLMAP 稀疏模型", "先跑 colmap 阶段")
+
+        # 选中的模型里有多少张注册图像（用文本模型数，最直接）
+        registered = 0
+        try:
+            from ..gsdata.colmap_io import read_model
+
+            registered = len(read_model(model).images)
+        except Exception:  # noqa: BLE001
+            registered = 0
+
+        have_cam = (find_model_dir(data_dir) / "cameras.bin").exists()
+        have_imgs = (data_dir / "images").exists()
+        n_undist = 0
+        if have_imgs:
+            n_undist = sum(1 for p in (data_dir / "images").iterdir() if p.is_file())
+        data_ready = have_cam and have_imgs and n_undist > 0 and (
+            registered == 0 or n_undist >= registered)
+
         if not data_ready:
+            if have_imgs and n_undist:
+                ctx.warn(f"去畸变数据与当前 COLMAP 结果不匹配（已有 {n_undist} 张，"
+                         f"当前模型注册 {registered} 张），重新生成")
             colmap = find_tool("colmap", str(ctx.cfg("tools.colmap", "") or ""))
             assert colmap
-            model = ctx.job_dir / "03_colmap" / "sparse" / "0"
-            if not model.exists():
-                subs = list((ctx.job_dir / "03_colmap" / "sparse").glob("*"))
-                subs = [s for s in subs if s.is_dir()]
-                if not subs:
-                    raise StageError(self.name, "找不到 COLMAP 稀疏模型", "先跑 colmap 阶段")
-                model = subs[0]
-            ctx.info("准备去畸变训练数据（COLMAP image_undistorter）...")
+            ctx.info(f"准备去畸变训练数据（COLMAP image_undistorter，模型 {model.name}）...")
             info = prepare_undistorted(
                 ctx, colmap.path,
                 self._pick_images_dir(ctx),
@@ -67,7 +98,7 @@ class TrainStage(Stage):
             )
             ctx.info(f"去畸变完成：{info['image_count']} 张图，掩码目录={info.get('masks_dir') or '无'}")
         else:
-            ctx.info("复用已有的去畸变数据")
+            ctx.info(f"复用已有的去畸变数据（{n_undist} 张）")
 
         # 2) 把掩码同步到去畸变图像名下，供掩码内损失使用
         self._sync_masks(ctx, data_dir, info_file)
