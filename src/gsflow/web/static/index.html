@@ -12,9 +12,9 @@
   <nav id="tabs">
     <button class="tab active" data-tab="new">新建作业</button>
     <button class="tab" data-tab="jobs">作业与进度</button>
+    <button class="tab" data-tab="models">模型查看</button>
     <button class="tab" data-tab="doctor">环境自检</button>
     <button class="tab" data-tab="settings">设置 / API Key</button>
-    <button class="tab" data-tab="about">说明</button>
   </nav>
   <div class="badge" id="health">连接中…</div>
 </header>
@@ -258,35 +258,41 @@
     </div>
   </section>
 
-  <!-- ================= 说明 ================= -->
-  <section class="panel" id="panel-about">
-    <div class="card">
-      <h2>这套流程在做什么</h2>
-      <ol class="steps">
-        <li><b>抽帧/导入</b>：视频经 ffmpeg 抽帧并缩放到目标长边，或直接导入图片。</li>
-        <li><b>AI 清理</b>：分割后端生成前景掩码，背景填黑（或补全），同时输出掩码供 COLMAP 忽略动态物体。
-          后端可选：classical（零依赖兜底）/ fastsam / rembg / sam2 / sam3（需 HF 授权）。</li>
-        <li><b>COLMAP</b>：特征提取 → 匹配（自动判断序列/全局）→ 稀疏重建 → 导出，给出注册率与重投影误差体检。</li>
-        <li><b>3DGS 训练</b>：去畸变后用 gsplat 训练，自适应密度控制 + 渐进分辨率 + 掩码内损失。</li>
-        <li><b>导出</b>：PLY → GLB/SPZ/OBJ + 离线查看器 + 预览图。</li>
-        <li><b>报告</b>：注册率、掩码占比、清晰度、PSNR 与改进建议。</li>
-      </ol>
-      <h2>架构红线</h2>
-      <ul>
-        <li>流程核心不依赖 UI；CLI 与 Web 只是两个入口，行为完全一致（GUI 里会显示等价命令）。</li>
-        <li>阶段之间只通过磁盘产物 + job.json 通信，随时可断点续跑或单阶段重跑。</li>
-        <li>外部工具（ffmpeg/colmap）用适配器定位，缺失时给“可执行的修复建议”而不是堆栈。</li>
-      </ul>
-      <h2>显存建议（8GB 卡）</h2>
-      <ul>
-        <li>1600px / 150~250 张 / 30k 迭代：可跑，训练约 30~60 分钟。</li>
-        <li>大场景（>400 张或户外）：降到 1200~1400px，或分批重建后合并。</li>
-        <li>OOM 时流程会自动降一档分辨率重试一次。</li>
-      </ul>
+  <!-- ================= 模型查看（独立功能页）================= -->
+  <section class="panel" id="panel-models">
+    <div class="grid two">
+      <div class="card">
+        <h2>选择作业与查看模式</h2>
+        <label>作业（已导出产物的）
+          <select id="m-job"><option value="">— 载入中 —</option></select>
+        </label>
+        <div class="row">
+          <button id="btn-m-reload">刷新作业列表</button>
+          <button id="btn-m-reset">重置视角</button>
+          <button id="btn-m-wire">切换线框</button>
+        </div>
+        <div class="modes" id="m-modes"></div>
+        <p class="hint" id="m-hint">三种模式：<b>点云</b>（3DGS 原始形态，最忠实）、
+          <b>网格</b>（三角面 + 顶点色，看几何是否成立）、
+          <b>带贴图网格</b>（最终"实感"产物）。</p>
+        <div id="m-list" class="list"></div>
+      </div>
+      <div class="card">
+        <h2>三维视图 <span class="muted" id="m-status"></span></h2>
+        <div id="m-canvas-wrap">
+          <canvas id="m-canvas"></canvas>
+          <div id="m-overlay" class="muted">选择一个模型…</div>
+        </div>
+        <p class="hint">左键拖动旋转 · 滚轮缩放 · 右键（或 Shift+左键）平移。
+          点云模式下渲染的是 <code>model.glb</code> / <code>model.ply</code>；
+          网格模式是 <code>model_mesh.glb</code>；带贴图模式是
+          <code>model_mesh_textured.glb</code>。</p>
+      </div>
     </div>
   </section>
 </main>
 
+<script src="/static/viewer.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

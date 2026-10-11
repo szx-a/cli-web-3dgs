@@ -224,15 +224,37 @@ class ExportStage(Stage):
                              "size_mb": round(obj_path.stat().st_size / 1024 / 1024, 2),
                              "desc": "通用点云 OBJ"})
 
+        # ⚠️ 在"重活"（网格提取 + 纹理烘焙）之前先落一次清单。
+        # 踩坑：manifest 原来只在**全部步骤之后**写。而纹理烘焙在大网格上会卡很久
+        # （xatlas UV 展开实测 79808 面要 813 秒），一旦超时被中断，
+        # 已经导出的 glb/obj/ply 就成了**没有清单的孤儿产物** ——
+        # GUI 的产物列表、脚本的产物发现全靠 manifest，等于白干。
+        # 所以：每完成一批产物就刷新清单，"部分成功"也要留下可用记录。
+        def _flush_manifest(extra_note: str = "") -> None:
+            m = {
+                "source_ply": str(ply),
+                "gaussians": int(len(gauss["xyz"])),
+                "formats": formats,
+                "artifacts": produced,
+                "complete": False,
+            }
+            if extra_note:
+                m["note"] = extra_note
+            (out_dir / "manifest.json").write_text(
+                json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        _flush_manifest("点云类产物已就绪；网格/贴图进行中")
+
         # 三角网格导出（用户反馈"点云没有实感"）
-        # 走 TSDF 融合：用已训练的 3DGS 渲深度+RGB -> open3d 融合出网格。
-        # 选型理由与 SuGaR/2DGS 的对比见 gsdata/mesh_export.py 顶部注释。
+        # 深度反投影 -> 泊松 -> 平滑 -> QEM 简化；详见 gsdata/mesh_export.py 顶部注释。
         if "mesh" in formats or "obj_mesh" in formats or "mesh_obj" in formats:
             try:
                 mesh_items = self._export_mesh(ctx, ply, out_dir)
                 produced.extend(mesh_items)
+                _flush_manifest("网格已就绪")
             except Exception as exc:  # noqa: BLE001
                 ctx.warn(f"网格导出失败（不影响其它产物）：{type(exc).__name__}: {exc}")
+                _flush_manifest(f"网格导出失败：{type(exc).__name__}")
 
         previews = self._render_previews(ctx, gauss, out_dir)
         produced.extend(previews)
@@ -249,6 +271,7 @@ class ExportStage(Stage):
             "gaussians": int(len(gauss["xyz"])),
             "formats": formats,
             "artifacts": produced,
+            "complete": True,
         }
         (out_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         return StageResult(artifacts=[str(out_dir / "manifest.json")], metrics=manifest,

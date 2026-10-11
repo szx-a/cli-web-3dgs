@@ -28,6 +28,7 @@ document.querySelectorAll('.tab').forEach((btn) => {
     $('panel-' + btn.dataset.tab).classList.add('active');
     if (btn.dataset.tab === 'jobs') refreshJobs();
     if (btn.dataset.tab === 'doctor') runDoctor();
+    if (btn.dataset.tab === 'models') initModelsPage();
   });
 });
 
@@ -399,6 +400,145 @@ $('btn-reset-config').onclick = async () => { await api('/api/config/reset', { m
   'p-export-formats', 'p-mesh-method', 'p-mesh-depth', 'p-mesh-tris', 'p-mesh-smooth',
   'p-mesh-width', 'p-mesh-views', 'p-mesh-densq', 'p-mesh-texture', 'p-mesh-texsize',
 ].forEach((id) => { const el = $(id); if (el) el.addEventListener('input', updateCliPreview); });
+
+/* ------------------------------------------------------ 模型查看（独立功能页） */
+/* 三种模式对应用户要求的三种查看方式：
+ *   points   点云（model.glb / model.ply）      —— 3DGS 原始形态
+ *   mesh     三角网格 + 顶点色（model_mesh.glb）—— 看几何
+ *   textured 带贴图网格（model_mesh_textured.glb）—— 最终"实感"产物
+ */
+const MODE_DEF = [
+  { key: 'points',   title: '点云',        desc: '3DGS 原始形态，最忠实',
+    prefers: ['glb_points', 'ply', 'spz'] },
+  { key: 'mesh',     title: '网格',        desc: '三角面 + 顶点色，看几何',
+    prefers: ['glb_mesh', 'obj_mesh', 'ply_mesh'] },
+  { key: 'textured', title: '带贴图网格',  desc: '最终"实感"产物',
+    prefers: ['glb_textured'] },
+];
+let MODELS = null;          // 当前作业的 /api/models 结果
+let ACTIVE_MODE = 'points';
+let VIEWER_READY = false;
+
+function initModelsPage() {
+  if (!VIEWER_READY) {
+    try {
+      window.GsViewer.init($('m-canvas'), (s) => { $('m-status').textContent = s || ''; });
+      VIEWER_READY = true;
+    } catch (e) {
+      $('m-overlay').textContent = '查看器初始化失败：' + e.message;
+      $('m-overlay').classList.remove('hide');
+    }
+  }
+  loadModelJobs();
+}
+
+async function loadModelJobs() {
+  try {
+    const j = await api('/api/jobs');
+    const all = [].concat(j.running || [], j.history || []);
+    const seen = new Set();
+    const opts = ['<option value="">— 选择作业 —</option>'];
+    all.forEach((it) => {
+      const id = it.job_id || it.id;
+      if (!id || seen.has(id)) return;
+      seen.add(id);
+      const st = it.status || '';
+      opts.push(`<option value="${id}">${id}${st ? '  (' + st + ')' : ''}</option>`);
+    });
+    $('m-job').innerHTML = opts.join('');
+  } catch (e) {
+    $('m-job').innerHTML = '<option value="">（作业列表读取失败）</option>';
+  }
+}
+
+function renderModeButtons() {
+  const box = $('m-modes');
+  box.innerHTML = '';
+  MODE_DEF.forEach((d) => {
+    const n = MODELS ? (MODELS.counts?.[d.key] || 0) : 0;
+    const el = document.createElement('button');
+    el.className = 'mode' + (d.key === ACTIVE_MODE ? ' active' : '');
+    el.innerHTML = `<div class="mt">${d.title}</div><div class="md">${d.desc}</div>`
+      + `<div class="mc">${n} 个产物</div>`;
+    el.disabled = n === 0;
+    el.onclick = () => { ACTIVE_MODE = d.key; renderModeButtons(); renderModeFiles(); };
+    box.appendChild(el);
+  });
+}
+
+function renderModeFiles() {
+  const box = $('m-list');
+  box.innerHTML = '';
+  if (!MODELS) { box.innerHTML = '<div class="hint">先选择一个作业。</div>'; return; }
+  const files = (MODELS.modes && MODELS.modes[ACTIVE_MODE]) || [];
+  if (!files.length) {
+    box.innerHTML = '<div class="hint">该模式下没有产物。'
+      + '（点云/网格/贴图分别对应 export.formats 里的 glb_points 与 mesh，'
+      + '带贴图网格还需 export.mesh_texture=true）</div>';
+    return;
+  }
+  files.forEach((f) => {
+    const el = document.createElement('div');
+    el.className = 'item';
+    el.innerHTML = `<div class="top"><span class="jid">${f.name}</span>`
+      + `<span class="muted">${f.size_mb} MB</span></div>`
+      + `<div class="meta">${f.desc || f.kind}</div>`;
+    el.onclick = () => loadModelFile(f);
+    box.appendChild(el);
+  });
+  // 自动载入第一个，省一次点击
+  loadModelFile(files[0]);
+}
+
+async function loadModelFile(f) {
+  $('m-overlay').classList.remove('hide');
+  $('m-overlay').textContent = '载入 ' + f.name + ' …';
+  try {
+    const info = await window.GsViewer.load(f.url, f.name.toLowerCase().endsWith('.ply') ? 'ply' : 'glb');
+    $('m-overlay').classList.add('hide');
+    const parts = [`${info.vertices} 顶点`];
+    if (info.triangles) parts.push(`${info.triangles} 面`);
+    if (info.textured) parts.push('带贴图');
+    else if (info.colors) parts.push('顶点色');
+    $('m-status').textContent = f.name + ' · ' + parts.join(' · ');
+  } catch (e) {
+    $('m-overlay').textContent = '载入失败：' + e.message;
+  }
+}
+
+async function selectModelJob() {
+  const jid = $('m-job').value;
+  if (!jid) { MODELS = null; renderModeButtons(); renderModeFiles(); return; }
+  $('m-overlay').classList.remove('hide');
+  $('m-overlay').textContent = '读取产物清单…';
+  try {
+    MODELS = await api('/api/models/' + encodeURIComponent(jid));
+    if (MODELS.complete === false && MODELS.note) {
+      $('m-hint').textContent = '提示：' + MODELS.note
+        + '（导出未完整结束，下面列出的是已完成的产物）';
+    }
+    if (!MODELS.counts?.[ACTIVE_MODE]) {
+      ACTIVE_MODE = MODE_DEF.find((d) => (MODELS.counts?.[d.key] || 0) > 0)?.key || 'points';
+    }
+    renderModeButtons();
+    renderModeFiles();
+    if (!(MODELS.counts?.points || MODELS.counts?.mesh || MODELS.counts?.textured)) {
+      $('m-overlay').textContent = '该作业还没有导出产物';
+    }
+  } catch (e) {
+    MODELS = null;
+    $('m-overlay').textContent = '读取失败：' + e.message;
+    renderModeButtons(); renderModeFiles();
+  }
+}
+
+$('btn-m-reload').onclick = loadModelJobs;
+$('m-job').onchange = selectModelJob;
+$('btn-m-reset').onclick = () => window.GsViewer.reset();
+$('btn-m-wire').onclick = () => {
+  const on = window.GsViewer.toggleWire();
+  $('btn-m-wire').textContent = on ? '关闭线框' : '切换线框';
+};
 
 /* ------------------------------------------------------------------ 启动 */
 (async function boot() {

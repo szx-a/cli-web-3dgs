@@ -207,6 +207,85 @@ def create_app():
         events = read_jsonl(f)
         return {"events": [e.to_json() for e in events[-tail:]]}
 
+    @app.get("/api/models/{job_id}")
+    def job_models(job_id: str) -> dict[str, Any]:
+        """列出该作业可用于**查看**的模型产物，分为三种模式。
+
+        三种模式是用户明确要求的查看方式：
+          * `points`  —— 点云（PLY / 点云 GLB），最忠实反映 3DGS 的原始形态
+          * `mesh`    —— 三角网格（无贴图），看几何是否成立
+          * `textured`—— 带贴图的网格，看最终"实感"产物
+
+        数据来源是 `05_export/manifest.json`（导出阶段会**增量刷新**，
+        所以即使网格/贴图那一步失败或超时，已完成的产物也能列出）。
+        文件不存在时不报错，只返回空列表 —— GUI 要能优雅处理"还没导出"。
+        """
+        root = Path(str(load_settings().get("project.workspace_dir"))) / job_id
+        out = root / "05_export"
+        modes: dict[str, list[dict[str, Any]]] = {"points": [], "mesh": [], "textured": []}
+        info: dict[str, Any] = {"job_id": job_id, "manifest": False, "complete": False}
+
+        man_p = out / "manifest.json"
+        arts: list[dict[str, Any]] = []
+        if man_p.exists():
+            try:
+                man = json.loads(man_p.read_text(encoding="utf-8"))
+                arts = man.get("artifacts") or []
+                info["manifest"] = True
+                info["complete"] = bool(man.get("complete"))
+                info["note"] = man.get("note", "")
+                info["gaussians"] = man.get("gaussians")
+            except Exception:  # noqa: BLE001
+                info["note"] = "manifest.json 解析失败"
+
+        # 兜底：没有 manifest 就直接扫目录（导出被中断时仍有产物可用）
+        if not arts and out.exists():
+            for p in sorted(out.iterdir()):
+                if p.is_file():
+                    arts.append({"kind": p.suffix.lstrip(".") or "file",
+                                 "path": p.name,
+                                 "size_mb": round(p.stat().st_size / 1024 / 1024, 2)})
+            if arts:
+                info["note"] = info.get("note") or "manifest 缺失，已按目录扫描兜底"
+
+        def _add(mode: str, kind: str, name: str, desc: str = "") -> None:
+            p = out / name
+            if not p.exists():
+                return
+            modes[mode].append({
+                "kind": kind, "name": name, "desc": desc,
+                "size_mb": round(p.stat().st_size / 1024 / 1024, 2),
+                "url": f"/api/artifacts/{job_id}/05_export/{name}",
+            })
+
+        for a in arts:
+            name = str(a.get("path") or "")
+            kind = str(a.get("kind") or "")
+            desc = str(a.get("desc") or "")
+            low = name.lower()
+            if low.endswith(".glb") and "mesh" in low and "textured" in low:
+                _add("textured", "glb_textured", name, desc or "带贴图网格 glTF")
+            elif low.endswith(".glb") and "mesh" in low:
+                _add("mesh", "glb_mesh", name, desc or "三角网格 glTF（顶点色）")
+            elif low.endswith(".obj") and "mesh" in low:
+                _add("mesh", "obj_mesh", name, desc or "三角网格 OBJ")
+            elif low.endswith(".ply") and "mesh" in low:
+                _add("mesh", "ply_mesh", name, desc or "三角网格 PLY")
+            elif low.endswith(".glb"):
+                _add("points", "glb_points", name, desc or "点云 glTF")
+            elif low.endswith(".ply"):
+                _add("points", "ply", name, desc or "3DGS 点云 PLY")
+            elif low.endswith(".spz"):
+                _add("points", "spz", name, desc or "SPZ 压缩点云")
+            elif low.endswith(".png") and "texture" in low:
+                _add("textured", "texture_png", name, desc or "烘焙贴图")
+            elif low.endswith("viewer.html"):
+                info["viewer"] = f"/api/artifacts/{job_id}/05_export/{name}"
+
+        info["modes"] = modes
+        info["counts"] = {k: len(v) for k, v in modes.items()}
+        return info
+
     return app
 
 
