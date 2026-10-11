@@ -560,7 +560,11 @@ class ExportStage(Stage):
                 density_quantile=float(ctx.cfg("mesh_density_quantile", 0.001) or 0.0),
                 # 按"到输入点的距离"裁掉泊松桥接出来的面（自适应阈值 = 输入点间距 × sigma）
                 trim_distance_sigma=float(ctx.cfg("mesh_trim_sigma", 2.5) or 0.0),
-                orient=True,
+                # `orient=False`：反投影现在给出的法线是**由深度梯度算出的真实表面法线、
+                # 且已按"朝向相机"统一过**，不需要（也不应该）再跑一次
+                # `orient_normals_consistent_tangent_plane` —— 那一步是给**无朝向**的
+                # 原始点云用的，在带噪薄壳上会打乱本来正确的法线，而且很慢。
+                orient=False,
             )
             info["method"] = "poisson_backproject"
             info["points_used"] = int(len(bp_pts))

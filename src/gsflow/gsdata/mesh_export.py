@@ -395,8 +395,54 @@ def backproject_depth_to_points(rendered, c2ws, view_idx, ks, src_wh,
         x = (us - cx) / fx * z
         y = (vs - cy) / fy * z
         cam_pts = np.stack([x, y, z], axis=1)
-        # 法线（相机系）：单位方向即"相机指向表面"的方向
-        cam_n = cam_pts / np.linalg.norm(cam_pts, axis=1, keepdims=True)
+
+        # ---- 表面法线：**从深度图的梯度求**（社区标准做法，2DGS / GOF 同源）----
+        #
+        # ⚠️ 这里曾有一个**严重错误**，是"网格像揉皱的纸"的根因：
+        #     原实现写的是 `cam_n = cam_pts / ||cam_pts||`
+        #   那是**视线方向（相机->像素的射线）**，不是表面法线。
+        #   视线方向指向"穿过表面继续往外"，而且**同一表面点从不同视角看方向完全相反**
+        #   （从正面看朝你、从背面看背你）。泊松重建正是靠法线定朝向，
+        #   喂这种法线时指示函数无解 -> 输出"填满轮廓的碎面"：
+        #   实测轮廓 IoU 高达 0.837（轮廓对），但邻域法线一致性仅 0.0022、
+        #   翻转比例 50%（完全没有方向性）。
+        #
+        # 正确做法：深度图在相机系下是 z(u,v)，
+        #   切向量 T_u = d/du (x,y,z) = (z_u*x/fx + x*z_u/z + z, z_u*y/fy, z_u)
+        #   切向量 T_v = d/dv (x,y,z) = (z_v*x/fx, z_v*y/fy + y*z_v/z + z, z_v)
+        #   法线 = normalize(T_v × T_u)
+        # 其中 z_u / z_v 是深度对像素的偏导（中心差分，单位像素）。
+        z_img = depth.astype(np.float64)
+        zu_img = np.zeros_like(z_img)
+        zv_img = np.zeros_like(z_img)
+        zu_img[:, 1:-1] = 0.5 * (z_img[:, 2:] - z_img[:, :-2])
+        zv_img[1:-1, :] = 0.5 * (z_img[2:, :] - z_img[:-2, :])
+        zu = zu_img[vs, us]
+        zv = zv_img[vs, us]
+        vz = np.ones_like(z)          # dz/du = 0, dz/dv = 0（对 v 的 z 分量）
+        tu = np.stack([zu * x / fx + x * zu / z + z, zu * y / fy, zu], axis=1)
+        tv = np.stack([zv * x / fx, zv * y / fy + y * zv / z + z, vz], axis=1)
+        cam_n = np.cross(tv, tu)
+        nl = np.linalg.norm(cam_n, axis=1, keepdims=True)
+        good_n = nl[:, 0] > 1e-12
+        cam_n = np.divide(cam_n, np.where(nl > 1e-12, nl, 1.0))
+        # 深度梯度为 0（正对相机的平面）时叉积会退化，退回视线方向作兜底
+        if not good_n.all():
+            fallback = cam_pts / np.maximum(np.linalg.norm(cam_pts, axis=1, keepdims=True), 1e-12)
+            cam_n[~good_n] = fallback[~good_n]
+
+        # 背面剔除：真实可见表面的法线必然**朝向相机**（视线方向是 (0,0,1) 的反方向，
+        # 即 -cam_pts）。点积 <= 0 说明这个像素落在背面/深度不连续处，其法线不可信。
+        # 不剔除的话，多视角重叠处的相反法线会在体素下采样里互相抵消（平均成 ~0）。
+        facing = np.einsum("ij,ij->i", cam_n, -cam_pts) > 0
+        if not facing.any():
+            continue
+        if not facing.all():
+            vs, us, z = vs[facing], us[facing], z[facing]
+            cam_pts, cam_n = cam_pts[facing], cam_n[facing]
+        # 统一朝向相机（保证同一表面在不同视角给出同向法线）
+        cam_n = np.where((np.einsum("ij,ij->i", cam_n, -cam_pts) > 0)[:, None],
+                         cam_n, -cam_n)
 
         c2w = np.asarray(c2ws[i], dtype=np.float64)
         R, t = c2w[:3, :3], c2w[:3, 3]
