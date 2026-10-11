@@ -27,6 +27,7 @@ def get(base: str, path: str, timeout: int = 30):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8787)
+    ap.add_argument("--jobs", default="", help="只检查这些作业（逗号分隔）；默认取前几个")
     args = ap.parse_args()
     base = f"http://127.0.0.1:{args.port}"
 
@@ -61,7 +62,11 @@ def main() -> int:
 
     # 模型清单端点
     ws = Path(h.get("workspace") or (ROOT / "workspace"))
-    jobs = [p.name for p in sorted(ws.iterdir()) if p.is_dir() and (p / "05_export").exists()]
+    if args.jobs:
+        jobs = [s.strip() for s in args.jobs.split(",") if s.strip()]
+    else:
+        jobs = [p.name for p in sorted(ws.iterdir())
+                if p.is_dir() and (p / "05_export").exists()]
     print(f"\n有 05_export 的作业 {len(jobs)} 个：{jobs[:6]}")
     if not jobs:
         print("（没有可验证的作业，跳过 /api/models 检查）")
