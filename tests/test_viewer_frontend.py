@@ -113,3 +113,66 @@ def test_viewer_source_has_no_hard_pitch_clamp() -> None:
     assert "PITCH_LIMIT" in src, "缺少 PITCH_LIMIT"
     # lookAt 必须有共线保护
     assert "共线退化保护" in src or "1e-6" in src, "m4lookAt 缺少共线保护"
+
+
+def _pick_ply_mesh() -> Path | None:
+    """找一个三角网格 PLY（含 element face）。"""
+    if not WORKSPACE.exists():
+        return None
+    for job in sorted(WORKSPACE.iterdir(), reverse=True):
+        for name in ("model_mesh.ply",):
+            p = job / "05_export" / name
+            if p.exists():
+                head = p.read_bytes()[:4000]
+                if b"element face" in head:
+                    return p
+    return None
+
+
+def _pick_point_ply() -> Path | None:
+    """找一个 3DGS 点云 PLY（没有 element face）。"""
+    if not WORKSPACE.exists():
+        return None
+    for job in sorted(WORKSPACE.iterdir(), reverse=True):
+        for d in sorted((job / "04_train" / "point_cloud").glob("iteration_*"), reverse=True):
+            p = d / "point_cloud.ply"
+            if p.exists():
+                head = p.read_bytes()[:4000]
+                if b"element face" not in head and b"f_dc_0" in head:
+                    return p
+    return None
+
+
+@needs_node
+def test_ply_mesh_is_parsed_as_solid_not_point_cloud() -> None:
+    """**网格 PLY 必须被解析成实体三角面，而不是点云。**
+
+    回归：`parsePly` 曾经无条件返回 `mode: 0`（POINTS）与 `indices: null`，
+    完全忽略 `element face`，于是**任何 PLY 都被画成点云** ——
+    用户看到的"ply 查看只有点云、不是实体模型"就是这个原因
+    （网格 PLY 里有 74295 个三角面，却一个都没被读）。
+    """
+    mesh = _pick_ply_mesh()
+    pts = _pick_point_ply()
+    if mesh is None:
+        pytest.skip("workspace 里没有带 element face 的网格 PLY")
+
+    r = _run_probe(mesh)
+    out = (r.stdout or "") + (r.stderr or "")
+    assert "load() 返回" in out, out
+    # 必须报出三角形数与 mode=4
+    assert '"mode":4' in out.replace(" ", ""), f"网格 PLY 未识别为 TRIANGLES：\n{out}"
+    assert '"triangles":0' not in out.replace(" ", ""), \
+        f"网格 PLY 的三角形数为 0（面没被解析）：\n{out}"
+    # 且渲染走 drawElements(TRIANGLES=4)
+    assert '["drawElements",4' in out.replace(" ", ""), \
+        f"网格 PLY 没有用 drawElements(TRIANGLES) 绘制：\n{out}"
+    assert "PLY 面索引越界" not in out, out
+
+    # 对照组：点云 PLY 仍应是 POINTS（不能把点云误判成网格）
+    if pts is not None:
+        r2 = _run_probe(pts)
+        out2 = (r2.stdout or "") + (r2.stderr or "")
+        assert '"mode":0' in out2.replace(" ", ""), \
+            f"点云 PLY 应保持 POINTS：\n{out2}"
+        assert '["drawArrays",0' in out2.replace(" ", ""), out2

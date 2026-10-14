@@ -206,16 +206,37 @@ function parsePly(buf) {
   const vcount = parseInt((lines.find((l) => l.startsWith('element vertex')) || '').split(/\s+/)[2], 10);
   if (!vcount) throw new Error('PLY 没有 element vertex');
 
-  // 属性列表（只取 vertex 元素）
+  // ⚠️ 必须区分 element 段：`element face N` 里的行**不是**顶点属性。
+  // 原来只收集 "property " 行、不看当前落在哪个 element，
+  // 于是 face 段的 `property list uchar uint vertex_indices` 被当成第 11 个浮点属性，
+  // 导致 stride 与颜色偏移全错。这里按 element 分段解析。
   const props = [];
-  let inVertex = false;
+  const faceProps = [];
+  let inVertex = false, inFace = false;
   for (const l of lines) {
-    if (l.startsWith('element vertex')) { inVertex = true; continue; }
-    if (l.startsWith('element ') && !l.startsWith('element vertex')) { inVertex = false; continue; }
-    if (inVertex && l.startsWith('property ')) {
+    if (l.startsWith('element ')) {
+      const nm = l.split(/\s+/)[1];
+      inVertex = (nm === 'vertex');
+      inFace = (nm === 'face');
+      if (inFace) faceProps.push({ list: true });
+      continue;
+    }
+    if (l.startsWith('property ') && inVertex) {
       const p = l.split(/\s+/);
       props.push({ type: p[1], name: p[2] });
     }
+  }
+  // face 数（用于解析三角形）
+  const faceCount = parseInt((lines.find((l) => l.startsWith('element face')) || '')
+    .split(/\s+/)[2], 10) || 0;
+  // face 的属性声明：形如 `property list uchar uint vertex_indices`
+  const faceLine = lines.find((l) => l.startsWith('property list') &&
+    lines.indexOf(l) > lines.findIndex((q) => q.startsWith('element face')));
+  let faceIndexType = 'uint';
+  if (faceLine) {
+    const p = faceLine.split(/\s+/);
+    // property list <countType> <indexType> <name>
+    faceIndexType = p[3] || 'uint';
   }
   const SIZE = { char: 1, uchar: 1, int8: 1, uint8: 1, short: 2, ushort: 2,
                  int16: 2, uint16: 2, int: 4, uint: 4, int32: 4, uint32: 4,
@@ -252,13 +273,33 @@ function parsePly(buf) {
   for (let i = 0; i < vcount; i++) {
     position[i*3] = rx(i); position[i*3+1] = ry(i); position[i*3+2] = rz(i);
   }
-  // 颜色：优先 red/green/blue（0~255），否则 f_dc_*（SH 直流项）
+  // 法线（网格 PLY 通常带 nx/ny/nz）：有就用于平滑光照
+  let normal = null;
+  const nxg = get('nx'), nyg = get('ny'), nzg = get('nz');
+  if (nxg && nyg && nzg) {
+    normal = new Float32Array(vcount * 3);
+    let ok = false;
+    for (let i = 0; i < vcount; i++) {
+      const a = nxg(i), b = nyg(i), c = nzg(i);
+      normal[i*3] = a; normal[i*3+1] = b; normal[i*3+2] = c;
+      if (Math.abs(a) + Math.abs(b) + Math.abs(c) > 1e-6) ok = true;
+    }
+    if (!ok) normal = null;          // 全零法线等于没有
+  }
+  // 颜色：优先 red/green/blue（0~255 或 0~1），否则 f_dc_*（SH 直流项）
   let color = null;
   const rr = get('red'), gg = get('green'), bb = get('blue');
   if (rr && gg && bb) {
     color = new Float32Array(vcount * 3);
+    // open3d 写网格时颜色可能是 uchar(0~255)，也可能是 float(0~1)；
+    // 用属性类型判断，避免把 0~1 的值再除 255 变成全黑。
+    const rp = props.find((p) => p.name === 'red');
+    const isByte = rp && /^(uchar|char|uint8|int8|ushort|uint16|short|int16)$/.test(rp.type);
+    const sc = isByte ? 1 / 255 : 1;
     for (let i = 0; i < vcount; i++) {
-      color[i*3] = rr(i) / 255; color[i*3+1] = gg(i) / 255; color[i*3+2] = bb(i) / 255;
+      color[i*3] = Math.min(1, Math.max(0, rr(i) * sc));
+      color[i*3+1] = Math.min(1, Math.max(0, gg(i) * sc));
+      color[i*3+2] = Math.min(1, Math.max(0, bb(i) * sc));
     }
   } else {
     const f0 = get('f_dc_0'), f1 = get('f_dc_1'), f2 = get('f_dc_2');
@@ -272,7 +313,42 @@ function parsePly(buf) {
       }
     }
   }
-  return { mode: 0, position, color, uv: null, indices: null, textureUrl: null };
+
+  // ---- 面（三角形）：有 element face 就是**实体网格**，不是点云 ----
+  //
+  // ⚠️ 这里曾经**完全没实现**：`parsePly` 无条件返回 `mode: 0`（POINTS）与
+  //    `indices: null`，于是**任何 PLY 都被画成点云** —— 包括带 74295 个三角面的
+  //    实体网格 PLY。用户看到"ply 查看只有点云、不是实体"就是这个原因。
+  // open3d 写网格的布局：`element face N` + `property list uchar uint vertex_indices`。
+  let indices = null;
+  if (faceCount > 0) {
+    const faceBase = headEnd + vcount * stride;   // 顶点段之后的字节偏移
+    const fdv = new DataView(buf, faceBase);
+    const IDX_SIZE = SIZE[faceIndexType] || 4;
+    const readIdx = IDX_SIZE === 4
+      ? (b) => fdv.getUint32(b, le)
+      : (b) => fdv.getUint16(b, le);
+    const out = [];
+    let p = 0;
+    for (let f = 0; f < faceCount; f++) {
+      const n = fdv.getUint8(p); p += 1;          // 每面的顶点数（三角面=3）
+      const v = new Array(n);
+      for (let k = 0; k < n; k++) { v[k] = readIdx(p); p += IDX_SIZE; }
+      // 三角形直接收；多边形按扇形三角化（PLY 里少见，但别静默丢面）
+      for (let k = 1; k + 1 < n; k++) {
+        out.push(v[0], v[k], v[k + 1]);
+      }
+    }
+    if (out.length >= 3) {
+      indices = new Uint32Array(out);
+      // 索引越界会让整个图元不画（WebGL 静默失败）—— 这里挡一道
+      let mx = 0;
+      for (let i = 0; i < indices.length; i++) if (indices[i] > mx) mx = indices[i];
+      if (mx >= vcount) throw new Error(`PLY 面索引越界（max=${mx} >= 顶点数 ${vcount}）`);
+    }
+  }
+  return { mode: indices ? 4 : 0, position, color, uv: null, normal,
+           indices, textureUrl: null };
 }
 
 /* ============================ WebGL 渲染器 ============================ */

@@ -172,8 +172,11 @@ try {
   process.exit(1);
 }
 
+// kind 必须按扩展名判断 —— 写死 'glb' 会让 .ply 走 GLB 分支，
+// 报出误导性的"不是 GLB 文件"（实测踩过）。
+const kindOf = (p) => (p.toLowerCase().endsWith('.ply') ? 'ply' : 'glb');
 try {
-  const info = await V.load('/api/artifacts/x/' + path.basename(glb), 'glb');
+  const info = await V.load('/api/artifacts/x/' + path.basename(glb), kindOf(glb));
   console.log('load() 返回: ' + JSON.stringify(info));
 } catch (e) {
   console.log('**load() 抛出**: ' + e.message + '\n' + e.stack);
@@ -224,8 +227,7 @@ console.log(`  采样 ${mvpFinite.length} 次 uMVP，含 NaN/Inf 的次数 = ${b
 console.log('\n--- 本地文件路径 loadBuffer() ---');
 try {
   const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
-  const kind = glb.toLowerCase().endsWith('.ply') ? 'ply' : 'glb';
-  const r2 = await V.loadBuffer(ab, glb.split(/[\\/]/).pop(), kind);
+  const r2 = await V.loadBuffer(ab, glb.split(/[\\/]/).pop(), kindOf(glb));
   console.log('  loadBuffer() 返回: ' + JSON.stringify(r2));
   if (!r2 || !r2.vertices) {
     console.log('  **本地文件路径解析失败**');
