@@ -643,30 +643,60 @@ window.GsViewer = (function () {
       draw();
     },
     toggleWire() { wire = !wire; draw(); return wire; },
-    /** 载入一个模型：kind 为 'glb' 或 'ply' */
+
+    /** 清空当前模型（"清空视图"按钮用） */
+    clear() {
+      if (obj && R) {
+        const { gl } = R;
+        [obj.vbuf, obj.cbuf, obj.ubuf, obj.nbuf, obj.ibuf, obj.lineIbuf]
+          .forEach((b) => { if (b) gl.deleteBuffer(b); });
+        if (obj.texture) gl.deleteTexture(obj.texture);
+      }
+      obj = null;
+      target = [0, 0, 0];
+      dist = 3;
+      yaw = 0.6; pitch = 0.45;
+      draw();
+      return true;
+    },
+
+    /** 载入一个远端产物：从 URL 取回后交给 loadBuffer */
     async load(url, kind) {
       if (!R) throw new Error('查看器未初始化');
       if (onStatus) onStatus('载入中…');
-      const res = await fetch(url);
+      let res;
+      try {
+        res = await fetch(url);
+      } catch (e) {
+        throw new Error('下载失败：' + e.message);
+      }
       if (!res.ok) throw new Error('下载失败 HTTP ' + res.status
                                    + '（文件可能已被删除 —— 重跑一次导出即可）');
       const buf = await res.arrayBuffer();
+      return this.loadBuffer(buf, url, kind);
+    },
+
+    /** 载入一个已在内存里的模型（本地文件、拖拽、粘贴等都用这条路径）*/
+    async loadBuffer(buf, nameOrUrl, kind) {
+      if (!R) throw new Error('查看器未初始化');
+      const label = String(nameOrUrl || '');
+      const low = label.toLowerCase();
       if (!buf || buf.byteLength < 64) {
         throw new Error('文件为空或过小（' + (buf ? buf.byteLength : 0)
-                        + ' 字节）—— 该产物可能未成功导出');
+                        + ' 字节）');
       }
+      if (onStatus) onStatus('解析中…');
       let model;
       try {
-        const low = url.toLowerCase();
         if (kind === 'glb' || low.endsWith('.glb')) {
           model = glbToRenderable(buf, null);
-        } else if (low.endsWith('.ply')) {
+        } else if (kind === 'ply' || low.endsWith('.ply')) {
           model = parsePly(buf);
         } else {
           // ⚠️ 只支持 glb / ply 两种容器。OBJ / SPZ 等**必须在界面层就过滤掉** ——
           // 否则这里会走进 GLB 解析分支、抛一个含糊的错误，用户只看到"黑"。
           throw new Error('查看器不支持该格式（仅 GLB 与 PLY）：'
-                          + url.split('/').pop());
+                          + (label.split('/').pop() || label));
         }
       } catch (e) {
         throw new Error('解析失败：' + e.message);

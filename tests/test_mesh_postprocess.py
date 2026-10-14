@@ -125,3 +125,75 @@ def test_presimplify_avoids_smoothing_huge_meshes(ratio: float, expect_pre: bool
             f"平滑时仍有 {faces_at_smooth} 面（应已被预简化到 <= {100 * ratio}）")
     else:
         assert faces_at_smooth == n_src
+
+
+# --------------------------------------------------------------- 2dgs 一致性投票
+def test_multiview_consistency_drops_single_view_points() -> None:
+    """一致性投票必须删掉"只被 1 个视角看到"的点（伪影），保留多视角支持的点。
+
+    这是 `mesh_method=2dgs` 的核心机制，对应本项目的实测问题：
+    单视角点会让泊松生成毛刺/薄片，并使法线在体素下采样后互相抵消（翻转 ~35%）。
+    """
+    from gsflow.gsdata.mesh_export import filter_by_multiview_consistency
+
+    rng = np.random.default_rng(0)
+    # 100 个被 3 个视角共同看到的点（真实表面），挤在一起构成表面
+    surface = rng.normal(0, 0.001, size=(100, 3))
+    vid_surface = np.tile([0, 1, 2], 34)[:100].astype(np.int64)
+    # 50 个只被视角 9 看到、且远离表面的孤立点（伪影）
+    ghost = rng.normal(5.0, 0.001, size=(50, 3))
+    vid_ghost = np.full(50, 9, dtype=np.int64)
+
+    pts = np.vstack([surface, ghost])
+    vid = np.concatenate([vid_surface, vid_ghost])
+    nrm = np.tile(np.array([0.0, 1.0, 0.0]), (len(pts), 1))
+
+    out, out_n, _c, st = filter_by_multiview_consistency(
+        pts, normals=nrm, view_id=vid, voxel=0.02, min_views=2)
+
+    assert st["points_in"] == 150
+    assert st["dropped_few_views"] == 50, st
+    assert len(out) == 100, f"应保留 100 个表面点，实际 {len(out)}"
+    assert out[:, 1].max() < 1.0, "孤立的单视角点没有被删掉"
+    assert out_n is not None and len(out_n) == len(out)
+
+    # min_views=1 等于关闭该过滤
+    out1, _, _, st1 = filter_by_multiview_consistency(
+        pts, normals=nrm, view_id=vid, voxel=0.02, min_views=1)
+    assert len(out1) == 150 and st1["dropped_few_views"] == 0
+
+
+def test_multiview_consistency_prefers_larger_voxel() -> None:
+    """投票体素越大保留越多点 —— 这解释了实测里 1.5x 删掉 52% 点的现象。
+
+    回归依据（img2-opfix，80 视角）：1.5x 保留 48.0%、IoU 0.684；
+    3.0x 保留 84.0%、IoU 0.815。所以默认取 3.0。
+    """
+    from gsflow.gsdata.mesh_export import filter_by_multiview_consistency
+
+    rng = np.random.default_rng(1)
+    # 表面点略有噪声：视角不同 -> 采样位置略有偏移
+    pts, vid = [], []
+    for v in range(4):
+        p = rng.normal(0, 0.004, size=(200, 3))
+        pts.append(p)
+        vid.append(np.full(200, v, dtype=np.int64))
+    pts = np.vstack(pts)
+    vid = np.concatenate(vid)
+
+    small, _, _, st_s = filter_by_multiview_consistency(
+        pts, view_id=vid, voxel=0.004, min_views=2)
+    big, _, _, st_b = filter_by_multiview_consistency(
+        pts, view_id=vid, voxel=0.02, min_views=2)
+    assert len(big) >= len(small), (
+        f"体素变大后保留数不应减少：小 {len(small)} vs 大 {len(big)}")
+    assert st_b["kept_ratio"] >= st_s["kept_ratio"]
+
+
+def test_multiview_consistency_keeps_everything_without_voxel() -> None:
+    """voxel<=0（未启用）时应原样返回，不应静默删点。"""
+    from gsflow.gsdata.mesh_export import filter_by_multiview_consistency
+
+    pts = np.zeros((10, 3))
+    out, _, _, st = filter_by_multiview_consistency(pts, voxel=0.0, min_views=2)
+    assert len(out) == 10 and st["points_out"] == 10

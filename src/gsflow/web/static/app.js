@@ -29,6 +29,7 @@ document.querySelectorAll('.tab').forEach((btn) => {
     if (btn.dataset.tab === 'jobs') refreshJobs();
     if (btn.dataset.tab === 'doctor') runDoctor();
     if (btn.dataset.tab === 'models') initModelsPage();
+    if (btn.dataset.tab === 'mesh') initMeshPage();
   });
 });
 
@@ -402,6 +403,123 @@ $('btn-reset-config').onclick = async () => { await api('/api/config/reset', { m
 ].forEach((id) => { const el = $(id); if (el) el.addEventListener('input', updateCliPreview); });
 
 /* ------------------------------------------------------ 模型查看（独立功能页） */
+/* ============================================================ 网格导出页 */
+/**
+ * 对**已训练**的作业单独重导出网格。
+ *
+ * 为什么单独做一页：网格提取的调参是**反复试**的过程（换方法、调泊松深度、
+ * 调目标面数），而重跑一次训练要十几分钟。这一页只触发 `export` 阶段，
+ * 并显示等价的 CLI 命令，保证 GUI 与 CLI 行为一致（架构红线）。
+ */
+let MESH_READY = false;
+
+function initMeshPage() {
+  if (!MESH_READY) {
+    MESH_READY = true;
+    const reload = $('btn-me-jobs');
+    if (reload) reload.onclick = loadMeshJobs;
+    const dry = $('btn-me-dry');
+    if (dry) dry.onclick = () => runMeshExport(true);
+    const run = $('btn-me-run');
+    if (run) run.onclick = () => runMeshExport(false);
+  }
+  loadMeshJobs();
+}
+
+function collectMeshParams() {
+  const p = {};
+  const put = (k, v) => { if (v !== '' && v !== null && v !== undefined) p[k] = v; };
+  put('export.formats', $('me-formats').value.trim());
+  put('export.mesh_method', $('me-method').value);
+  put('export.mesh_poisson_depth', $('me-depth').value);
+  put('export.mesh_target_triangles', $('me-tris').value);
+  put('export.mesh_width', $('me-width').value);
+  put('export.mesh_max_views', $('me-views').value);
+  put('export.mesh_smooth_iters', $('me-smooth').value);
+  put('export.mesh_texture', $('me-texture').value);
+  put('export.mesh_texture_size', $('me-texsize').value);
+  // 只有 2dgs 模式读这几项，其它模式传了也无害
+  put('export.mesh_consistency_min_views', $('me-minviews').value);
+  put('export.mesh_consistency_voxel_scale', $('me-voxscale').value);
+  put('export.mesh_consistency_normal_dot', $('me-nrmdot').value);
+  return p;
+}
+
+async function loadMeshJobs() {
+  const sel = $('me-job');
+  if (!sel) return;
+  try {
+    const j = await api('/api/jobs');
+    const all = [].concat(j.running || [], j.history || []);
+    const prev = sel.value;
+    sel.innerHTML = '';
+    if (!all.length) {
+      sel.innerHTML = '<option value="">（没有作业）</option>';
+      return;
+    }
+    all.forEach((x) => {
+      const o = document.createElement('option');
+      o.value = x.job_id;
+      o.textContent = x.job_id + (x.status ? `（${x.status}）` : '');
+      sel.appendChild(o);
+    });
+    if (prev && all.some((x) => x.job_id === prev)) sel.value = prev;
+  } catch (e) {
+    sel.innerHTML = '<option value="">载入失败：' + e.message + '</option>';
+  }
+}
+
+async function runMeshExport(dryRun) {
+  const job = $('me-job').value;
+  const st = $('me-status');
+  const note = $('me-note');
+  if (!job) { if (st) st.textContent = '请先选择一个作业。'; return; }
+  const method = $('me-method').value;
+
+  // 参数预检：把已知"必然失败/极慢"的组合提前提示。阈值都来自实测（见 docs/03 G46/G50）。
+  const depth = parseInt($('me-depth').value, 10);
+  const tris = parseInt($('me-tris').value, 10);
+  const warn = [];
+  if (method === 'poisson' && depth >= 10) {
+    warn.push('泊松深度 ≥10 在本机（15GB 内存）实测不可用：2771 万面会让后处理'
+      + '超过 27 分钟。建议保持 9；要更细请提高「深度图分辨率」或减少参与视角。');
+  }
+  if (method === '2dgs' && parseInt($('me-minviews').value, 10) > 4) {
+    warn.push('最小视角数 >4 会删掉大量真实表面'
+      + '（80 视角下每个表面点通常只被 2~3 个视角看到）。');
+  }
+  if ($('me-texture').value === 'true' && tris > 30000) {
+    warn.push('目标面数 >3 万时烘焙贴图很可能超时（xatlas 在 8 万面上要 13 分钟以上）。');
+  }
+  if (note) note.innerHTML = warn.length ? ('⚠ ' + warn.join('<br>⚠ ')) : '';
+
+  const body = {
+    job_id: job,
+    title: '网格导出 · ' + method,
+    stages: ['export'],
+    force_stages: ['export'],
+    params: collectMeshParams(),
+    dry_run: !!dryRun,
+  };
+  if (st) {
+    st.textContent = dryRun ? '正在生成命令预览…'
+      : '已提交，正在导出（可在「作业与进度」看日志）…';
+  }
+  try {
+    const r = await api('/api/run', { method: 'POST', body: JSON.stringify(body) });
+    const cli = $('me-cli');
+    if (cli) cli.textContent = r.cli_equivalent || '';
+    if (st) {
+      st.textContent = dryRun
+        ? '以上是本次导出等价的 CLI 命令（GUI 与 CLI 走同一套流程逻辑）。'
+        : `已提交：run_id=${r.run_id || '-'} job=${r.job_id || job}。`
+          + '导出完成后到「模型查看」页刷新即可看到新网格。';
+    }
+  } catch (e) {
+    if (st) st.textContent = '失败：' + e.message;
+  }
+}
+
 /* 三种模式对应用户要求的三种查看方式：
  *   points   点云（model.glb / model.ply）      —— 3DGS 原始形态
  *   mesh     三角网格 + 顶点色（model_mesh.glb）—— 看几何
@@ -429,6 +547,7 @@ function initModelsPage() {
       $('m-overlay').classList.remove('hide');
     }
   }
+  initLocalFilePicker();
   loadModelJobs();
 }
 
@@ -515,17 +634,83 @@ async function loadModelFile(f) {
   $('m-overlay').textContent = '载入 ' + f.name + ' …';
   try {
     const info = await window.GsViewer.load(f.url, f.name.toLowerCase().endsWith('.ply') ? 'ply' : 'glb');
-    $('m-overlay').classList.add('hide');
-    const parts = [`${info.vertices} 顶点`];
-    if (info.triangles) parts.push(`${info.triangles} 面`);
-    if (info.textured) parts.push('带贴图');
-    else if (info.colors) parts.push('顶点色');
-    if (info.normals) parts.push('法线');
-    $('m-status').textContent = f.name + ' · ' + parts.join(' · ');
+    showModelInfo(f.name, info);
   } catch (e) {
     // 失败必须显示出来 —— 之前只把 overlay 留着，用户看到的就是一片黑
     $('m-overlay').textContent = '载入失败：' + e.message;
     $('m-status').textContent = '失败';
+  }
+}
+
+/** 统一显示"载入成功"的信息（远端产物与本地文件共用） */
+function showModelInfo(name, info) {
+  $('m-overlay').classList.add('hide');
+  const parts = [`${info.vertices} 顶点`];
+  if (info.triangles) parts.push(`${info.triangles} 面`);
+  if (info.textured) parts.push('带贴图');
+  else if (info.colors) parts.push('顶点色');
+  if (info.normals) parts.push('法线');
+  $('m-status').textContent = name + ' · ' + parts.join(' · ');
+}
+
+/**
+ * 直接打开本地 .ply / .glb 文件。
+ *
+ * 为什么需要：用户手上常有**不在作业目录里**的产物 —— 例如从别处拿到的
+ * 点云 PLY、或 Blender 导出的实感网格 GLB。要求先"跑一个作业"才能看是不合理的。
+ * 这里用 FileReader 读成 ArrayBuffer 后走 `GsViewer.loadBuffer()`，
+ * 与远端产物**共用同一条解析路径**（避免两套解析逻辑各自出 bug）。
+ * 文件不会上传：全程在浏览器内存里。
+ */
+function initLocalFilePicker() {
+  const input = $('m-file');
+  if (!input) return;
+  input.onchange = async () => {
+    const f = input.files && input.files[0];
+    if (!f) return;
+    const low = f.name.toLowerCase();
+    const info = $('m-file-info');
+    if (!low.endsWith('.ply') && !low.endsWith('.glb')) {
+      // 界面层就挡掉不支持的格式，不要让查看器抛含糊错误
+      if (info) info.textContent = '不支持该格式（仅 .ply 与 .glb）：' + f.name;
+      return;
+    }
+    if (info) {
+      info.textContent = `读取中：${f.name}（${(f.size / 1048576).toFixed(2)} MB）…`;
+    }
+    $('m-overlay').classList.remove('hide');
+    $('m-overlay').textContent = '读取 ' + f.name + ' …';
+    try {
+      const buf = await f.arrayBuffer();
+      const kind = low.endsWith('.ply') ? 'ply' : 'glb';
+      const r = await window.GsViewer.loadBuffer(buf, f.name, kind);
+      showModelInfo(f.name, r);
+      if (info) {
+        info.textContent = `已载入本地文件 ${f.name}`
+          + `（${(f.size / 1048576).toFixed(2)} MB，${r.vertices} 顶点`
+          + (r.triangles ? `，${r.triangles} 面` : '')
+          + (r.colors ? '，含顶点色' : '')
+          + (r.normals ? '，含法线' : '') + '）';
+      }
+    } catch (e) {
+      $('m-overlay').textContent = '打开失败：' + e.message;
+      $('m-status').textContent = '失败';
+      if (info) info.textContent = '打开失败：' + e.message;
+    } finally {
+      input.value = '';   // 允许再次选择同一个文件
+    }
+  };
+
+  const clear = $('btn-m-clear');
+  if (clear) {
+    clear.onclick = () => {
+      window.GsViewer.clear();
+      $('m-overlay').classList.remove('hide');
+      $('m-overlay').textContent = '选择一个模型…';
+      $('m-status').textContent = '';
+      const info = $('m-file-info');
+      if (info) info.textContent = '';
+    };
   }
 }
 

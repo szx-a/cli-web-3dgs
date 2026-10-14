@@ -442,6 +442,7 @@ class ExportStage(Stage):
         import torch
 
         from ..gsdata.mesh_export import (_scene_extent, auto_crop_bounds, clean_mesh,
+                                          filter_by_multiview_consistency,
                                           poisson_mesh, to_largest_component)
 
         gauss = self._read_ply(ply, max_points=0)
@@ -473,7 +474,7 @@ class ExportStage(Stage):
             else:
                 ctx.warn("聚焦后剩余高斯过少，改用全部点")
 
-        # ---------------- 路线一：深度反投影 -> 泊松（社区标准流程，默认） ----------------
+        # ---------------- 路线一：深度反投影 -> 泊松 ----------------
         # 用户给的社区标准流程：
         #   1) 从 3DGS 渲染深度图，按不透明度/深度一致性过滤后**反投影**成稠密点云
         #   2) 统计去噪 + **体素下采样**均匀化密度 + 法线一致定向
@@ -481,7 +482,12 @@ class ExportStage(Stage):
         #   4) 后处理：裁掉低密度包络面 + 平滑 + QEM 简化
         # 关键点：**不能直接拿高斯中心当输入点云** —— 那些点是一团一团分布在
         # 表面附近的三维体，泊松会得到厚壳与鼓包；反投影出来的才是"薄薄一层"。
-        if method in ("poisson", "poisson_depth", "backproject"):
+        #
+        # 两种模式共用这条主链，差别只在"反投影之后是否做多视角一致性筛选"：
+        #   * `poisson`（默认）：沿用社区标准流程，适合视图较少/深度较干净的场景。
+        #   * `2dgs`：额外做多视角深度一致性投票（见下面 consistency 段），
+        #     针对本项目实测的"表面毛刺 + 法线翻转 35%"问题。
+        if method in ("poisson", "poisson_depth", "backproject", "2dgs"):
             from ..gsdata.mesh_export import (backproject_depth_to_points,
                                               render_depths, select_views_by_distance,
                                               simplify_mesh, smooth_mesh, voxel_downsample)
@@ -541,13 +547,71 @@ class ExportStage(Stage):
             ctx.info(f"   反投影得到 {len(bp_pts)} 个点"
                      f"（{bp_stat['views_used']} 视角，{bp_stat['pixels']} 个有效像素）")
 
-            # 体素下采样：均匀化密度（近处视角点密、远处稀疏，差异可达百倍）。
+            # 体素下采样尺寸：均匀化密度（近处视角点密、远处稀疏，差异可达百倍）。
             # 反投影会产出百万级点，必须下采样，否则泊松既慢又过拟合。
             # 默认取 体素尺度 = 场景尺度/400 的 1/4（比几何体素更粗），
             # 实测 250 万点 -> 155 万点，网格质量不受影响。
+            # 注意：**在一致性投票之前算**，因为投票体素要按它来定标。
             vds = float(ctx.cfg("mesh_voxel_downsample", 0.0) or 0.0)
             if vds <= 0:
                 vds = extent / float(ctx.cfg("mesh_voxel_div", 400.0) or 400.0) * 0.25
+
+            # ---- 「2dgs」模式的核心：多视角深度一致性投票 ----
+            #
+            # `mesh_method=2dgs` 与默认 `poisson` 走**同一条主链**，差别只在这里：
+            # 把"只被单个视角看到的点"清掉。为什么必须清（都是本项目的实测问题）：
+            #   * 表面毛刺/薄片：深度不连续处（前景边缘拖尾）产生孤立点，
+            #     泊松在局部把它们连成尖刺。
+            #   * **法线翻转约 35%**：同一表面被相邻视角各投一份点，两份法线因噪声
+            #     方向相反，体素下采样把它们**平均成接近零**，于是光照大片发黑。
+            # 判据：体素投票，要求 >= min_views 个视角支持；
+            # 并可再按"与该体素平均法线的夹角"剔除方向矛盾的点。
+            #
+            # 这对应 2DGS / Gaussian Opacity Fields 用"多视角一致性约束表面"的思想，
+            # 但作用在**导出阶段**，不需要重训模型。
+            if method == "2dgs":
+                bp_pts, bp_cols, bp_nrm, vstat = backproject_depth_to_points(
+                    rendered=rendered, c2ws=c2ws, view_idx=used_idx, ks=ks, src_wh=src_wh,
+                    width=width, height=width,
+                    depth_stride=ctx.cfgt("mesh_depth_stride", 2, int),
+                    min_alpha=ctx.cfgt("mesh_min_alpha", 0.5, float),
+                    erode_px=ctx.cfgt("mesh_erode_px", 1, int),
+                    grad_thresh_ratio=ctx.cfgt("mesh_grad_thresh", 0.06, float),
+                    return_view_id=True,
+                )
+                # 投票体素要比下采样体素**大一些**，否则相邻视角对同一表面的采样
+                # 永远落不进同一格，投票就没意义。默认 1.5 倍。
+                cvoxel = vds * ctx.cfgt("mesh_consistency_voxel_scale", 3.0, float)
+                bp_pts, bp_nrm, bp_cols, cstat = filter_by_multiview_consistency(
+                    bp_pts, normals=bp_nrm, colors=bp_cols,
+                    view_id=vstat.get("view_id"),
+                    voxel=cvoxel,
+                    min_views=ctx.cfgt("mesh_consistency_min_views", 2, int),
+                    normal_dot_min=ctx.cfgt("mesh_consistency_normal_dot", 0.0, float),
+                )
+                # ⚠️ 这里不能用 `info` —— 它要等下面的 `poisson_mesh(...)` 才被赋值，
+                # 提前引用会 UnboundLocalError（实测踩过）。先用局部变量存着，后面合并。
+                consistency_info = {k: (round(v, 4) if isinstance(v, float) else v)
+                                    for k, v in cstat.items()}
+                ctx.info(
+                    f"   多视角一致性投票（体素 {cvoxel:.5f}，要求 >= "
+                    f"{cstat['min_views']}/{cstat['views_total']} 视角）："
+                    f"{cstat['points_in']} -> {cstat['points_out']} 点"
+                    f"（保留 {cstat['kept_ratio']*100:.1f}%；"
+                    f"视角不足剔除 {cstat['dropped_few_views']}，"
+                    f"法线矛盾剔除 {cstat['dropped_normal_conflict']}）")
+                if len(bp_pts) < 1000:
+                    ctx.warn("一致性投票后点太少，退回不做投票的结果")
+                    bp_pts, bp_cols, bp_nrm, _ = backproject_depth_to_points(
+                        rendered=rendered, c2ws=c2ws, view_idx=used_idx, ks=ks,
+                        src_wh=src_wh, width=width, height=height,
+                        depth_stride=ctx.cfgt("mesh_depth_stride", 2, int),
+                        min_alpha=ctx.cfgt("mesh_min_alpha", 0.5, float),
+                        erode_px=ctx.cfgt("mesh_erode_px", 1, int),
+                        grad_thresh_ratio=ctx.cfgt("mesh_grad_thresh", 0.06, float),
+                    )
+                    consistency_info = None
+
             bp_pts, bp_cols, bp_nrm = voxel_downsample(bp_pts, bp_cols, bp_nrm, voxel=vds)
             ctx.info(f"③ 体素下采样（{vds:.5f}）后剩 {len(bp_pts)} 个点")
 
@@ -568,7 +632,10 @@ class ExportStage(Stage):
                 # 原始点云用的，在带噪薄壳上会打乱本来正确的法线，而且很慢。
                 orient=False,
             )
-            info["method"] = "poisson_backproject"
+            # 2dgs 模式的一致性统计（在 poisson_mesh 之后才有 info 可写）
+            if method == "2dgs" and locals().get("consistency_info"):
+                info["consistency"] = consistency_info
+            info["method"] = "poisson_backproject" if method != "2dgs" else "2dgs_consistency"
             info["points_used"] = int(len(bp_pts))
             ctx.info(f"④ 泊松重建（depth={info['depth']}）："
                      f"{len(mesh.triangles)} 个三角形 / {len(mesh.vertices)} 个顶点")

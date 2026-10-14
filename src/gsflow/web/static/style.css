@@ -81,6 +81,14 @@ button {
 button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 button:disabled { opacity: .45; cursor: not-allowed; }
 button.primary { background: var(--accent); color: #04121c; border-color: transparent; font-weight: 600; }
+
+/* 让 <label> 看起来像按钮（用于包住隐藏的 file input —— 原生 file 控件样式不可控） */
+.btn-like {
+  display: inline-block;
+  background: var(--panel-2); color: var(--fg); border: 1px solid var(--line);
+  padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 13px;
+}
+.btn-like:hover { border-color: var(--accent); color: var(--accent); }
 button.primary:hover:not(:disabled) { background: #6fd0ff; color: #04121c; }
 button.small { padding: 3px 10px; font-size: 11px; text-transform: none; letter-spacing: 0; }
 

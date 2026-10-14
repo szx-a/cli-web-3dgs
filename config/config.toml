@@ -92,6 +92,9 @@ mesh_largest_only = true
 mesh_texture = false
 mesh_texture_size = 2048
 mesh_texture_timeout = 300
+mesh_consistency_min_views = 2
+mesh_consistency_voxel_scale = 3.0
+mesh_consistency_normal_dot = 0.0
 
 [metrics]
 enabled = true

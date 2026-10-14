@@ -46,6 +46,43 @@ def test_static_assets(client) -> None:
         assert r.status_code == 200 and len(r.content) > 500
 
 
+def test_gui_has_local_file_picker_and_mesh_export_page(client) -> None:
+    """GUI 必须能**直接打开本机 .ply/.glb 文件**，并有一个独立的网格导出页。
+
+    前者是用户明确要求的能力（"直接 ply 文件查看，点云和实感模型"）——
+    不能要求先跑一个作业才能看手上的文件。
+    后者承载"两条网格路线"的可视化操作，且必须暴露 2dgs 模式与一致性参数。
+    """
+    html = client.get("/").text
+    static = ROOT / "src" / "gsflow" / "web" / "static"
+    appjs = (static / "app.js").read_text(encoding="utf-8")
+    viewer = (static / "viewer.js").read_text(encoding="utf-8")
+
+    # 1) 本地文件选择
+    assert 'id="m-file"' in html, "缺少本地文件选择控件"
+    assert 'accept=".ply,.glb"' in html, "文件选择应只接受 ply/glb"
+    assert "initLocalFilePicker" in appjs, "文件选择没有接线"
+    assert "arrayBuffer" in appjs, "本地文件应以 ArrayBuffer 读入"
+
+    # 2) 查看器提供 loadBuffer / clear，且远端 load() 复用同一条解析路径
+    assert "loadBuffer" in viewer and "clear()" in viewer
+    assert "this.loadBuffer(buf" in viewer, "远端 load() 应复用 loadBuffer()，避免两套解析逻辑"
+
+    # 3) 独立网格导出页
+    assert 'data-tab="mesh"' in html, "缺少网格导出页签"
+    assert 'id="panel-mesh"' in html, "缺少网格导出面板"
+    assert "initMeshPage" in appjs, "网格导出页没有初始化逻辑"
+    assert "collectMeshParams" in appjs, "网格导出页没有收集参数"
+
+    # 4) 两条路线 + 一致性参数都要能在界面上选
+    assert 'value="2dgs"' in html, "网格方法缺少 2dgs 选项"
+    assert 'value="tsdf"' in html, "网格方法缺少 tsdf 选项"
+    assert 'id="me-minviews"' in html and 'id="me-voxscale"' in html, \
+        "缺少 2dgs 的一致性投票参数"
+    #   预检提示：泊松深度 ≥10 在本机不可用（见 docs/03 G46）
+    assert "2771" in appjs, "缺少泊松深度预检提示"
+
+
 def test_gui_has_model_viewer_and_no_about_tab(client) -> None:
     """GUI 结构契约：有「模型查看」页、且「说明」页已移除。
 

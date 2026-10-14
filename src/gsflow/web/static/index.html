@@ -13,6 +13,7 @@
     <button class="tab active" data-tab="new">新建作业</button>
     <button class="tab" data-tab="jobs">作业与进度</button>
     <button class="tab" data-tab="models">模型查看</button>
+    <button class="tab" data-tab="mesh">网格导出</button>
     <button class="tab" data-tab="doctor">环境自检</button>
     <button class="tab" data-tab="settings">设置 / API Key</button>
   </nav>
@@ -129,10 +130,10 @@
           <label class="grow">网格提取方法
             <select id="p-mesh-method">
               <option value="poisson">poisson（深度反投影 + 泊松，推荐）</option>
+              <option value="2dgs">2dgs（多视角一致性投票，法线更干净）</option>
               <option value="tsdf">tsdf（深度图 TSDF 融合）</option>
             </select>
           </label>
-          <label class="grow">导出格式（逗号分隔）
             <input id="p-export-formats" value="glb_points,mesh,viewer_html"
                    placeholder="glb_points,mesh,spz,obj,viewer_html">
           </label>
@@ -276,6 +277,19 @@
           <b>网格</b>（三角面 + 顶点色，看几何是否成立）、
           <b>带贴图网格</b>（最终"实感"产物）。</p>
         <div id="m-list" class="list"></div>
+
+        <h2 style="margin-top:14px">直接打开本地文件</h2>
+        <p class="hint">不需要先跑作业 —— 直接选择本机的 <code>.ply</code>（点云或
+          <b>实感网格</b>）或 <code>.glb</code> 文件即可查看。文件只在浏览器内解析，
+          不会上传。</p>
+        <div class="row">
+          <label class="btn-like">选择文件…
+            <input type="file" id="m-file" accept=".ply,.glb"
+                   style="display:none">
+          </label>
+          <button id="btn-m-clear">清空视图</button>
+        </div>
+        <div id="m-file-info" class="hint"></div>
       </div>
       <div class="card">
         <h2>三维视图 <span class="muted" id="m-status"></span></h2>
@@ -286,8 +300,94 @@
         <p class="hint">左键拖动旋转 · 滚轮缩放 · 右键（或 Shift+左键）平移。
           点云模式下渲染的是 <code>model.glb</code> / <code>model.ply</code>；
           网格模式是 <code>model_mesh.glb</code>；带贴图模式是
-          <code>model_mesh_textured.glb</code>。</p>
+          <code>model_mesh_textured.glb</code>。
+          也可以从左侧<b>直接打开本机的 .ply / .glb 文件</b>（点云或实感网格）。</p>
       </div>
+    </div>
+  </section>
+
+  <!-- ================= 网格导出（独立功能页）================= -->
+  <section class="panel" id="panel-mesh">
+    <div class="card">
+      <h2>网格导出（对已完成训练的作业单独重导出，不必重跑训练）</h2>
+      <p class="hint">训练好的高斯模型可以反复用不同参数提取网格。这里选一个
+        已有 <code>04_train</code> 的作业，只重跑 <code>export</code> 阶段即可。
+        <b>poisson</b> 是社区标准流程（深度反投影 → 泊松 → 裁剪 → 平滑 → QEM）；
+        <b>2dgs</b> 在其上增加多视角一致性投票，法线更干净（实测翻转比例 44% → 31%），
+        代价是 IoU 略降。</p>
+
+      <div class="row">
+        <label class="grow">作业（含 04_train 的）
+          <select id="me-job"><option value="">— 载入中 —</option></select>
+        </label>
+        <button id="btn-me-jobs">刷新列表</button>
+      </div>
+
+      <div class="row">
+        <label class="grow">提取方法
+          <select id="me-method">
+            <option value="poisson">poisson（默认，IoU 最高）</option>
+            <option value="2dgs">2dgs（一致性投票，法线最干净）</option>
+            <option value="tsdf">tsdf（体素融合）</option>
+          </select>
+        </label>
+        <label class="grow">泊松深度
+          <input id="me-depth" type="number" min="6" max="12" value="9">
+        </label>
+        <label class="grow">目标面数
+          <input id="me-tris" type="number" step="10000" value="80000">
+        </label>
+      </div>
+      <p class="hint">泊松深度每 +1 三角形约 ×5.7：<b>深度 10 在本机（15GB 内存）
+        不可用</b>（实测 2771 万面，后处理超 27 分钟）。要更细请先减少输入点数，
+        而不是直接调深度。</p>
+
+      <div class="row">
+        <label class="grow">深度图分辨率
+          <input id="me-width" type="number" step="160" value="640">
+        </label>
+        <label class="grow">参与视角上限
+          <input id="me-views" type="number" step="10" value="80">
+        </label>
+        <label class="grow">平滑迭代
+          <input id="me-smooth" type="number" step="1" value="5">
+        </label>
+      </div>
+
+      <div class="row">
+        <label class="grow">一致性最小视角数（仅 2dgs）
+          <input id="me-minviews" type="number" min="1" value="2">
+        </label>
+        <label class="grow">投票体素倍数（仅 2dgs）
+          <input id="me-voxscale" type="number" step="0.5" value="3.0">
+        </label>
+        <label class="grow">法线点积下限（仅 2dgs）
+          <input id="me-nrmdot" type="number" step="0.1" value="0.0">
+        </label>
+      </div>
+
+      <div class="row">
+        <label class="grow">导出格式（逗号分隔）
+          <input id="me-formats" value="mesh,glb_points,viewer_html">
+        </label>
+        <label class="grow">烘焙贴图
+          <select id="me-texture">
+            <option value="false">关闭（默认；大网格上 xatlas 很慢）</option>
+            <option value="true">开启（需面数 ≤2 万才实用）</option>
+          </select>
+        </label>
+        <label class="grow">贴图尺寸
+          <input id="me-texsize" type="number" step="256" value="2048">
+        </label>
+      </div>
+
+      <div class="row">
+        <button class="primary" id="btn-me-run">开始导出</button>
+        <button id="btn-me-dry">预览 CLI 命令</button>
+      </div>
+      <div id="me-status" class="hint"></div>
+      <pre id="me-cli" class="cli"></pre>
+      <div id="me-note" class="hint"></div>
     </div>
   </section>
 </main>

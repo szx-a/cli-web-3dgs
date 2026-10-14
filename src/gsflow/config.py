@@ -166,7 +166,7 @@ DEFAULTS: dict[str, Any] = {
         "viewer_cdn": "",         # 留空则用本地静态查看器
 
         # ---- 网格提取（深度反投影 -> 泊松 -> 平滑 -> QEM 简化）----
-        "mesh_method": "poisson",       # poisson（推荐）| tsdf
+        "mesh_method": "poisson",       # poisson（默认，社区标准流程）| 2dgs | tsdf
         "mesh_width": 640,              # 渲深度用的分辨率
         "mesh_max_views": 80,           # 参与融合的视角上限
         "mesh_poisson_depth": 9,        # 泊松八叉树深度：8 快 / 9 均衡 / 10 更细更慢
@@ -192,6 +192,22 @@ DEFAULTS: dict[str, Any] = {
         "mesh_texture_timeout": 300,    # UV 展开超时（秒）；超时跳过纹理烘焙
         # 按"到输入点距离"裁掉泊松桥接出来的面（阈值 = 输入点间距 × 该值；0=关闭）
         "mesh_trim_sigma": 2.5,
+
+        # ---- 「2dgs」模式的多视角一致性投票（仅 mesh_method=2dgs 时生效）----
+        # 为什么需要：单视角深度反投影会把"只有 1 个视角看到的伪影"也变成点，
+        # 表现为表面毛刺、以及**法线翻转 ~35%**（同一表面被相邻视角各投一份、
+        # 两份法线方向相反，体素下采样后平均成接近零，光照大片发黑）。
+        # 判据：体素投票，要求 >= min_views 个视角支持。
+        "mesh_consistency_min_views": 2,       # 至少多少个视角支持该体素
+        # 投票体素 = 下采样体素 × 该值。**必须比下采样体素大**，否则相邻视角对同一
+        # 表面的采样永远落不进同一格，投票会误删真实表面（实测 1.5 时删掉 52% 的点、
+        # IoU 从 0.840 掉到 0.684）。
+        # 实测（img2-opfix，80 视角，模型与其它参数完全相同）：
+        #   1.5 -> 保留 48.0%，法线一致 0.5865，IoU 0.684
+        #   3.0 -> 保留 84.0%，法线一致 0.3041，IoU 0.815   <- 默认，性价比最好
+        #   对照 poisson（不投票）：法线一致 0.1019，IoU 0.840
+        "mesh_consistency_voxel_scale": 3.0,
+        "mesh_consistency_normal_dot": 0.0,    # 与该体素平均法线的点积下限（-1=不筛）
     },
     "metrics": {
         "enabled": True,

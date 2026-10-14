@@ -342,13 +342,98 @@ def filter_depth(depth, alpha, min_alpha: float = 0.5, erode_px: int = 1,
                   "kept_ratio": (n2 / n0) if n0 else 0.0}
 
 
+def filter_by_multiview_consistency(points, normals=None, colors=None,
+                                    view_id=None, voxel: float = 0.01,
+                                    min_views: int = 2,
+                                    normal_dot_min: float = 0.0):
+    """按**多视角一致性**剔除只在单个视角出现的反投影点（2DGS 路线的核心过滤）。
+
+    为什么需要：单纯深度反投影会把每个视角的**噪声与深度跳变**都变成点。
+    两个具体后果，都是本项目的实测问题：
+
+    1. **表面碎/毛刺**：只在 1 个视角出现的点，多半是深度不连续处的伪影
+       （前景边缘"拖尾"到背景上）。它们让泊松在局部生成薄片与尖刺。
+    2. **法线翻转 ~35%**：同一个表面被相邻视角各投一份点，两份点的法线
+       可能因为噪声而方向相反；体素下采样把它们**平均成接近零**的法线，
+       于是表面光照出现大片黑斑。
+
+    判据（体素投票）：
+      * 把点按体素量化，同一体素内统计**出现过的不同视角数**
+      * 少于 `min_views` 个视角支持的点直接删除（孤立噪点）
+      * 同一体素内，若某点法线与该体素**平均法线的夹角余弦 < normal_dot_min**
+        则删除（抑制方向矛盾的点）
+
+    这对应 2DGS / Gaussian Opacity Fields 里"用多视角深度一致性约束表面"的做法，
+    但作用在**导出阶段**，不需要重训模型。
+
+    返回 (points, normals, colors, stats)。
+    """
+    import numpy as np
+
+    pts = np.asarray(points, dtype=np.float64)
+    n = len(pts)
+    if n == 0 or voxel <= 0:
+        return pts, normals, colors, {"points_in": n, "points_out": n, "kept_ratio": 1.0}
+
+    nrm = np.asarray(normals, dtype=np.float64) if normals is not None else None
+    col = np.asarray(colors, dtype=np.float64) if colors is not None else None
+    vid = (np.asarray(view_id).reshape(-1) if view_id is not None
+           else np.zeros(n, dtype=np.int64))
+
+    keys = np.floor(pts / float(voxel)).astype(np.int64)
+    _, inv, counts = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
+    inv = inv.reshape(-1)
+
+    # 每个体素内出现过多少个**不同视角**
+    order = np.lexsort((vid, inv))
+    inv_s, vid_s = inv[order], vid[order]
+    new_group = np.empty(len(inv_s), dtype=bool)
+    new_group[0] = True
+    new_group[1:] = (inv_s[1:] != inv_s[:-1]) | (vid_s[1:] != vid_s[:-1])
+    uniq_per_voxel = np.bincount(inv_s[new_group], minlength=len(counts))
+    keep = uniq_per_voxel[inv] >= int(min_views)
+
+    dropped_views = int((~keep).sum())
+
+    # 体素内平均法线（只统计保留下来的点），用于一致性方向过滤
+    dropped_normal = 0
+    if nrm is not None and normal_dot_min > -1.0:
+        acc = np.zeros((len(counts), 3), dtype=np.float64)
+        np.add.at(acc, inv[keep], nrm[keep])
+        mean_n = acc[inv]
+        ln = np.linalg.norm(mean_n, axis=1)
+        good = ln > 1e-12
+        dot = np.ones(len(pts), dtype=np.float64)
+        dot[good] = (nrm[good] * (mean_n[good] / ln[good, None])).sum(1)
+        ok_n = (~keep) | (dot >= float(normal_dot_min))
+        dropped_normal = int((keep & ~ok_n).sum())
+        keep = keep & ok_n
+
+    out_pts = pts[keep]
+    out_stats = {
+        "points_in": n,
+        "points_out": int(keep.sum()),
+        "kept_ratio": float(keep.mean()) if n else 0.0,
+        "dropped_few_views": dropped_views,
+        "dropped_normal_conflict": dropped_normal,
+        "voxel": float(voxel),
+        "min_views": int(min_views),
+        "views_total": int(len(np.unique(vid))),
+    }
+    return (out_pts,
+            (nrm[keep] if nrm is not None else None),
+            (col[keep] if col is not None else None),
+            out_stats)
+
+
 def backproject_depth_to_points(rendered, c2ws, view_idx, ks, src_wh,
                                 width: int, height: int,
                                 depth_stride: int = 2,
                                 min_alpha: float = 0.5, erode_px: int = 1,
                                 grad_thresh_ratio: float = 0.06,
                                 max_depth_ratio: float = 0.0,
-                                colors_out: bool = True):
+                                colors_out: bool = True,
+                                return_view_id: bool = False):
     """把多视角渲染出的深度图**反投影**成"紧贴表面"的稠密点云。
 
     这是整条网格流水线的**核心步骤**（用户给的社区标准流程第 1 步）：
@@ -362,11 +447,13 @@ def backproject_depth_to_points(rendered, c2ws, view_idx, ks, src_wh,
       * `grad_thresh_ratio` 剔除与邻域中值深度差异过大的像素（深度跳变）
       * `depth_stride` 像素采样步长（控制点数，避免几百万点拖慢泊松）
 
-    返回 (points[N,3], colors[N,3], normals[N,3] 或 None, 统计)
+    返回 (points[N,3], colors[N,3], normals[N,3] 或 None, 统计)；
+    `return_view_id=True` 时统计里会多一个 "view_id"（每个点来自哪个视角的索引），
+    供 `filter_by_multiview_consistency` 做多视角投票。
     """
     import numpy as np
 
-    pts_all, col_all, nrm_all = [], [], []
+    pts_all, col_all, nrm_all, vid_all = [], [], [], []
     n_used = 0
     kept = 0
     total = 0
@@ -448,6 +535,7 @@ def backproject_depth_to_points(rendered, c2ws, view_idx, ks, src_wh,
         R, t = c2w[:3, :3], c2w[:3, 3]
         pts_all.append(cam_pts @ R.T + t)
         nrm_all.append(cam_n @ R.T)
+        vid_all.append(np.full(len(cam_pts), int(i), dtype=np.int64))
         if colors_out:
             col_all.append((rgb[vs, us] * 255.0).astype(np.float64))
         n_used += 1
@@ -457,8 +545,11 @@ def backproject_depth_to_points(rendered, c2ws, view_idx, ks, src_wh,
     pts = np.concatenate(pts_all, axis=0)
     cols = np.concatenate(col_all, axis=0) if col_all else None
     nrms = np.concatenate(nrm_all, axis=0) if nrm_all else None
+    stats = {"views_used": n_used, "pixels": total, "points": len(pts)}
+    if return_view_id and vid_all:
+        stats["view_id"] = np.concatenate(vid_all, axis=0)
     # 同一表面点会被多个视角重复采到：体素下采样前先去掉完全重合的点
-    return pts, cols, nrms, {"views_used": n_used, "pixels": total, "points": len(pts)}
+    return pts, cols, nrms, stats
 
 
 def voxel_downsample(points, colors=None, normals=None, voxel: float = 0.01):

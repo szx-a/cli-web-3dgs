@@ -18,7 +18,7 @@ HTML = ROOT / "src" / "gsflow" / "web" / "static" / "index.html"
 JS = ROOT / "src" / "gsflow" / "web" / "static" / "app.js"
 
 # 这些控件不需要被 collectParams/updateCliPreview 处理
-IGNORE_PREFIX = ("btn-", "tab-", "panel-", "stage-")
+IGNORE_PREFIX = ("btn-", "tab-", "panel-", "stage-", "m-")
 
 
 def main() -> int:
@@ -29,8 +29,11 @@ def main() -> int:
     used = set(re.findall(r"\$\('([^']+)'\)", js))
 
     missing = sorted(u for u in used if u not in ids and not u.startswith(IGNORE_PREFIX))
+    # 参数控件有两族：`p-*`（新建作业页）与 `me-*`（网格导出页）。
+    # 两族都必须被 app.js 读取，否则"界面填了但提交时没带上"。
+    PARAM_PREFIX = ("p-", "me-")
     unused = sorted(i for i in ids
-                    if i.startswith("p-") and i not in used)
+                    if i.startswith(PARAM_PREFIX) and i not in used)
 
     print(f"HTML 控件总数：{len(ids)}")
     print(f"app.js 引用的 id 数：{len(used)}")
@@ -45,12 +48,12 @@ def main() -> int:
 
     if unused:
         ok = False
-        print("\n[错误] HTML 里有参数控件（p-*）没有被 app.js 使用"
+        print("\n[错误] HTML 里有参数控件没有被 app.js 使用"
               "（会导致'界面填了但没提交'的静默失真）：")
         for u in unused:
             print(f"   - {u}")
     else:
-        print("[OK] HTML 里所有 p-* 参数控件都被 app.js 使用")
+        print("[OK] HTML 里所有参数控件（p-* / me-*）都被 app.js 使用")
 
     # 再检查 updateCliPreview 的监听列表是否覆盖了所有 p-* 控件
     m = re.search(r"\[([^\]]*?)\]\.forEach\(\(id\) => \{ const el = \$\(id\)", js, re.S)
