@@ -747,6 +747,16 @@ $('btn-m-wire').onclick = () => {
   const on = window.GsViewer.toggleWire();
   $('btn-m-wire').textContent = on ? '关闭线框' : '切换线框';
 };
+// 旋转模式切换：'free'（可越过顶/底继续翻，默认）| 'clamp'（到顶底停住）
+// 两种都**不会中途反向**（那才是"卡住"）；差别只在极点处停住还是翻过去。
+if ($('btn-m-rotmode')) {
+  $('btn-m-rotmode').onclick = () => {
+    const cur = window.GsViewer.getRotMode ? window.GsViewer.getRotMode() : 'clamp';
+    const next = cur === 'free' ? 'clamp' : 'free';
+    window.GsViewer.setRotMode(next);
+    $('btn-m-rotmode').textContent = next === 'free' ? '旋转模式：自由翻转' : '旋转模式：到顶底停住';
+  };
+}
 
 /* ------------------------------------------------------------------ 启动 */
 (async function boot() {

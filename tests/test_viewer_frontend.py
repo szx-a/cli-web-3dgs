@@ -170,6 +170,30 @@ def test_viewer_drag_is_monotonic_no_pushback() -> None:
 
 
 @needs_node
+def test_viewer_camera_modes_are_switchable() -> None:
+    """旋转模式必须可切换（'clamp' 默认 / 'free' 可翻越极点）。
+
+    提供两种模式的原因：用户三次反馈"卡住"，而"到极点停住"与"翻越极点"是
+    两种合理但不兼容的手感，无法靠猜测决定 —— 因此两种都实现、可运行时切换。
+    这里断言：默认是 clamp；切成 free 后能到达**另一个**极点（说明确实越过了极点）。
+    """
+    glb = _pick_glb()
+    if glb is None:
+        pytest.skip("workspace 里没有可用的 GLB 产物")
+    py = shutil.which("node") or "node"
+    r = subprocess.run(
+        [py, str(ROOT / "scripts" / "probe_camera_modes.mjs"), str(glb)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=str(ROOT), timeout=300,
+    )
+    out = (r.stdout or "") + (r.stderr or "")
+    assert "默认模式 = clamp" in out, out
+    assert "clamp 反向步数 = 0" in out, f"clamp 模式出现反向：\n{out}"
+    assert "free 能到达两个极点 = 是" in out, f"free 模式无法翻越极点：\n{out}"
+    assert r.returncode == 0, out
+
+
+@needs_node
 def test_viewer_draw_elements_uses_legal_index_type() -> None:
     """`drawElements` 的索引类型必须合法 —— 这是"画布全黑"的真凶。
 

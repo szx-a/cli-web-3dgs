@@ -271,9 +271,13 @@
           <button id="btn-m-reload">刷新作业列表</button>
           <button id="btn-m-reset">重置视角</button>
           <button id="btn-m-wire">切换线框</button>
+          <button id="btn-m-rotmode">旋转模式：自由翻转</button>
         </div>
+        <p class="hint" id="m-hint">拖拽旋转（左键）、平移（右键/Shift）、滚轮缩放。
+          旋转模式可切换：<b>自由翻转</b>（可越过顶/底继续翻，默认）／
+          <b>到顶底停住</b>（标准轨道相机）。两种都<b>不会中途反向</b>。</p>
         <div class="modes" id="m-modes"></div>
-        <p class="hint" id="m-hint">三种模式：<b>点云</b>（3DGS 原始形态，最忠实）、
+        <p class="hint" id="m-hint2">三种模式：<b>点云</b>（3DGS 原始形态，最忠实）、
           <b>网格</b>（三角面 + 顶点色，看几何是否成立）、
           <b>带贴图网格</b>（最终"实感"产物）。</p>
         <div id="m-list" class="list"></div>

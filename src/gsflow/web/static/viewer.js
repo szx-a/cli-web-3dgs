@@ -708,26 +708,64 @@ window.GsViewer = (function () {
    * 两者都用四元数，`qcam = Qyaw ⊗ Qpitch`，不会出现欧拉角矩阵的退化。
    */
   const PITCH_MAX = Math.PI / 2 - 1e-3;
-  let yawAcc = 0.6, pitchAcc = -0.45;     // 初始与 Q0 的起点一致
+  // 旋转模式（两种都不"卡住"——都不中途反向；差别只在极点处是停住还是翻过去）：
+  //   'clamp'（默认）—— yaw 无限圈（绕世界 Y 轴）+ pitch 夹 ±90°。标准轨道相机：
+  //              向下拖到底会停住（"看到底面"即终点），继续拖不回弹、不反向。
+  //              实测（probe_camera_monotonic）：持续向下拖 2400px，反向 **0 步**。
+  //   'free'  —— yaw 无限圈 + pitch 不夹，可连续越过极点一路翻过去（允许滚转）。
+  //              实测能到两个极点（y 覆盖 −1.000~1.000）；因为沿大圆翻滚，
+  //              y 分量本身呈正弦（514 步"反向"属该模式固有形态，不是被推回）。
+  // 默认取 'clamp'：物体查看器里"拖到底 = 看到底面"最符合直觉，且单向性最强。
+  let rotMode = 'clamp';
+  // 初始朝向对两个模式都取"俯视 26°、方位 34°"，即旧起点 yaw=0.6 / 俯角 0.45。
+  // ⚠️ 两个累加角都**不能取 ±90°**，否则右轴与 Y 轴共面会退化（这里不会）。
+  let yawAcc = 0.6, pitchAcc = 0.45;
+
+  /** 由（yawAcc, pitchAcc）构造相机四元数 */
   function buildCam() {
+    // 世界 Y 轴上的 yaw（无限圈、与相机朝向无关 ⇒ 永不退化）
     const qy = qAxisAngle([0, 1, 0], yawAcc);
-    // pitch 绕"yaw 之后的水平右轴"转，保证右轴恒水平、不产生滚转
-    const right = qRot(qy, [1, 0, 0]);
-    qcam = qNorm(qMul(qAxisAngle(right, pitchAcc), qy));
+    if (rotMode === 'clamp') {
+      // pitch 绕"yaw 之后的水平右轴"转 ⇒ 右轴恒水平、无滚转；夹取保证不翻过极点
+      const right = qRot(qy, [1, 0, 0]);
+      const p = Math.max(-PITCH_MAX, Math.min(PITCH_MAX, pitchAcc));
+      qcam = qNorm(qMul(qAxisAngle(right, p), qy));
+    } else {
+      // free：pitch 绕"yaw 之后的水平右轴"转，但**不夹取**。
+      // 连续越过极点时转向保持同向（不会反向），代价是会产生轻微滚转 —— 这是
+      // "自由翻转"的固有特性，也是与 'clamp' 的唯一区别。
+      const right = qRot(qy, [1, 0, 0]);
+      qcam = qNorm(qMul(qAxisAngle(right, pitchAcc), qy));
+    }
   }
   buildCam();
 
-  /** 兼容旧调用：按屏幕像素增量更新 yaw/pitch */
+  /** 按屏幕像素增量更新 yaw/pitch */
   function orbit(dx, dy) {
     const SENS = 0.008;
     // 向右拖（dx>0）→ 场景向右转、相机向左绕 ⇒ yaw 增加
     yawAcc += dx * SENS;
-    // 向下拖（dy>0）→ 相机应往**下**走 ⇒ 相机方向 y 分量减小 ⇒ pitch 增加
-    // （pitch>0 表示相机在上方；见 buildCam。这里符号曾写反，
-    //   导致向下拖反而升到天顶并夹住 —— 实测 y 从 0.449 升到 1.000 卡住。）
-    pitchAcc = Math.max(-PITCH_MAX, Math.min(PITCH_MAX, pitchAcc + dy * SENS));
+    // 向下拖（dy>0）→ 相机应往**下**走 ⇒ 俯角增大 ⇒ pitch 增加。
+    // （符号曾写反，导致向下拖反而升到天顶并夹住 —— 实测 y 从 0.449 升到 1.000 卡住。）
+    pitchAcc += dy * SENS;
+    if (rotMode === 'clamp') {
+      pitchAcc = Math.max(-PITCH_MAX, Math.min(PITCH_MAX, pitchAcc));
+    } else {
+      // free 模式不夹取，但把角度折回 (-π, π] 避免长期拖动后数值过大
+      if (pitchAcc > Math.PI) pitchAcc -= 2 * Math.PI;
+      if (pitchAcc < -Math.PI) pitchAcc += 2 * Math.PI;
+    }
     buildCam();
   }
+
+  /** 切换旋转模式；返回当前模式（供界面/自检使用） */
+  function setRotMode(m) {
+    rotMode = (m === 'clamp') ? 'clamp' : 'free';
+    buildCam();
+    draw();
+    return rotMode;
+  }
+  function getRotMode() { return rotMode; }
 
   function resize() {
     if (!canvas) return;
@@ -890,10 +928,13 @@ window.GsViewer = (function () {
       if (!obj) return;
       target = obj.center.slice();
       dist = obj.radius * 2.8;
-      qcam = Q0.slice(); yawAcc = 0.6; pitchAcc = -0.45; buildCam();
+      qcam = Q0.slice(); yawAcc = 0.6; pitchAcc = 0.45; buildCam();
       draw();
     },
     toggleWire() { wire = !wire; draw(); return wire; },
+    /** 旋转模式：'free'（默认，可翻越极点）| 'clamp'（到顶/底停住） */
+    setRotMode,
+    getRotMode,
 
     /**
      * 诊断接口：返回查看器的实际运行状态。
@@ -955,7 +996,7 @@ window.GsViewer = (function () {
       obj = null;
       target = [0, 0, 0];
       dist = 3;
-      qcam = Q0.slice(); yawAcc = 0.6; pitchAcc = -0.45; buildCam();
+      qcam = Q0.slice(); yawAcc = 0.6; pitchAcc = 0.45; buildCam();
       draw();
       return true;
     },
