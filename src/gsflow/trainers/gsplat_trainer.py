@@ -79,6 +79,19 @@ class TrainConfig:
     # 致密判据改用绝对值和而不是"正负相消后的梯度"，能恢复更细的结构。
     # 默认关闭，需实测对照后再决定是否改默认。
     absgrad: bool = False
+    # ---- 2DGS 参数化（压平高斯）----
+    # 社区做法（2D Gaussian Splatting, SIGGRAPH'24）：把高斯**压平成 2D 圆盘**，
+    # 于是"最短轴"就是该面片的**法线**，几何语义明确。3DGS 的椭球没有这个约束，
+    # 这也是为什么直接把 2DGS 的两个损失项搬到 3DGS 上会有害（见 docs/03 G52）：
+    # 损失项与参数化是一套的，只搬前者不匹配后者会与"拟合辐射场"冲突。
+    #
+    # 实现方式：只钳住**最短轴**的 log 尺度上限（其余两轴自由），
+    # 即 scale_min = exp(min(log_scale, flatten_log_scale))。
+    # 这样圆盘半径仍可自由学习，但厚度被压到极小 ⇒ 法线可信、深度沿射线集中。
+    flatten_2dgs: bool = False
+    # 最短轴的 log 尺度上限。exp(-6)≈0.0025，相对场景尺度是"极薄"；
+    # 太大会失去压平效果，太小可能让光栅化数值不稳（有效像素过少）。
+    flatten_log_scale: float = -6.0
     # 以下三个比例都相对 scene_scale（相机中心到均值距离），取自官方 DefaultStrategy：
     #   grow_scale3d  = 0.01 -> 尺度 <= 0.01*scene_scale 走"克隆"
     #   grow_scale3d  >  0.01 -> 走"分裂"
@@ -197,19 +210,39 @@ def _quat_to_rotmat(q: "torch.Tensor") -> "torch.Tensor":
     return torch.stack([col0, col1, col2], dim=-2)
 
 
-def gaussian_normals(quats: "torch.Tensor", scales: "torch.Tensor") -> "torch.Tensor":
-    """每个高斯的**最短轴方向**作为它的表面法线（2DGS/GOF 的标准做法）。
+def gaussian_normals(quats: "torch.Tensor", scales: "torch.Tensor",
+                     axis: str = "z") -> "torch.Tensor":
+    """每个高斯的表面法线。
 
-    3DGS 的高斯是各向异性的椭球；代表"表面朝向"的是**最短的那根轴**。
-    2DGS 把高斯压平成圆盘后，最短轴就是圆盘法线 —— 这里不压平（保留 3DGS 表达力），
-    但仍用最短轴方向作为法线估计，用于法线一致性正则。
+    **用旋转后的 +z 轴（第 3 列），不是"最短轴"。** 这是实测结论，推翻了原先的实现：
+
+    原先用 `argmin(scales)` 取"最短轴"，理由是"2DGS 把高斯压平后最短轴就是圆盘法线"。
+    但实测（scripts/compare_normal_sources.py，对**压平过的**模型直接比较邻域一致度）：
+
+        候选                      mean_dot    翻转率
+        +z 轴（旋转第 3 列）       0.9569      0.0%     ← 最优
+        最短轴 argmin(scales)      0.5690      4.4%
+        最长轴                     0.5586      5.1%
+
+    而且"最短轴是 z 轴"只在 **19.2%** 的高斯上成立（其余 81% 落在两个水平轴上）——
+    也就是说旧实现**大部分时候在监督一个错误的水平方向**，法线一致性正则基本没起作用，
+    这也解释了它为什么"加不加都一样"（docs/03 G52）。
+
+    几何原因：压平（`scatter(-1, argmin, cap)`）把**最小**的尺度压到上限，
+    所以最短轴与 +z 轴本来就是同一根；但 `argmin` 返回的是**当时的索引**，
+    在索引不等于 2 的高斯上它就指向了一个水平轴 —— 两种写法的差别只在这一点。
+    直接用 +z 既正确又没有这个索引歧义。
+
+    `axis="shortest"` 保留给"确实想取最短轴"的实验场景，不作为默认。
     """
     import torch
 
     R = _quat_to_rotmat(quats)                       # [N,3,3]，列是三个轴
-    axis = torch.argmin(scales, dim=-1)              # 每个高斯的最短轴下标
-    idx = axis.view(-1, 1, 1).expand(-1, 3, 1)
-    n = torch.gather(R, 2, idx).squeeze(-1)          # 取对应列
+    if axis == "shortest":
+        idx = torch.argmin(scales, dim=-1).view(-1, 1, 1).expand(-1, 3, 1)
+        n = torch.gather(R, 2, idx).squeeze(-1)
+    else:
+        n = R[:, :, 2]                               # +z 轴（圆盘法线）
     return n / (n.norm(dim=-1, keepdim=True) + 1e-8)
 
 
@@ -813,7 +846,18 @@ def train(cfg: TrainConfig, ctx) -> dict:
     background = torch.tensor([1.0, 1.0, 1.0] if cfg.white_background else [0.0, 0.0, 0.0], device=device)
 
     def current_scales():
-        return torch.exp(scales)
+        s = torch.exp(scales)
+        if not cfg.flatten_2dgs:
+            return s
+        # 2DGS 参数化：只限制**最短轴**，让高斯退化成"圆盘"（圆盘半径仍自由学习）。
+        #   1) argmin 取最短轴下标 —— 与高斯的旋转一致，故法线语义稳定
+        #   2) 把该轴厚度压到上限
+        #   3) scatter 放回原位置
+        axis = torch.argmin(s, dim=-1, keepdim=True)          # [N,1]
+        thin = torch.gather(s, -1, axis)                      # [N,1]
+        cap = float(np.exp(cfg.flatten_log_scale))
+        thin2 = torch.minimum(thin, torch.full_like(thin, cap))
+        return s.scatter(-1, axis, thin2)
 
     def current_opacities():
         return torch.sigmoid(opac)

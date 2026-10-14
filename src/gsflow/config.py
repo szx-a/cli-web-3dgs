@@ -131,6 +131,12 @@ DEFAULTS: dict[str, Any] = {
         #   official —— 直接复用 gsplat `DefaultStrategy`（含 AbsGS 的 absgrad 支持）。
         # 注意：`absgrad` 只有配合 official 才有意义；走 builtin 时它会被忽略。
         "densify_strategy": "builtin",
+        # ---- 2DGS 参数化（压平高斯）----
+        # 把高斯压平成 2D 圆盘（只钳最短轴），"最短轴 = 表面法线"这一语义才成立。
+        # 这是 2DGS(SIGGRAPH'24) 与 3DGS 的**根本差别**；只搬损失项而不改参数化
+        # 会与"拟合辐射场"冲突（实测有害，见 docs/03 G52）。默认关闭，需实测对照。
+        "flatten_2dgs": False,
+        "flatten_log_scale": -6.0,
         # 以下三个比例都相对 scene_scale（相机中心平均距离），取自官方 gsplat DefaultStrategy。
         # prune_scale3d 是**防发散的关键约束**：漏掉它会让尺度无界增长（实测 log尺度到 739）。
         "grow_scale3d": 0.01,          # 尺度 <= 0.01*scene_scale 走克隆，大于走分裂

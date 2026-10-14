@@ -25,21 +25,43 @@ sys.path.insert(0, str(ROOT / "src"))
 torch = pytest.importorskip("torch")
 
 
-def test_gaussian_normals_picks_shortest_axis() -> None:
+def test_gaussian_normals_uses_rotated_z_axis() -> None:
+    """高斯法线取**旋转后的 +z 轴**（圆盘法线），而不是 `argmin(scales)` 的最短轴索引。
+
+    为什么改：实测（scripts/compare_normal_sources.py，对压平过的真实模型比较邻域一致度）
+
+        +z 轴             mean_dot 0.9569   翻转 0.0%
+        最短轴 argmin      mean_dot 0.5690   翻转 4.4%
+        最长轴             mean_dot 0.5586   翻转 5.1%
+
+    而且"最短轴恰好是 z 轴"只在 **19.2%** 的高斯上成立 —— 旧实现大部分时候
+    在监督一个水平方向，正则因而基本无效。这里用"最短轴是 x"的构造来锁住这个区别：
+    正确实现应仍返回 x-y 平面内的 **z 轴方向**（由四元数决定），而不是 x 轴。
+    """
     from gsflow.trainers.gsplat_trainer import gaussian_normals
 
-    # 单位四元数 = 无旋转，三个轴就是 x/y/z；最短轴是 z（scale 最小）
-    q = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    q = torch.tensor([[1.0, 0.0, 0.0, 0.0]])       # 无旋转 ⇒ 三个轴就是 x/y/z
     s = torch.tensor([[1.0, 1.0, 0.01]])
     n = gaussian_normals(q, s)
     assert n.shape == (1, 3)
     assert torch.allclose(n.norm(dim=-1), torch.ones(1), atol=1e-6), "法线必须单位化"
-    assert abs(float(n[0, 2])) > 0.99, f"应取最短轴 z，实际 {n.tolist()}"
+    assert abs(float(n[0, 2])) > 0.99, f"应取 +z 轴，实际 {n.tolist()}"
 
-    # 最短轴换成 x
+    # 关键区分：最短轴是 x —— 正确实现仍应返回 +z，而不是 x
     s2 = torch.tensor([[0.01, 1.0, 1.0]])
     n2 = gaussian_normals(q, s2)
-    assert abs(float(n2[0, 0])) > 0.99, f"应取最短轴 x，实际 {n2.tolist()}"
+    assert abs(float(n2[0, 2])) > 0.99, (
+        f"最短轴是 x 时仍须返回 +z（圆盘法线），实际 {n2.tolist()} —— "
+        "若返回 x 说明又回到了 argmin 索引的旧实现")
+
+    # 绕 X 轴转 90°：+z 轴应转到 -y
+    q90 = torch.tensor([[0.70710678, 0.70710678, 0.0, 0.0]])
+    n3 = gaussian_normals(q90, s)
+    assert abs(float(n3[0, 1])) > 0.99, f"绕 X 转 90° 后 +z 应为 ±y，实际 {n3.tolist()}"
+
+    # axis='shortest' 仍可用于实验场景
+    n4 = gaussian_normals(q, s2, axis="shortest")
+    assert abs(float(n4[0, 0])) > 0.99, f"axis='shortest' 应取最短轴 x，实际 {n4.tolist()}"
 
 
 def test_depth_to_normal_points_towards_camera() -> None:
