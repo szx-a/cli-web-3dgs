@@ -71,6 +71,10 @@ opacity_reg = 0.0
 scale_reg = 0.0
 min_opacity_final = 0.0
 lr_opacities = 0.025
+lambda_depth_distortion = 0.0
+lambda_normal = 0.1
+reg_interval = 8
+depth_distortion_mode = "tv"
 extra_args = ""
 
 [export]

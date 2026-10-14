@@ -485,20 +485,22 @@ def backproject_depth_to_points(rendered, c2ws, view_idx, ks, src_wh,
 
         # ---- 表面法线：**从深度图的梯度求**（社区标准做法，2DGS / GOF 同源）----
         #
-        # ⚠️ 这里曾有一个**严重错误**，是"网格像揉皱的纸"的根因：
-        #     原实现写的是 `cam_n = cam_pts / ||cam_pts||`
-        #   那是**视线方向（相机->像素的射线）**，不是表面法线。
-        #   视线方向指向"穿过表面继续往外"，而且**同一表面点从不同视角看方向完全相反**
-        #   （从正面看朝你、从背面看背你）。泊松重建正是靠法线定朝向，
-        #   喂这种法线时指示函数无解 -> 输出"填满轮廓的碎面"：
-        #   实测轮廓 IoU 高达 0.837（轮廓对），但邻域法线一致性仅 0.0022、
-        #   翻转比例 50%（完全没有方向性）。
+        # ⚠️ 这里历史上错过**两次**，两次都直接损害网格质量，务必看清推导：
         #
-        # 正确做法：深度图在相机系下是 z(u,v)，
-        #   切向量 T_u = d/du (x,y,z) = (z_u*x/fx + x*z_u/z + z, z_u*y/fy, z_u)
-        #   切向量 T_v = d/dv (x,y,z) = (z_v*x/fx, z_v*y/fy + y*z_v/z + z, z_v)
-        #   法线 = normalize(T_v × T_u)
-        # 其中 z_u / z_v 是深度对像素的偏导（中心差分，单位像素）。
+        # 错误一（已修）：原实现写的是 `cam_n = cam_pts / ||cam_pts||` ——
+        #   那是**视线方向（相机->像素的射线）**，不是表面法线。视线方向指向
+        #   "穿过表面继续往外"，而且**同一表面点从不同视角看方向完全相反**。
+        #   泊松靠法线定朝向，喂这种法线时指示函数无解 -> "填满轮廓的碎面"
+        #   （实测轮廓 IoU 0.837 但邻域法线一致仅 0.0022、翻转 50%）。
+        #
+        # 错误二（本轮修）：改成"深度梯度切向量"后，把 P_v 的 z 分量写成了常数 1。
+        #   正确推导：参数化 P(u,v) = z(u,v)·K⁻¹[u,v,1]，记 m = (x/z, y/z, 1)，
+        #       P_u = z_u·m + z·(1/fx, 0, 0)
+        #       P_v = z_v·m + z·(0, 1/fy, 0)
+        #       n   = P_u × P_v
+        #   代入**正对相机的平面**（z_u = z_v = 0）应得 -z²·fx·fy·ẑ ∝ [0,0,-1]。
+        #   而错误写法会给 [0, 0.447, -0.894]（偏离真实方向 26.6°）——
+        #   注意它**不退化**，所以既不会报错也不会被兜底掩盖，只能靠单测发现。
         z_img = depth.astype(np.float64)
         zu_img = np.zeros_like(z_img)
         zv_img = np.zeros_like(z_img)
@@ -506,14 +508,17 @@ def backproject_depth_to_points(rendered, c2ws, view_idx, ks, src_wh,
         zv_img[1:-1, :] = 0.5 * (z_img[2:, :] - z_img[:-2, :])
         zu = zu_img[vs, us]
         zv = zv_img[vs, us]
-        vz = np.ones_like(z)          # dz/du = 0, dz/dv = 0（对 v 的 z 分量）
-        tu = np.stack([zu * x / fx + x * zu / z + z, zu * y / fy, zu], axis=1)
-        tv = np.stack([zv * x / fx, zv * y / fy + y * zv / z + z, vz], axis=1)
-        cam_n = np.cross(tv, tu)
+        zc = np.maximum(z, 1e-12)
+        m = np.stack([x / zc, y / zc, np.ones_like(z)], axis=1)
+        pu = zu[:, None] * m + z[:, None] * np.stack(
+            [np.full_like(z, 1.0 / fx), np.zeros_like(z), np.zeros_like(z)], axis=1)
+        pv = zv[:, None] * m + z[:, None] * np.stack(
+            [np.zeros_like(z), np.full_like(z, 1.0 / fy), np.zeros_like(z)], axis=1)
+        cam_n = np.cross(pu, pv)
         nl = np.linalg.norm(cam_n, axis=1, keepdims=True)
         good_n = nl[:, 0] > 1e-12
         cam_n = np.divide(cam_n, np.where(nl > 1e-12, nl, 1.0))
-        # 深度梯度为 0（正对相机的平面）时叉积会退化，退回视线方向作兜底
+        # 数值退化时（极少）退回视线方向作兜底
         if not good_n.all():
             fallback = cam_pts / np.maximum(np.linalg.norm(cam_pts, axis=1, keepdims=True), 1e-12)
             cam_n[~good_n] = fallback[~good_n]

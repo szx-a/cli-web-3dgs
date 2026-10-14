@@ -152,8 +152,250 @@ class TrainConfig:
     # 我们默认关闭重置，0.05 会导致不透明度持续塌陷成"薄雾"（见 G43）。
     # Faster-GS / 3DGS-MCMC 用 0.025，这里对齐。
     lr_opacities: float = 0.025
+    # ---- 2DGS 训练侧正则（参考 2D Gaussian Splatting, SIGGRAPH'24）----
+    # 为什么需要（本项目的实测动机）：导出网格时我们从深度图反投影取点，
+    # 而 3DGS 的"累计深度"是沿射线的**加权平均** —— 一个像素的深度被几十个
+    # 高斯混合出来，表面位置是模糊的，于是：
+    #   * 反投影点云在表面法线方向上有厚度 -> 泊松得到"碎面"
+    #   * 深度梯度算出的法线不稳（实测网格法线翻转 31~44%）
+    # 2DGS 用两个正则解决：深度失真抑制（让同像素的高斯挤到同一深度）
+    # 与法线一致性（渲染法线要等于深度图的几何法线）。两者都**默认关闭**，
+    # 需要显式开启（见下面两个权重）。
+    lambda_depth_distortion: float = 0.0
+    lambda_normal: float = 0.1
+    # 正则的施加间隔：每 N 步算一次。0/1 = 每步都算。
+    # 深度正则需要**额外一次渲染**（render_mode="D"），所以默认隔几步算，控制开销。
+    reg_interval: int = 8
+    # 深度失真正则的形式：
+    #   "tv"   -> |Δ_x D| + |Δ_y D|（一阶差分，惩罚深度图不平滑；实现简单、必收敛）
+    #   "lap"  -> |Δ²D|（二阶，更接近 2DGS 的"深度应分段恒定"意图）
+    depth_distortion_mode: str = "tv"
     seed: int = 42
     log_every: int = 200
+
+
+def _quat_to_rotmat(q: "torch.Tensor") -> "torch.Tensor":
+    """四元数 (w,x,y,z) -> 旋转矩阵 [N,3,3]。用于取高斯的法线方向。"""
+    import torch
+
+    q = q / (q.norm(dim=-1, keepdim=True) + 1e-8)
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    col0 = torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y)], -1)
+    col1 = torch.stack([2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x)], -1)
+    col2 = torch.stack([2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y)], -1)
+    return torch.stack([col0, col1, col2], dim=-2)
+
+
+def gaussian_normals(quats: "torch.Tensor", scales: "torch.Tensor") -> "torch.Tensor":
+    """每个高斯的**最短轴方向**作为它的表面法线（2DGS/GOF 的标准做法）。
+
+    3DGS 的高斯是各向异性的椭球；代表"表面朝向"的是**最短的那根轴**。
+    2DGS 把高斯压平成圆盘后，最短轴就是圆盘法线 —— 这里不压平（保留 3DGS 表达力），
+    但仍用最短轴方向作为法线估计，用于法线一致性正则。
+    """
+    import torch
+
+    R = _quat_to_rotmat(quats)                       # [N,3,3]，列是三个轴
+    axis = torch.argmin(scales, dim=-1)              # 每个高斯的最短轴下标
+    idx = axis.view(-1, 1, 1).expand(-1, 3, 1)
+    n = torch.gather(R, 2, idx).squeeze(-1)          # 取对应列
+    return n / (n.norm(dim=-1, keepdim=True) + 1e-8)
+
+
+def depth_to_normal(depth: "torch.Tensor", K: "torch.Tensor"):
+    """由**深度图**求几何法线（与导出阶段 `backproject_depth_to_points` 同一套公式）。
+
+    相机系下 z(u,v)，切向量
+        T_u = [zu*x/fx + x*zu/z + z, zu*y/fy, zu]
+        T_v = [zv*x/fx, zv*y/fy + y*zv/z + z, 1]
+        n   = normalize(T_v × T_u)
+    其中 zu/zv 为深度对像素的中心差分偏导。
+
+    返回 (法线 [H,W,3], 有效掩码 [H,W])。深度 <= 0 或梯度退化处标记为无效。
+    """
+    import torch
+
+    H, W = depth.shape
+    z = depth
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+    vs = torch.arange(H, device=depth.device, dtype=depth.dtype).view(-1, 1).expand(H, W)
+    us = torch.arange(W, device=depth.device, dtype=depth.dtype).view(1, -1).expand(H, W)
+    x = (us - cx) / fx * z
+    y = (vs - cy) / fy * z
+
+    zu = torch.zeros_like(z)
+    zv = torch.zeros_like(z)
+    zu[:, 1:-1] = 0.5 * (z[:, 2:] - z[:, :-2])
+    zv[1:-1, :] = 0.5 * (z[2:, :] - z[:-2, :])
+
+    eps = 1e-8
+    # 视线方向（相机系：从光心指向该像素），先算好 —— 下面的退化兜底要用。
+    # ⚠️ 这个变量必须**定义在使用之前**：第一版把它放在了兜底之后，
+    # 单次调用会 NameError，而在循环里会**静默沿用上一轮的残留值**，
+    # 表现为"兜底法线在整幅图上都是一个常数方向"（单测发现）。
+    forward = torch.stack([x, y, z], dim=-1)
+
+    # ---- 由深度图求表面法线（正确的切向量推导）----
+    #
+    # 参数化：P(u,v) = z(u,v) · K⁻¹[u,v,1]，记 m = (x/z, y/z, 1) = K⁻¹[u,v,1]
+    #   P_u = z_u·m + z·(1/fx, 0, 0)
+    #   P_v = z_v·m + z·(0, 1/fy, 0)
+    #   n   = P_u × P_v
+    #
+    # ⚠️ 这里曾经写错过（而且**导出阶段也是同一个错误公式**）：
+    # 把 P_v 的 z 分量写成了常数 1（那是 dz/dv 吗？不是，1 是 K⁻¹ 第三分量的系数）。
+    # 后果：**正对相机的平面**（z_u = z_v = 0，最常见的情形）算出的法线会
+    # 偏离真实方向 26.6°（实测 [0, 0.447, -0.894]，而正确值是 [0, 0, -1]）。
+    # 用正确的 P_u × P_v 代入 z_u=z_v=0 可验证：结果 = -z²·fx·fy·ẑ ∝ [0,0,-1] ✓
+    m = torch.stack([x / z.clamp_min(eps), y / z.clamp_min(eps), torch.ones_like(z)], dim=-1)
+    pu = zu.unsqueeze(-1) * m + z.unsqueeze(-1) * torch.stack(
+        [torch.full_like(z, 1.0 / fx), torch.zeros_like(z), torch.zeros_like(z)], dim=-1)
+    pv = zv.unsqueeze(-1) * m + z.unsqueeze(-1) * torch.stack(
+        [torch.zeros_like(z), torch.full_like(z, 1.0 / fy), torch.zeros_like(z)], dim=-1)
+    n = torch.cross(pu, pv, dim=-1)
+    ln = n.norm(dim=-1, keepdim=True)
+    # 兜底：极端情况下（数值退化）退回视线方向
+    degenerate = (ln[..., 0] <= 1e-12) & (z > 1e-6)
+    if bool(degenerate.any()):
+        fallback = forward / forward.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+        n = torch.where(degenerate.unsqueeze(-1), fallback, n)
+    valid = z > 1e-6
+    n = n / n.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    # 统一朝向相机（视线为 -forward）：法线要与视线反向
+    flip = (n * (-forward)).sum(-1, keepdim=True) < 0
+    n = torch.where(flip, -n, n)
+    return n, valid
+
+
+def normal_consistency_loss(n_render_cam: "torch.Tensor", n_geo: "torch.Tensor",
+                            weight: "torch.Tensor"):
+    """法线一致性损失：`1 - |dot(渲染法线, 深度几何法线)|`，按 `weight` 加权平均。
+
+    单独抽成函数是为了**可单测**：这个量曾经被我写成恒等式（恒为 0，等于没加正则），
+    而单测能立刻抓到"两种明显不同的输入给出相同损失"。
+
+    两个输入都应是**单位向量**、同一坐标系（相机系）、形状 [H,W,3]。
+    取绝对值是因为法线的正负方向对"表面朝向"等价（两面都可渲染）。
+    """
+    import torch
+
+    a = n_render_cam / n_render_cam.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    b = n_geo / n_geo.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    dot = (a * b).sum(-1).abs().clamp(0.0, 1.0)
+    w = weight
+    denom = w.sum()
+    if float(denom) <= 0:
+        return None
+    return ((1.0 - dot) * w).sum() / denom
+
+
+def depth_distortion_loss(depth: "torch.Tensor", alpha: "torch.Tensor",
+                          mode: str = "tv"):
+    """深度失真抑制：惩罚深度图的局部不平滑（`tv` 一阶 / `lap` 二阶），按 alpha 加权。
+
+    2DGS 原式是 `L_d = Σ_{i,j} w_i w_j |z_i - z_j|`（需要逐像素的高斯深度列表），
+    而 gsplat 的 `render_mode="D"` 只给累计量 `Σwᵢzᵢ`。这里用深度图差分做等价约束：
+    同样是"让同一像素附近的高斯挤到同一深度"，只需一次额外渲染、无需改 CUDA 核。
+    """
+    import torch
+
+    if mode == "lap":
+        dx = depth[:, 2:] - 2 * depth[:, 1:-1] + depth[:, :-2]
+        dy = depth[2:, :] - 2 * depth[1:-1, :] + depth[:-2, :]
+        ax, ay = alpha[:, 1:-1], alpha[1:-1, :]
+    else:
+        dx = depth[:, 1:] - depth[:, :-1]
+        dy = depth[1:, :] - depth[:-1, :]
+        ax, ay = alpha[:, 1:], alpha[1:, :]
+    if not dx.numel() and not dy.numel():
+        return None
+    total = (dx.abs() * ax).mean()
+    if dy.numel():
+        total = total + (dy.abs() * ay).mean()
+    return total
+
+
+def two_dgs_regularizers(cfg, means, quats, scales, opacities, shs, kk, vm,
+                         width: int, height: int, alphas, sh_degree: int):
+    """2DGS 的两项正则：**深度失真抑制** + **法线一致性**。
+
+    动机（本项目实测）：3DGS 的累计深度 `Σwᵢzᵢ / Σwᵢ` 是沿射线的**加权平均**，
+    一个像素的深度由几十个高斯混合而成 -> 表面位置本身是模糊的。于是导出网格时
+    "深度反投影"拿到的点云在法线方向上有厚度，泊松重建出来就是碎面，
+    由深度梯度算的法线也不稳（实测网格法线翻转 31~44%）。
+
+    2DGS（SIGGRAPH'24）用两项正则把表面"钉住"：
+      * **深度失真**：同一像素内高斯的深度应尽量集中。2DGS 原式是
+        `L_d = Σ_{i,j} w_i w_j |z_i - z_j|`，需要逐像素的高斯深度列表，
+        而 gsplat 的 `render_mode="D"` 只给累计量 `Σwᵢzᵢ`。
+        这里用**深度图的差分**做等价约束（`tv`：一阶 / `lap`：二阶），
+        效果同样是"让深度分段平滑/恒定"，且只需一次额外渲染、无需改 CUDA 核。
+      * **法线一致性**：渲染出的高斯法线（最短轴）应与**深度图的几何法线**一致。
+
+    返回 {"depth": Tensor|None, "normal": Tensor|None}（已经过 alpha 加权）。
+    """
+    import torch
+    from gsplat import rasterization
+
+    want_depth = float(getattr(cfg, "lambda_depth_distortion", 0.0) or 0.0) > 0
+    want_normal = float(getattr(cfg, "lambda_normal", 0.0) or 0.0) > 0
+    out: dict = {"depth": None, "normal": None}
+    if not (want_depth or want_normal):
+        # 两个正则都关闭时**直接返回**，不要白跑一次深度渲染（每 reg_interval 步一次，
+        # 虽然不大但纯属浪费；实测单测也会因此误判"触发了额外渲染"）。
+        return out
+
+    # 1) 额外渲染一次累计深度：render_mode="D" 给出 Σwᵢzᵢ（官方文档）
+    colors_d, _, _ = rasterization(
+        means=means, quats=quats, scales=scales, opacities=opacities,
+        colors=shs, viewmats=vm[None], Ks=kk[None], width=width, height=height,
+        sh_degree=sh_degree, near_plane=0.01, far_plane=1e10, packed=False,
+        render_mode="D",
+    )
+    depth = colors_d[0][..., 0]                    # [H,W]
+    alpha = alphas[0][..., 0].detach()             # [H,W]
+
+    # 2) 深度失真抑制
+    if want_depth:
+        out["depth"] = depth_distortion_loss(
+            depth, alpha,
+            mode=str(getattr(cfg, "depth_distortion_mode", "tv") or "tv").lower())
+
+    # 3) 法线一致性：渲染出的高斯法线 vs 深度图的几何法线
+    #
+    # ⚠️ 这里不能用"几何法线与视线正交"之类的代理量 —— 几何法线在
+    # `depth_to_normal` 里已经统一朝向相机，那个量**恒等于 1**，损失恒为 0，
+    # 看起来"加了正则"其实什么都没做（第一版就是这样，单测立刻抓到）。
+    # 正确做法：把高斯法线当作颜色**再渲染一次**，得到逐像素的渲染法线，
+    # 再与深度几何法线比较。这就是 2DGS / GOF 的法线一致性损失。
+    if float(getattr(cfg, "lambda_normal", 0.0) or 0.0) > 0:
+        n_geo, valid = depth_to_normal(depth, kk)
+        n_gauss = gaussian_normals(quats, scales)          # [N,3] 世界系
+        R = vm[:3, :3]
+        # 渲染法线要在**相机系**下表达（法线不随平移变化，只旋转）
+        n_cam = n_gauss @ R.t()                            # [N,3]
+        # ⚠️ `sh_degree=None` 时 gsplat 要求 colors 是 **[N, D]`（不带中间的 SH 系数维），
+        # 传 [N,1,3] 会触发 `AssertionError: torch.Size([N,1,3])`。
+        # 第一版就是这样，被 try/except 吞掉 -> 法线项静默为 None（日志里看不到），
+        # 表现为"加了法线正则但完全没生效"。现在按形状分支处理，并且**失败时会告警**。
+        col_n = (n_cam * 0.5 + 0.5).reshape(-1, 3)
+        try:
+            n_rgb, a_n, _ = rasterization(
+                means=means, quats=quats, scales=scales, opacities=opacities,
+                colors=col_n, viewmats=vm[None], Ks=kk[None],
+                width=width, height=height, sh_degree=None,
+                near_plane=0.01, far_plane=1e10, packed=False, render_mode="RGB",
+            )
+            n_render = n_rgb[0] * 2.0 - 1.0                # [H,W,3]
+            w = (valid & (a_n[0][..., 0] > 0.5)).float()
+            out["normal"] = normal_consistency_loss(n_render, n_geo, w)
+        except Exception as exc:  # noqa: BLE001
+            # 失败时**明确为 None 并记录原因**，而不是返回一个恒为 0 的假损失。
+            # 调用方会在日志里看到 normal 缺失（曾因静默 except 而长期未察觉）。
+            out["normal"] = None
+            out["normal_error"] = f"{type(exc).__name__}: {exc}"
+    return out
 
 
 def _quantile(values, q: float) -> float:
@@ -735,6 +977,32 @@ def train(cfg: TrainConfig, ctx) -> dict:
         if cfg.scale_reg > 0:
             # 尺度正则：抑制个别高斯长到过大（也是浮点的常见形态）
             loss = loss + float(cfg.scale_reg) * current_scales().mean()
+
+        # ---- 2DGS 正则（深度失真抑制 + 法线一致性）----
+        # 见 TrainConfig 里 `lambda_depth_distortion` 的说明：3DGS 的累计深度是沿射线的
+        # 加权平均，表面位置本身是模糊的 —— 这正是"反投影点云有厚度、网格碎"的根源。
+        # 这两个正则让"同一像素上的高斯挤到同一深度"，并让渲染法线与深度几何法线一致。
+        #
+        # 代价：深度正则需要**额外一次 `render_mode="D"` 渲染**，所以按 `reg_interval`
+        # 隔步计算（默认 8 步一次），避免拖慢训练。
+        want_depth_reg = float(cfg.lambda_depth_distortion) > 0
+        want_normal_reg = float(cfg.lambda_normal) > 0
+        reg_every = max(1, int(cfg.reg_interval or 1))
+        if (want_depth_reg or want_normal_reg) and (step % reg_every == 0):
+            reg = two_dgs_regularizers(
+                cfg=cfg, means=means, quats=quats, scales=current_scales(),
+                opacities=torch.clamp(current_opacities().squeeze(-1), 0.0, 1.0),
+                shs=shs, kk=kk, vm=vm, width=gt.shape[1], height=gt.shape[0],
+                alphas=alphas, sh_degree=cfg.sh_degree,
+            )
+            if reg.get("depth") is not None and want_depth_reg:
+                loss = loss + float(cfg.lambda_depth_distortion) * reg["depth"]
+            if reg.get("normal") is not None and want_normal_reg:
+                loss = loss + float(cfg.lambda_normal) * reg["normal"]
+            if step % 500 == 0 and reg:
+                parts = [f"{k}={float(v):.4e}" for k, v in reg.items() if v is not None]
+                if parts:
+                    ctx.emit(f"step {step} 2DGS 正则：" + "  ".join(parts), level="debug")
 
         # 官方策略要求在 backward 之前 retain 它需要的梯度（means2d）
         if gs_strategy is not None:
