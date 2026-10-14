@@ -218,8 +218,35 @@ const bad = mvpFinite.filter((x) => !x).length;
 console.log(`  采样 ${mvpFinite.length} 次 uMVP，含 NaN/Inf 的次数 = ${bad}`
             + (bad ? '  **仍有退化**' : '  （全部有限，万向锁已修）'));
 
+// 本地文件路径回归：GUI 的"直接打开本地 .ply/.glb"走的是 loadBuffer()，
+// 与远端 load() 共用同一条解析逻辑。这里直接以"内存 buffer"方式载入同一个文件，
+// 确认本地路径也能解析（否则用户选了文件仍然黑屏）。
+console.log('\n--- 本地文件路径 loadBuffer() ---');
+try {
+  const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+  const kind = glb.toLowerCase().endsWith('.ply') ? 'ply' : 'glb';
+  const r2 = await V.loadBuffer(ab, glb.split(/[\\/]/).pop(), kind);
+  console.log('  loadBuffer() 返回: ' + JSON.stringify(r2));
+  if (!r2 || !r2.vertices) {
+    console.log('  **本地文件路径解析失败**');
+    process.exitCode = 1;
+  }
+} catch (e) {
+  console.log('  **loadBuffer() 抛出**: ' + e.message);
+  process.exitCode = 1;
+}
+
+// clear() 必须能清空（"清空视图"按钮用）
+try {
+  V.clear();
+  console.log('  clear() OK');
+} catch (e) {
+  console.log('  **clear() 抛出**: ' + e.message);
+  process.exitCode = 1;
+}
+
 // 退出码：供 pytest 做回归（非 0 表示有退化）
-process.exitCode = (bad > 0 || mvpFinite.length === 0) ? 1 : 0;
+process.exitCode = (bad > 0 || mvpFinite.length === 0) ? 1 : (process.exitCode || 0);
 
 console.log('\n--- 渲染调用序列（关键项）---');
 for (const c of calls) {
