@@ -170,6 +170,52 @@ def test_viewer_drag_is_monotonic_no_pushback() -> None:
 
 
 @needs_node
+def test_view_matrix_looks_down_negative_z() -> None:
+    """`m4viewFromQuat` 必须让相机看向 **−Z**（这是"模型跑到视角后面"那个 bug）。
+
+    用户的观察："模型渲染的位置不在 GUI 查看器正中，跑到视角后面导致模型不可见"。
+    根因：第 2 轮把 draw() 从 `m4lookAt` 换成 `m4viewFromQuat` 时，
+    z 轴写成了 `(target - eye)`，于是相机在世界里实际看向 **+Z**，
+    整个场景落到相机背后被裁掉 —— 画布上什么都没画，看起来就是"黑屏/看不见"。
+
+    用**可控实例**判定（不看真实模型，避免被数据干扰）：
+      eye=[0,0,5], target=[0,0,0], 单位四元数
+      => target 必须变换到 [0,0,-5]；若得到 [0,0,+5] 就是符号反了。
+    """
+    py = shutil.which("node") or "node"
+    r = subprocess.run(
+        [py, str(ROOT / "scripts" / "probe_view_matrix_sign.mjs")],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=str(ROOT), timeout=180,
+    )
+    out = (r.stdout or "") + (r.stderr or "")
+    assert "符号约定正确" in out, f"视图矩阵看向 +Z（模型会在相机背后）：\n{out}"
+    assert "在视锥内" in out, out
+    assert r.returncode == 0, out
+
+
+@needs_node
+def test_model_is_framed_inside_the_frustum() -> None:
+    """加载模型后，它的包围盒必须落在视锥内且**居中**（不能跑到画面外/背后）。
+
+    这是上一条的端到端版本：用查看器**同一份**相机数学把包围盒 8 个角点投影到
+    NDC，要求至少有一部分角点在视锥内、且模型中心的 NDC 接近原点。
+    """
+    glb = _pick_glb()
+    if glb is None:
+        pytest.skip("workspace 里没有可用的 GLB 产物")
+    py = shutil.which("node") or "node"
+    r = subprocess.run(
+        [py, str(ROOT / "scripts" / "probe_viewer_framing_model.mjs"), str(glb)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=str(ROOT), timeout=300,
+    )
+    out = (r.stdout or "") + (r.stderr or "")
+    assert "居中且可见" in out, f"模型没有落在画面中央/不在视锥内：\n{out}"
+    assert r.returncode == 0, out
+
+
+@needs_node
 def test_standalone_viewer_is_self_contained_and_parseable() -> None:
     """离线查看器 HTML 必须**自包含且可解析**（不依赖任何服务）。
 

@@ -83,8 +83,18 @@ function qRot(q, v) {
 }
 /** 由四元数与相机位置直接构造视图矩阵（正交基，无需 lookAt 的退化兜底） */
 function m4viewFromQuat(q, eye, target) {
-  // 相机看向 -Zc，故 z 轴取"相机 -> 目标"方向
-  const zc = norm(sub(target, eye));
+  // ⚠️ **z 轴必须取"目标 -> 相机"方向，即 -(相机 -> 目标)。**
+  //
+  // 用户在 GUI 里看到"模型不在正中、跑到视角后面导致不可见"，根因就在这里：
+  // 我第 2 轮把 draw() 从 m4lookAt 换成这个函数时，把 z 写成了 (target - eye)，
+  // 于是相机在世界里实际看向 **+Z**，而视图空间约定"相机看 -Z"，
+  // 结果整个场景被放到相机背后 -> 全部被裁掉 -> 画布上什么都没有。
+  //
+  // 可控验证（scripts/probe_view_matrix_sign.mjs，单位四元数 / eye=[0,0,5] / target=原点）：
+  //   修正前: target -> [0,0,+5]   ❌ 在相机背后
+  //   修正后: target -> [0,0,-5]   ✅ 与 m4lookAt 一致
+  // 真实模型上的表现：包围盒 8 角点 NDC 的 z 全 ≈1.00（远裁剪面外），视锥内角点 0/8。
+  const zc = norm(sub(eye, target));
   const xc = norm(qRot(q, [1, 0, 0]));
   const yc = norm(cross(zc, xc));
   const xc2 = cross(yc, zc);          // 正交化，消除累积误差
