@@ -46,6 +46,48 @@ def test_static_assets(client) -> None:
         assert r.status_code == 200 and len(r.content) > 500
 
 
+def test_job_artifacts_are_normalized_to_downloadable_urls(client) -> None:
+    """`/api/jobs/{id}` 的产物必须是**可下载的相对路径 + URL**，不能是绝对路径。
+
+    这条对应一个真实的 404（用户报 "Failed to load resource: 404"）：
+      * 服务端原先返回绝对路径 `F:\\...\\workspace\\job\\05_export\\model.glb`；
+      * 前端把它拼进 URL，绝对路径在工作区之外 ⇒ 无论怎么编码都取不到；
+      * 前端还有个 `/\\\\/g`（匹配**两个**反斜杠）的正则，让 `\\` 变成 `%5C`，双重叠加。
+    所以这里断言：每个产物都有 url、url 里不含 %5C/%3A、且指向相对路径。
+    """
+    jobs = client.get("/api/jobs").json()
+    items = list(jobs.get("history") or []) + list(jobs.get("running") or [])
+    if not items:
+        pytest.skip("没有历史作业可供检查")
+    checked = 0
+    for j in items:
+        jid = j["job_id"] if isinstance(j, dict) else str(j)
+        d = client.get(f"/api/jobs/{jid}").json()
+        for stage, v in (d.get("stages") or {}).items():
+            for a in (v.get("artifacts") or []):
+                checked += 1
+                assert isinstance(a, dict), f"{jid}/{stage} 产物仍是裸字符串：{a!r}"
+                assert a.get("url"), f"{jid}/{stage} 产物缺少 url：{a!r}"
+                assert "%5C" not in a["url"] and "%3A" not in a["url"], \
+                    f"{jid}/{stage} url 含非法编码：{a['url']}"
+                assert not a["url"].startswith("//"), a["url"]
+                assert not Path(a["rel"]).is_absolute(), \
+                    f"{jid}/{stage} rel 仍是绝对路径：{a['rel']}"
+                # 归一化后的 url 必须真的能下载。
+                # 目录例外：端点只服务文件，对目录返回 404 是**正确行为**，
+                # 前端据 is_dir 不把它渲染成链接（否则用户点了就报 404）。
+                r = client.get(a["url"])
+                if a.get("is_dir"):
+                    assert r.status_code == 404, \
+                        f"{a['url']} 是目录却返回 {r.status_code}"
+                else:
+                    assert r.status_code in (200, 404), (a["url"], r.status_code)
+                    if r.status_code == 404:
+                        assert not Path(a["path"]).exists(), \
+                            f"{a['url']} 404 但文件存在 -> 归一化错了"
+    assert checked > 0, "没有检查到任何产物"
+
+
 def test_gui_has_local_file_picker_and_mesh_export_page(client) -> None:
     """GUI 必须能**直接打开本机 .ply/.glb 文件**，并有一个独立的网格导出页。
 

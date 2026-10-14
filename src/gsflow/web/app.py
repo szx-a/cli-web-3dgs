@@ -45,6 +45,59 @@ def create_app():
     app = FastAPI(title="gsflow", description="AI 图像清理 + 3DGS 全流程 GUI", version="0.1.0")
     manager = JobManager()
 
+    def _normalize_artifacts(data: dict[str, Any], job_id: str) -> dict[str, Any]:
+        """把每个阶段的产物路径归一化成**可下载的相对路径 + URL**。
+
+        为什么必须做（这就是用户看到 `Failed to load resource: 404` 的根因）：
+        `job.json` 的 `stages[*].artifacts` 里存的是**绝对路径**
+        （如 `F:\\3dgs-and-ai\\workspace\\verify-e2e2\\01_images_raw`），
+        而前端把它直接拼进 URL：
+            /api/artifacts/<job>/F%3A%5C3dgs-and-ai%5Cworkspace%5C...
+        绝对路径在工作区之外，服务器**无论怎么解码都取不到** ⇒ 必然 404。
+        （前端当时还有个正则层数写错的问题，让反斜杠没被替换，双重叠加。）
+
+        修法：服务端负责把它变成相对路径并给出最终 URL；前端不再自己拼路径。
+        同时保留原始值在 `path` 字段里，便于排查。
+        """
+        root = (Path(str(load_settings().get("project.workspace_dir"))) / job_id).resolve()
+        stages = data.get("stages")
+        if not isinstance(stages, dict):
+            return data
+        for _name, st in stages.items():
+            if not isinstance(st, dict):
+                continue
+            arts = st.get("artifacts")
+            if not isinstance(arts, list):
+                continue
+            norm: list[dict[str, Any]] = []
+            for a in arts:
+                raw = str(a)
+                is_dir = False
+                try:
+                    p = Path(raw)
+                    if p.is_absolute():
+                        rp = p.resolve()
+                        rel = rp.relative_to(root).as_posix() if rp.is_relative_to(root) \
+                            else p.name
+                        is_dir = rp.is_dir()
+                    else:
+                        rel = p.as_posix()
+                        is_dir = (root / p).is_dir()
+                except (ValueError, OSError):
+                    # 不在该作业目录内（或不是路径）：退回文件名，至少给个可用链接
+                    rel = Path(raw.replace("\\", "/")).name
+                norm.append({
+                    "path": raw,
+                    "rel": rel,
+                    "name": Path(rel).name,
+                    # 目录也要给出 url（便于排查），但前端据 is_dir 决定是否可点：
+                    # 端点对目录返回 404（它只服务文件），把目录渲染成链接就是"点了报 404"。
+                    "url": f"/api/artifacts/{job_id}/{rel}",
+                    "is_dir": bool(is_dir),
+                })
+            st["artifacts"] = norm
+        return data
+
     # ------------------------------------------------------------------ 静态页
     @app.get("/", response_class=HTMLResponse)
     def index() -> HTMLResponse:
@@ -128,9 +181,10 @@ def create_app():
     @app.get("/api/jobs/{job_id}")
     def job_detail(job_id: str) -> dict[str, Any]:
         try:
-            return load_job(job_id, Path(str(load_settings().get("project.workspace_dir"))))
+            data = load_job(job_id, Path(str(load_settings().get("project.workspace_dir"))))
         except FileNotFoundError as exc:
             raise HTTPException(404, str(exc)) from exc
+        return _normalize_artifacts(data, job_id)
 
     @app.post("/api/run")
     def run_job(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
@@ -198,10 +252,25 @@ def create_app():
     # ------------------------------------------------------------------ 产物
     @app.get("/api/artifacts/{job_id}/{path:path}")
     def artifact(job_id: str, path: str):
-        root = Path(str(load_settings().get("project.workspace_dir"))) / job_id
-        target = (root / path).resolve()
-        if not str(target).startswith(str(root.resolve())):
+        # ---- 路径归一化（防御性，修 404 的第二道保险）----
+        # 前端曾把 Windows 反斜杠编码成 %5C 传进来（app.js 的正则层数写错，
+        # 见 G66），于是 URL 形如
+        #   /api/artifacts/<job>/F%3A%5C3dgs-and-ai%5Cworkspace...
+        # Starlette 会把它解码成含反斜杠的字符串，`root / path` 自然找不到文件 -> 404。
+        # 前端已修，但服务端**也必须**自己归一化：URL 里的分隔符写法不该决定成败。
+        p = path.replace("\\", "/")
+        # 绝对路径（如 F:/... 或 /C:/...）一律视为越界尝试，不允许直接使用
+        if p.startswith("/") or (len(p) > 1 and p[1] == ":"):
             raise HTTPException(403, "路径越界")
+        root = (Path(str(load_settings().get("project.workspace_dir"))) / job_id).resolve()
+        target = (root / p).resolve()
+        # ⚠️ 必须用 relative_to 判断包含关系，**不能用字符串前缀**：
+        #    `str(target).startswith(str(root))` 会让 `<workspace>/job-evil` 通过
+        #    `<workspace>/job` 的检查（前缀相同），是一个真实的越界漏洞。
+        try:
+            target.relative_to(root)
+        except ValueError:
+            raise HTTPException(403, "路径越界") from None
         if not target.exists() or not target.is_file():
             raise HTTPException(404, "文件不存在")
         return FileResponse(target)

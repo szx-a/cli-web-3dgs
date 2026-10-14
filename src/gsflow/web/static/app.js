@@ -222,7 +222,27 @@ async function showJob(jobId) {
     if (arts.length) {
       const el = document.createElement('div');
       el.className = 'meta';
-      el.innerHTML = '产物：' + arts.slice(0, 12).map((a) => `<a href="/api/artifacts/${jobId}/${encodeURIComponent(a.replace(/\\\\/g, '/'))}" target="_blank">${a}</a>`).join(' · ');
+      // ⚠️ **不要再自己拼 URL**。服务端 `/api/jobs/{id}` 已把产物归一化成
+      //    {path, rel, name, url}（api 的 _normalize_artifacts）。
+      //    这里踩过两个叠加的坑，导致产物链接**全部 404**：
+      //      1) 服务端原先返回**绝对路径**（F:\3dgs-and-ai\workspace\...），
+      //         绝对路径在工作区之外，URL 里无论怎么编码都取不到；
+      //      2) 前端又把反斜杠替换写成了 `/\\\\/g`（匹配**两个**反斜杠），
+      //         而 Windows 路径是单个反斜杠 ⇒ 替换不触发 ⇒ `\` 被编成 `%5C`。
+      //    现在服务端给 url，前端只负责用；只有老数据（字符串）才走兜底。
+      // ⚠️ 产物里**既有文件也有目录**（如 `01_images_raw`、`02_masks`、`03_colmap/sparse/0`）。
+      //    端点 `/api/artifacts/...` 对目录**正确地**返回 404（它只服务文件），
+      //    所以目录**不能再渲染成可点击链接** —— 否则用户一点就是
+      //    "Failed to load resource: 404"。目录用无链接的样式标出即可。
+      el.innerHTML = '产物：' + arts.slice(0, 12).map((a) => {
+        const label = (a && (a.rel || a.name)) ? (a.rel || a.name) : String(a);
+        const isDir = /\/$/.test(label) || (a && a.is_dir);
+        if (isDir) return `<span class="dim" title="目录（不提供直接下载）">${label}/</span>`;
+        const href = (a && a.url) ? a.url
+          : `/api/artifacts/${encodeURIComponent(jobId)}/` +
+            encodeURIComponent(String(a).replace(/\\/g, '/'));
+        return `<a href="${href}" target="_blank">${label}</a>`;
+      }).join(' · ');
       $('log-view').appendChild(el);
     }
   } catch (e) { alert(e.message); }
