@@ -48,6 +48,53 @@ function m4perspective(fovy, aspect, near, far) {
   ]);
 }
 
+/* ==================== 四元数工具（轨道相机用，避免万向锁） ====================
+ *
+ * 为什么改用四元数：原来用欧拉角 (yaw, pitch) 表示相机朝向，必须把 pitch 夹在
+ * ±(π/2−ε) —— 否则 `lookAt` 的 up 与视线共线、`cross` 退化成零向量。
+ * 夹取虽然避免了数值崩坏，但**用户拖到顶/底就过不去**（主观感受就是"转到某个方向卡住"）。
+ * 四元数没有这个奇点：旋转可以自由累积，越过天顶/天底也不会退化。
+ */
+function qMul(a, b) {
+  return [
+    a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3],
+    a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2],
+    a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1],
+    a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0],
+  ];
+}
+function qNorm(q) {
+  const l = Math.hypot(q[0], q[1], q[2], q[3]) || 1;
+  return [q[0]/l, q[1]/l, q[2]/l, q[3]/l];
+}
+/** 绕**单位**轴旋转 angle 的四元数 */
+function qAxisAngle(axis, angle) {
+  const h = angle * 0.5, s = Math.sin(h);
+  return [Math.cos(h), axis[0]*s, axis[1]*s, axis[2]*s];
+}
+/** 用四元数旋转向量 */
+function qRot(q, v) {
+  // v' = v + 2 * cross(q.xyz, cross(q.xyz, v) + q.w * v)
+  const u = [q[1], q[2], q[3]];
+  const t = cross(u, v);
+  const t2 = [t[0] + q[0]*v[0], t[1] + q[0]*v[1], t[2] + q[0]*v[2]];
+  const c = cross(u, t2);
+  return [v[0] + 2*c[0], v[1] + 2*c[1], v[2] + 2*c[2]];
+}
+/** 由四元数与相机位置直接构造视图矩阵（正交基，无需 lookAt 的退化兜底） */
+function m4viewFromQuat(q, eye, target) {
+  // 相机看向 -Zc，故 z 轴取"相机 -> 目标"方向
+  const zc = norm(sub(target, eye));
+  const xc = norm(qRot(q, [1, 0, 0]));
+  const yc = norm(cross(zc, xc));
+  const xc2 = cross(yc, zc);          // 正交化，消除累积误差
+  return new Float32Array([
+    xc2[0], yc[0], zc[0], 0,
+    xc2[1], yc[1], zc[1], 0,
+    xc2[2], yc[2], zc[2], 0,
+    -dot(xc2, eye), -dot(yc, eye), -dot(zc, eye), 1,
+  ]);
+}
 function m4lookAt(eye, center, up) {
   const z = norm(sub(eye, center));
   let x = cross(up, z);
@@ -611,18 +658,50 @@ function uploadTexture(R, url) {
 /* ============================ 对外接口 ============================ */
 window.GsViewer = (function () {
   let R = null, canvas = null, obj = null;
-  // ---- 轨道相机角度 ----
-  // ⚠️ pitch 原来被**硬夹在 ±1.5 rad（±86°）**，这正是用户反馈的"转到某个方向就转不动了"：
-  // 相机绕 Y 轴轨道运动，pitch 接近 ±90° 时 eye 与 up=(0,1,0) 共线，
-  // lookAt 里的 cross(up, z) 退化为零向量 -> 矩阵出现 NaN -> 画面消失。
-  // 修复做法不是继续硬夹，而是：
-  //   1) 允许转到 ±90°（用 π/2 减去一个极小量，留出数值余量）
-  //   2) 在 m4lookAt 里对"共线"情形给出稳定的 up（见那里的保护）
-  //   3) 拖拽时用 pointer capture，拖出画布也不丢事件
-  const PITCH_LIMIT = Math.PI / 2 - 1e-4;
-  let yaw = 0.6, pitch = 0.45, dist = 3, target = [0, 0, 0];
+  // ---- 轨道相机（**四元数**）----
+  //
+  // 演进过程（三次都在同一个问题上）：
+  //   1) 最初 pitch 硬夹 ±1.5 rad(±86°) —— 竖直方向根本转不过去；
+  //   2) 改成 π/2−ε + `lookAt` 共线兜底 —— 数值不再崩（0 个 NaN），
+  //      但**仍然转不过顶/底**，主观感受还是"卡住"（用户再次反馈）；
+  //   3) 现在改成**四元数累积旋转**：不再有 pitch 这个会退化的自由度，
+  //      拖到天顶/天底可以自然翻过去，没有夹取、没有奇点。
+  //
+  // 采用"增量旋转"而不是"绝对 yaw/pitch"：
+  //   水平拖动 -> 绕**世界 Y 轴**转（轨道相机的习惯）
+  //   竖直拖动 -> 绕**相机当前右轴**转（任意朝向下手感一致，也不会在极点翻转）
+  const Q0 = (() => {
+    // 初始朝向：与原来 yaw=0.6 / pitch=0.45 的起点视觉一致
+    return qNorm(qMul(qAxisAngle([0, 1, 0], 0.6), qAxisAngle([1, 0, 0], -0.45)));
+  })();
+  let qcam = Q0.slice();
+  let dist = 3, target = [0, 0, 0];
   let dragging = 0, lastX = 0, lastY = 0, wire = false;
   let onStatus = null;
+
+  /** 当前相机位置：target + (相机系 +Z 方向 × dist) */
+  function eyePos() {
+    const dir = qRot(qcam, [0, 0, 1]);
+    return [target[0] + dir[0] * dist, target[1] + dir[1] * dist, target[2] + dir[2] * dist];
+  }
+
+  /**
+   * 轨道旋转（增量、四元数）。
+   *
+   * 水平拖动绕**世界 Y 轴**（轨道相机的习惯）。
+   * 竖直拖动绕**相机当前右轴** —— 这样在任意朝向下"向上拖就是向上转"，
+   * 而且不存在"到达天顶后无法继续"的奇点：越过后局部右轴随之翻转，旋转自然接续。
+   * 这正是用四元数替代 yaw/pitch 夹取的目的。
+   */
+  function orbit(dx, dy) {
+    const RY = 0.008;   // 弧度/像素，与旧 yaw 手感一致
+    const RX = 0.008;
+    if (dx) qcam = qNorm(qMul(qAxisAngle([0, 1, 0], -dx * RY), qcam));
+    if (dy) {
+      const right = norm(qRot(qcam, [1, 0, 0]));
+      qcam = qNorm(qMul(qAxisAngle(right, -dy * RX), qcam));
+    }
+  }
 
   function resize() {
     if (!canvas) return;
@@ -641,13 +720,10 @@ window.GsViewer = (function () {
     if (!obj) return;
 
     const aspect = canvas.width / Math.max(1, canvas.height);
-    const eye = [
-      target[0] + dist * Math.cos(pitch) * Math.sin(yaw),
-      target[1] + dist * Math.sin(pitch),
-      target[2] + dist * Math.cos(pitch) * Math.cos(yaw),
-    ];
-    // 注意：GLB 已做 y/z 翻转使其正立；相机 up 用 +Y
-    const view = m4lookAt(eye, target, [0, 1, 0]);
+    // 相机位置由四元数给出（不再有 pitch 这个会退化的自由度）
+    const eye = eyePos();
+    // 注意：GLB 已做 y/z 翻转使其正立；相机基由四元数直接构造，无需 up 向量
+    const view = m4viewFromQuat(qcam, eye, target);
     const proj = m4perspective(Math.PI / 4, aspect, dist * 1e-3, dist * 100);
     const mvp = m4mul(proj, view);
 
@@ -742,14 +818,11 @@ window.GsViewer = (function () {
       const dx = e.clientX - lastX, dy = e.clientY - lastY;
       lastX = e.clientX; lastY = e.clientY;
       if (dragging === 1) {
-        yaw -= dx * 0.008;
-        // 用 PITCH_LIMIT（略小于 π/2）而不是原来的 ±1.5：
-        // 旧值把竖直方向锁死，转不过顶/底，观感就是"转到某个方向就转不动了"。
-        pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, pitch + dy * 0.008));
+        orbit(dx, dy);
       } else {
         // 平移：沿相机的右/上方向在屏幕平面内移动目标点
         const s = dist * 0.0016;
-        const right = [Math.cos(yaw), 0, -Math.sin(yaw)];
+        const right = norm(qRot(qcam, [1, 0, 0]));
         target[0] -= right[0] * dx * s; target[2] -= right[2] * dx * s;
         target[1] += dy * s;
       }
@@ -766,8 +839,7 @@ window.GsViewer = (function () {
       const t = e.touches[0];
       const dx = t.clientX - lastX, dy = t.clientY - lastY;
       lastX = t.clientX; lastY = t.clientY;
-      yaw -= dx * 0.008;
-      pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, pitch + dy * 0.008));
+      orbit(dx, dy);
       draw();
       e.preventDefault();
     }, { passive: false });
@@ -792,7 +864,7 @@ window.GsViewer = (function () {
       if (!obj) return;
       target = obj.center.slice();
       dist = obj.radius * 2.8;
-      yaw = 0.6; pitch = 0.45;
+      qcam = Q0.slice();
       draw();
     },
     toggleWire() { wire = !wire; draw(); return wire; },
@@ -843,8 +915,7 @@ window.GsViewer = (function () {
                      ibuf: !!obj.ibuf, lineIbuf: !!obj.lineIbuf },
         };
       }
-      out.camera = { yaw, pitch, dist, target, wire,
-                     pitchLimit: PITCH_LIMIT };
+      out.camera = { quat: qcam.slice(), dist, target, wire, eye: eyePos() };
       return out;
     },
 
@@ -858,7 +929,7 @@ window.GsViewer = (function () {
       obj = null;
       target = [0, 0, 0];
       dist = 3;
-      yaw = 0.6; pitch = 0.45;
+      qcam = Q0.slice();
       draw();
       return true;
     },

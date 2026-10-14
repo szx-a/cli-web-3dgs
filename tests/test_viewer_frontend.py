@@ -104,6 +104,71 @@ def test_viewer_no_gimbal_lock_and_wireframe_index_is_even() -> None:
 
 
 @needs_node
+def test_viewer_no_gimbal_lock_and_wireframe_index_is_even() -> None:
+    """拖过顶/底不得产生 NaN 矩阵；线框的线段索引数必须是偶数。
+
+    这两条分别对应两个真实 bug（见模块 docstring）。探针在检测到退化时以非 0 退出。
+    """
+    glb = _pick_glb()
+    assert glb is not None
+    r = _run_probe(glb)
+    out = (r.stdout or "") + (r.stderr or "")
+
+    assert "含 NaN/Inf 的次数 = 0" in out, (
+        "拖拽越界后视图矩阵出现 NaN（万向锁回归）：\n" + out)
+    assert "LINES" not in out or "INVALID_OPERATION" not in out, (
+        "线框用了奇数长度的索引缓冲，WebGL 会整帧不画：\n" + out)
+    assert r.returncode == 0, f"探针以 {r.returncode} 退出：\n{out}"
+
+
+@needs_node
+def test_viewer_source_uses_quaternion_camera_without_pitch_clamp() -> None:
+    """相机必须用**四元数**且**不得再出现 pitch 夹取**。
+
+    演进（三次都在同一问题上）：
+      1) pitch 硬夹 ±1.5 rad（±86°）—— 竖直方向转不过去；
+      2) 改成 ±(π/2−ε) + `lookAt` 共线兜底 —— 数值不崩了，但**仍然转不过顶/底**；
+      3) 现在改为四元数累积旋转 —— 没有会退化的 pitch 自由度，可自由越过天顶/天底。
+    这条是静态检查，防止退回夹取方案。
+    """
+    src = (STATIC_DIR / "viewer.js").read_text(encoding="utf-8")
+    assert "Math.min(1.5, pitch" not in src, "pitch 又被硬夹在 1.5（万向锁会回来）"
+    assert "PITCH_LIMIT" not in src, "仍存在 PITCH_LIMIT（说明又回到夹取方案）"
+    # 四元数基础设施
+    for fn in ("qMul", "qNorm", "qAxisAngle", "qRot", "m4viewFromQuat"):
+        assert fn in src, f"缺少四元数函数 {fn}"
+    # 相机状态是四元数，且拖拽走 orbit()
+    assert "let qcam" in src, "相机状态不是四元数"
+    assert "function orbit(" in src, "缺少 orbit() 增量旋转"
+    assert "m4viewFromQuat(qcam" in src, "绘制时没有用四元数构造视图矩阵"
+
+
+@needs_node
+def test_viewer_camera_can_pass_through_poles() -> None:
+    """四元数相机必须能**越过天顶/天底**（这是万向锁的真实症状）。
+
+    做法：在 Node 里驱动真实 viewer.js，持续向下拖很久，检查
+    `GsViewer.debug().camera.eye`（相机位置）始终有限、且**确实越过了极点**：
+    相机方向向量的 y 分量应该先增到 +1 附近、**然后转为下降**（越过天顶后从另一侧下来）。
+    老实现会卡在 y≈+1 附近不动。
+    """
+    glb = _pick_glb()
+    if glb is None:
+        pytest.skip("workspace 里没有可用的 GLB 产物")
+    py = shutil.which("node") or "node"
+    r = subprocess.run(
+        [py, str(ROOT / "scripts" / "probe_camera_orbit.mjs"), str(glb)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=str(ROOT), timeout=300,
+    )
+    out = (r.stdout or "") + (r.stderr or "")
+    # 判据：相机方向能同时到达两极（旧实现会停在一个极点附近）
+    assert "是否同时到达两极 = 是" in out, f"相机只能到达一个极点（万向锁仍在）：\n{out}"
+    assert "含 NaN/Inf 的 = 0" in out, f"出现 NaN 矩阵：\n{out}"
+    assert r.returncode == 0, out
+
+
+@needs_node
 def test_viewer_draw_elements_uses_legal_index_type() -> None:
     """`drawElements` 的索引类型必须合法 —— 这是"画布全黑"的真凶。
 
@@ -160,19 +225,6 @@ def test_viewer_reports_clear_error_without_uint_index_extension() -> None:
     # 必须出现我们自己的、说明原因的报错（含"65535"与"OES_element_index_uint"）
     assert "65535" in out and "OES_element_index_uint" in out, (
         "无 32 位索引扩展时没有给出明确错误（会表现为静默黑屏）：\n" + out)
-
-
-@needs_node
-def test_viewer_source_has_no_hard_pitch_clamp() -> None:
-    """`viewer.js` 不得再出现旧的 ±1.5 硬夹取（它会锁死竖直方向）。
-
-    这条是"静态"检查：即使没有 GLB 产物也能跑，防止改回去。
-    """
-    src = (STATIC_DIR / "viewer.js").read_text(encoding="utf-8")
-    assert "Math.min(1.5, pitch" not in src, "pitch 又被硬夹在 1.5（万向锁会回来）"
-    assert "PITCH_LIMIT" in src, "缺少 PITCH_LIMIT"
-    # lookAt 必须有共线保护
-    assert "共线退化保护" in src or "1e-6" in src, "m4lookAt 缺少共线保护"
 
 
 def _pick_ply_mesh() -> Path | None:
