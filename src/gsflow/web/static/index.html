@@ -129,8 +129,8 @@
         <div class="row">
           <label class="grow">网格提取方法
             <select id="p-mesh-method">
-              <option value="poisson">poisson（深度反投影 + 泊松，推荐）</option>
-              <option value="2dgs">2dgs（多视角一致性投票，法线更干净）</option>
+              <option value="2dgs">2dgs（一致性投票，法线最干净 —— 推荐）</option>
+              <option value="poisson">poisson（社区标准流程，IoU 略高）</option>
               <option value="tsdf">tsdf（深度图 TSDF 融合）</option>
             </select>
           </label>
@@ -326,8 +326,8 @@
       <div class="row">
         <label class="grow">提取方法
           <select id="me-method">
-            <option value="poisson">poisson（默认，IoU 最高）</option>
-            <option value="2dgs">2dgs（一致性投票，法线最干净）</option>
+            <option value="2dgs">2dgs（一致性投票，法线最干净 —— 默认）</option>
+            <option value="poisson">poisson（社区标准流程，IoU 略高）</option>
             <option value="tsdf">tsdf（体素融合）</option>
           </select>
         </label>

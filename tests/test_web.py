@@ -83,6 +83,41 @@ def test_gui_has_local_file_picker_and_mesh_export_page(client) -> None:
     assert "2771" in appjs, "缺少泊松深度预检提示"
 
 
+def test_gui_default_matches_config_default_for_mesh_method(client) -> None:
+    """GUI 下拉框的**默认选项**必须与配置默认值一致。
+
+    这是 GUI/CLI 同构最容易破的一处：`config.DEFAULTS` 改了默认而界面没改，
+    用户创建作业时看到的是旧默认，提交上去又是新默认 —— 两边不一致且不报错。
+    这里直接解析 HTML 的 <select>，取其**第一个 option**（= 浏览器默认选中项），
+    与 config.DEFAULTS 比对。
+    """
+    import re
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(ROOT / "src"))
+    from gsflow.config import DEFAULTS
+
+    html = client.get("/").text
+    # 网格方法：两个页面各有一个下拉框，默认项都必须与配置一致
+    for sel_id, cfg_key in (("p-mesh-method", "mesh_method"),
+                            ("me-method", "mesh_method")):
+        m = re.search(r'<select id="' + sel_id + r'">(.*?)</select>', html, re.S)
+        assert m, f"找不到下拉框 {sel_id}"
+        first = re.search(r'<option value="([^"]+)"', m.group(1))
+        assert first, f"{sel_id} 没有选项"
+        assert first.group(1) == DEFAULTS["export"][cfg_key], (
+            f"{sel_id} 的默认选项是 {first.group(1)!r}，"
+            f"而配置默认是 {DEFAULTS['export'][cfg_key]!r} —— 界面与配置不一致")
+
+    # 至少要有 2dgs 与 poisson 两条路线可选
+    for sel_id in ("p-mesh-method", "me-method"):
+        m = re.search(r'<select id="' + sel_id + r'">(.*?)</select>', html, re.S)
+        body = m.group(1)
+        assert 'value="2dgs"' in body and 'value="poisson"' in body, \
+            f"{sel_id} 缺少 2dgs/poisson 选项"
+
+
 def test_gui_has_model_viewer_and_no_about_tab(client) -> None:
     """GUI 结构契约：有「模型查看」页、且「说明」页已移除。
 
