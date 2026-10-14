@@ -466,7 +466,12 @@ function createRenderer(canvas) {
   // **一个图元都不画** —— 而我们的网格有 3~4 万顶点，超过 UNSIGNED_SHORT 的 65535 上限，
   // 所以每个带面的 PLY/GLB 都会黑屏。错误只在 `getError()` 时才暴露。
   // 修法：探测扩展可用性，按需选择索引类型（见 makeMesh 里的 idxType）。
-  const uintIdxExt = gl.getExtension('OES_element_index_uint');
+  // WebGL1 的 drawElements 只接受 ... （详见下方注释）
+  // ⚠️ `getExtension` 是 WebGL1 标准方法，但**不能无条件调用**：
+  //    某些上下文变体 / 测试替身没有它，直接调用会抛 TypeError 并让 init() 失败
+  //    → 画布黑且没有任何提示。这里做存在性判断（实测在 mock 上就抛了）。
+  const uintIdxExt = (typeof gl.getExtension === 'function')
+    ? gl.getExtension('OES_element_index_uint') : null;
   const idxType = uintIdxExt ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
   const idxMax = uintIdxExt ? 0xFFFFFFFF : 0xFFFF;
 
@@ -982,7 +987,8 @@ window.GsViewer = (function () {
                      ibuf: !!obj.ibuf, lineIbuf: !!obj.lineIbuf },
         };
       }
-      out.camera = { quat: qcam.slice(), dist, target, wire, eye: eyePos() };
+      out.camera = { quat: qcam.slice(), dist, target, wire, eye: eyePos(),
+                     yawAcc, pitchAcc, rotMode };
       return out;
     },
 

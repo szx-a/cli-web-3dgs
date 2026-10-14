@@ -105,6 +105,10 @@ function makeGl(el) {
       return pn === 0x1F00 ? 'MockVendor' : (pn === 0x0D3A ? new Int32Array([16384, 16384]) : 4096);
     },
     isContextLost: () => false,
+    // 真实 WebGL 一定有 getExtension；mock 必须提供，否则 createRenderer
+    // 里的扩展探测会抛 "gl.getExtension is not a function"，
+    // 把"探针不完整"误报成"产品缺陷"（实测踩过）。
+    getExtension: (name) => (name === 'OES_element_index_uint' ? { name } : null),
   };
   // 把方法放到**原型**上，模拟真实 WebGL：own property 可写、可被包装
   const proto = Object.getPrototypeOf(gl);

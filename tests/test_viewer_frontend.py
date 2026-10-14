@@ -170,6 +170,52 @@ def test_viewer_drag_is_monotonic_no_pushback() -> None:
 
 
 @needs_node
+def test_standalone_viewer_is_self_contained_and_parseable() -> None:
+    """离线查看器 HTML 必须**自包含且可解析**（不依赖任何服务）。
+
+    为什么要这条：DSH 沙箱会回收我启动的服务（docs/03 G57），用户反复遇到
+    "查看器又黑了 / Edge 报 404"。根治办法是提供**不依赖服务**的产物：
+    把 viewer.js 与模型二进制内嵌进单个 HTML，`file://` 双击就能看。
+    但"生成 HTML"这类脚本最容易静默出错（占位符没换、数据被截断、
+    内嵌 JS 含 `</script>` 提前闭合）—— 生成时不报错，打开才发现黑屏。
+    所以这里必须真的**执行内嵌脚本并解析模型**，而不是只检查文件存在。
+    """
+    mesh_glb = None
+    if WORKSPACE.exists():
+        for cand in sorted(WORKSPACE.iterdir(), reverse=True):
+            p = cand / "05_export" / "model_mesh.glb"
+            if p.exists() and p.stat().st_size > 100_000:
+                mesh_glb = p
+                break
+    if mesh_glb is None:
+        pytest.skip("workspace 里没有网格 GLB（model_mesh.glb）")
+    job = mesh_glb.parent.parent.name
+    py = sys.executable
+    gen = subprocess.run(
+        [py, str(ROOT / "scripts" / "make_standalone_viewer.py"),
+         "--job", job, "--kind", "mesh"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=str(ROOT), timeout=300,
+    )
+    if gen.returncode != 0:
+        pytest.skip(f"生成离线查看器失败：{gen.stdout}{gen.stderr}")
+    out = mesh_glb.parent / "viewer_standalone_mesh.html"
+    assert out.exists(), "未生成离线查看器 HTML"
+    assert out.stat().st_size > 100_000, "HTML 过小，模型数据可能没内嵌进去"
+
+    py_node = shutil.which("node") or "node"
+    r = subprocess.run(
+        [py_node, str(ROOT / "scripts" / "probe_standalone_viewer.mjs"), str(out)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=str(ROOT), timeout=300,
+    )
+    text = (r.stdout or "") + (r.stderr or "")
+    assert "占位符已全部替换" in text, text
+    assert "离线查看器可用" in text, f"离线查看器不可用：\n{text}"
+    assert r.returncode == 0, text
+
+
+@needs_node
 def test_viewer_camera_modes_are_switchable() -> None:
     """旋转模式必须可切换（'clamp' 默认 / 'free' 可翻越极点）。
 
