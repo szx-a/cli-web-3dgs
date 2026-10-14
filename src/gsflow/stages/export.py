@@ -542,8 +542,17 @@ class ExportStage(Stage):
                 grad_thresh_ratio=ctx.cfgt("mesh_grad_thresh", 0.06, float),
             )
             if len(bp_pts) < 1000:
-                ctx.warn(f"反投影只得到 {len(bp_pts)} 个点，太少，放弃网格导出")
-                return []
+                # ⚠️ 这里必须**报错**而不是 warn。踩坑：背面剔除方向写反时，
+                # 每个视角的点都被剔掉、反投影恒为 0 点，而这里只 warn 就继续，
+                # 结果是"作业显示成功、却没有网格产物"——静默失败极难定位
+                # （我就是在核对产物时才发现的）。
+                bstat = bp_stat or {}
+                raise RuntimeError(
+                    f"深度反投影只得到 {len(bp_pts)} 个点，无法重建网格"
+                    f"（视角 {bstat.get('views_used', '?')}，有效像素 {bstat.get('pixels', '?')}）。"
+                    "常见原因：① 该检查点渲染出的 alpha 普遍低于 mesh_min_alpha；"
+                    "② 深度图为空/全零；③ 法线朝向与相机约定不符导致背面剔除删掉全部点"
+                    "（可用 scripts\\diag_backproject_exact.py 定位）")
             ctx.info(f"   反投影得到 {len(bp_pts)} 个点"
                      f"（{bp_stat['views_used']} 视角，{bp_stat['pixels']} 个有效像素）")
 

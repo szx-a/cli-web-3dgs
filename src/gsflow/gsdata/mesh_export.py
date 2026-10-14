@@ -523,17 +523,25 @@ def backproject_depth_to_points(rendered, c2ws, view_idx, ks, src_wh,
             fallback = cam_pts / np.maximum(np.linalg.norm(cam_pts, axis=1, keepdims=True), 1e-12)
             cam_n[~good_n] = fallback[~good_n]
 
-        # 背面剔除：真实可见表面的法线必然**朝向相机**（视线方向是 (0,0,1) 的反方向，
-        # 即 -cam_pts）。点积 <= 0 说明这个像素落在背面/深度不连续处，其法线不可信。
-        # 不剔除的话，多视角重叠处的相反法线会在体素下采样里互相抵消（平均成 ~0）。
-        facing = np.einsum("ij,ij->i", cam_n, -cam_pts) > 0
+        # 背面剔除：**可见**表面的法线必然朝向相机（相机在原点、看向 +Z），
+        # 因此 `dot(cam_n, cam_pts) > 0` 才是"朝向相机"。
+        #
+        # ⚠️ 这里曾经写成 `dot(cam_n, -cam_pts) > 0`（方向反了），后果是
+        # **每个视角的全部点都被剔除 -> 反投影恒为 0 点 -> 网格导出静默失败**。
+        # 实测（两个数据集完全一致，所以不是个例）：
+        #   dot(cam_n, -cam_pts) > 0 : 0 / 84509
+        #   dot(cam_n, +cam_pts) > 0 : 84509 / 84509
+        #   n_z > 0（可见表面应为正）: 92%
+        # 注意它**不报错**：`poisson_mesh` 之前的 `len(bp_pts) < 1000` 只是 warn，
+        # 所以表现为"能跑完但没有网格产物"。已在导出阶段加了硬失败（见 export.py）。
+        facing = np.einsum("ij,ij->i", cam_n, cam_pts) > 0
         if not facing.any():
             continue
         if not facing.all():
             vs, us, z = vs[facing], us[facing], z[facing]
             cam_pts, cam_n = cam_pts[facing], cam_n[facing]
         # 统一朝向相机（保证同一表面在不同视角给出同向法线）
-        cam_n = np.where((np.einsum("ij,ij->i", cam_n, -cam_pts) > 0)[:, None],
+        cam_n = np.where((np.einsum("ij,ij->i", cam_n, cam_pts) > 0)[:, None],
                          cam_n, -cam_n)
 
         c2w = np.asarray(c2ws[i], dtype=np.float64)
