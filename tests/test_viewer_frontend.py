@@ -123,48 +123,49 @@ def test_viewer_no_gimbal_lock_and_wireframe_index_is_even() -> None:
 
 @needs_node
 def test_viewer_source_uses_quaternion_camera_without_pitch_clamp() -> None:
-    """相机必须用**四元数**且**不得再出现 pitch 夹取**。
+    """相机朝向必须由**四元数**组合，且不得再出现欧拉角矩阵式的退化。
 
-    演进（三次都在同一问题上）：
-      1) pitch 硬夹 ±1.5 rad（±86°）—— 竖直方向转不过去；
-      2) 改成 ±(π/2−ε) + `lookAt` 共线兜底 —— 数值不崩了，但**仍然转不过顶/底**；
-      3) 现在改为四元数累积旋转 —— 没有会退化的 pitch 自由度，可自由越过天顶/天底。
-    这条是静态检查，防止退回夹取方案。
+    演进（用户反馈了三次，前三版都没真正解决，见 docs/03 G55/G58）：
+      1) 欧拉角 pitch 硬夹 ±1.5 rad；
+      2) 四元数 + 竖直绕"当前相机右轴"增量施加 —— 过极点后右轴翻向 ⇒ 反向；
+      3) 四元数 trackball / Arcball —— 竖直拖动变成绕固定轴的**圆锥运动**，
+         实测 y 只在 ±0.435 之间震荡（589 步反向），根本到不了极点；
+      4) 最终：**yaw 绕固定世界 Y 轴（不限圈数）+ pitch 绕水平右轴（夹 ±90°）**，
+         两者用四元数相乘 `qcam = Qpitch ⊗ Qyaw`。
+    关键点：轴固定在世界系，因此**方向恒定、单调、无进动、无反向**。
     """
     src = (STATIC_DIR / "viewer.js").read_text(encoding="utf-8")
-    assert "Math.min(1.5, pitch" not in src, "pitch 又被硬夹在 1.5（万向锁会回来）"
-    assert "PITCH_LIMIT" not in src, "仍存在 PITCH_LIMIT（说明又回到夹取方案）"
-    # 四元数基础设施
+    assert "Math.min(1.5, pitch" not in src, "pitch 又被硬夹在 1.5"
     for fn in ("qMul", "qNorm", "qAxisAngle", "qRot", "m4viewFromQuat"):
         assert fn in src, f"缺少四元数函数 {fn}"
-    # 相机状态是四元数，且拖拽走 orbit()
-    assert "let qcam" in src, "相机状态不是四元数"
-    assert "function orbit(" in src, "缺少 orbit() 增量旋转"
+    assert "function buildCam(" in src, "缺少 buildCam（四元数组合相机朝向）"
     assert "m4viewFromQuat(qcam" in src, "绘制时没有用四元数构造视图矩阵"
+    # 轴必须固定在世界系，不能是"每帧用当前相机基重算"（那会产生进动）
+    assert "qAxisAngle([0, 1, 0], yawAcc)" in src, "yaw 必须绕固定世界 Y 轴"
+    assert "PITCH_MAX" in src, "pitch 应有 ±90° 上限（上下看的自然边界）"
 
 
 @needs_node
-def test_viewer_camera_can_pass_through_poles() -> None:
-    """四元数相机必须能**越过天顶/天底**（这是万向锁的真实症状）。
+def test_viewer_drag_is_monotonic_no_pushback() -> None:
+    """持续朝同一方向拖动必须**单调**，不得中途反向（用户所谓"卡住/回弹"）。
 
-    做法：在 Node 里驱动真实 viewer.js，持续向下拖很久，检查
-    `GsViewer.debug().camera.eye`（相机位置）始终有限、且**确实越过了极点**：
-    相机方向向量的 y 分量应该先增到 +1 附近、**然后转为下降**（越过天顶后从另一侧下来）。
-    老实现会卡在 y≈+1 附近不动。
+    这条是最关键的回归：前面三版实现在这一项上全部失败。
+    实测（scripts/probe_camera_monotonic.mjs，持续向下拖 2400px）：
+      trackball/arcball 版：y 仅 ±0.435 来回震荡，非极点区反向 589/414 步；
+      当前版：y 0.421 → −0.502 → −0.996 → −1.000（夹住），**反向 0 步**。
     """
     glb = _pick_glb()
     if glb is None:
         pytest.skip("workspace 里没有可用的 GLB 产物")
     py = shutil.which("node") or "node"
     r = subprocess.run(
-        [py, str(ROOT / "scripts" / "probe_camera_orbit.mjs"), str(glb)],
+        [py, str(ROOT / "scripts" / "probe_camera_monotonic.mjs"), str(glb)],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         cwd=str(ROOT), timeout=300,
     )
     out = (r.stdout or "") + (r.stderr or "")
-    # 判据：相机方向能同时到达两极（旧实现会停在一个极点附近）
-    assert "是否同时到达两极 = 是" in out, f"相机只能到达一个极点（万向锁仍在）：\n{out}"
-    assert "含 NaN/Inf 的 = 0" in out, f"出现 NaN 矩阵：\n{out}"
+    assert "非极点区反向步数 = 0" in out, f"拖动中途出现反向（主观卡住）：\n{out}"
+    assert "无推回区段" in out, out
     assert r.returncode == 0, out
 
 

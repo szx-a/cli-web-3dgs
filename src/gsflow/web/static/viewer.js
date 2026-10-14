@@ -686,21 +686,47 @@ window.GsViewer = (function () {
   }
 
   /**
-   * 轨道旋转（增量、四元数）。
+   * 相机朝向 = yaw（绕**固定世界 Y 轴**，不限圈数）· pitch（绕水平右轴，夹 ±90°）。
+   * 用四元数组合，因此没有欧拉角矩阵的数值退化。
    *
-   * 水平拖动绕**世界 Y 轴**（轨道相机的习惯）。
-   * 竖直拖动绕**相机当前右轴** —— 这样在任意朝向下"向上拖就是向上转"，
-   * 而且不存在"到达天顶后无法继续"的奇点：越过后局部右轴随之翻转，旋转自然接续。
-   * 这正是用四元数替代 yaw/pitch 夹取的目的。
+   * 为什么最终是这个方案（我为此走了四次弯路，全部有实测数据支撑）：
+   *   1) 欧拉角 pitch 硬夹 —— 转不过顶/底；
+   *   2) 四元数 + 竖直绕"当前相机右轴"**增量**施加 —— 数值安全，但越过极点后
+   *      右轴翻向，继续向下拖会反向（实测非极点区频繁反转）；
+   *   3) 四元数 trackball（增量） —— 更糟：持续向下拖 2400px，y 只在 ±0.435
+   *      **来回震荡**（589 步反向），根本到不了极点；
+   *   4) 四元数 Arcball（以按下点累积） —— 实测 y 是**平滑正弦**
+   *      （0.435 → −0.435 → 0.435，周期≈840px），仍是 ±0.435 的圆环。
+   *      **根因**：屏幕竖直位移对应的旋转轴垂直于屏幕 up，于是相机绕固定轴做
+   *      **圆锥运动**，只能扫出一个圆环 —— 想绕到极点必须斜着拖，
+   *      这正是用户说的"转到某个方向就转不动了"。arcball 不适合"看物体"的场景。
+   *
+   * 最终方案把两件事分开，语义清晰且没有奇点：
+   *   - **水平拖动 = yaw**，绕**世界 Y 轴**（与相机朝向无关）⇒ 可以无限圈转，无极点；
+   *   - **竖直拖动 = pitch**，绕**水平右轴**（由 yaw 决定，恒水平）⇒ 上下扫到 ±90°，
+   *     到顶/底夹住（这是"上下看"的自然边界，不是卡死），**并且永不反向**。
+   * 两者都用四元数，`qcam = Qyaw ⊗ Qpitch`，不会出现欧拉角矩阵的退化。
    */
+  const PITCH_MAX = Math.PI / 2 - 1e-3;
+  let yawAcc = 0.6, pitchAcc = -0.45;     // 初始与 Q0 的起点一致
+  function buildCam() {
+    const qy = qAxisAngle([0, 1, 0], yawAcc);
+    // pitch 绕"yaw 之后的水平右轴"转，保证右轴恒水平、不产生滚转
+    const right = qRot(qy, [1, 0, 0]);
+    qcam = qNorm(qMul(qAxisAngle(right, pitchAcc), qy));
+  }
+  buildCam();
+
+  /** 兼容旧调用：按屏幕像素增量更新 yaw/pitch */
   function orbit(dx, dy) {
-    const RY = 0.008;   // 弧度/像素，与旧 yaw 手感一致
-    const RX = 0.008;
-    if (dx) qcam = qNorm(qMul(qAxisAngle([0, 1, 0], -dx * RY), qcam));
-    if (dy) {
-      const right = norm(qRot(qcam, [1, 0, 0]));
-      qcam = qNorm(qMul(qAxisAngle(right, -dy * RX), qcam));
-    }
+    const SENS = 0.008;
+    // 向右拖（dx>0）→ 场景向右转、相机向左绕 ⇒ yaw 增加
+    yawAcc += dx * SENS;
+    // 向下拖（dy>0）→ 相机应往**下**走 ⇒ 相机方向 y 分量减小 ⇒ pitch 增加
+    // （pitch>0 表示相机在上方；见 buildCam。这里符号曾写反，
+    //   导致向下拖反而升到天顶并夹住 —— 实测 y 从 0.449 升到 1.000 卡住。）
+    pitchAcc = Math.max(-PITCH_MAX, Math.min(PITCH_MAX, pitchAcc + dy * SENS));
+    buildCam();
   }
 
   function resize() {
@@ -864,7 +890,7 @@ window.GsViewer = (function () {
       if (!obj) return;
       target = obj.center.slice();
       dist = obj.radius * 2.8;
-      qcam = Q0.slice();
+      qcam = Q0.slice(); yawAcc = 0.6; pitchAcc = -0.45; buildCam();
       draw();
     },
     toggleWire() { wire = !wire; draw(); return wire; },
@@ -929,7 +955,7 @@ window.GsViewer = (function () {
       obj = null;
       target = [0, 0, 0];
       dist = 3;
-      qcam = Q0.slice();
+      qcam = Q0.slice(); yawAcc = 0.6; pitchAcc = -0.45; buildCam();
       draw();
       return true;
     },
