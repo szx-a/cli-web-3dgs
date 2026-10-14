@@ -120,6 +120,17 @@ DEFAULTS: dict[str, Any] = {
         "densify_quantile": 0.0,
         "densify_grad_threshold": 2e-4,
         "densify_grad_max": 5e-3,
+        # 绝对梯度致密化（AbsGS：https://ty424.github.io/AbsGS.github.io/）。
+        # 官方 `DefaultStrategy(absgrad=...)` 支持：开启后栅格化会额外产出
+        # `means2d.absgrad`，致密判据用**绝对值和**而不是"正负相消后的梯度"。
+        # 优点是能恢复更细的结构（Faster-GS README 也专门列出这一项），
+        # 代价是 backward 多一份开销。默认关闭，需实测对照后再决定。
+        "absgrad": False,
+        # 密度控制实现：
+        #   builtin  —— 本项目的自定义实现（已验证、默认）。`absgrad` 在此路径**不生效**。
+        #   official —— 直接复用 gsplat `DefaultStrategy`（含 AbsGS 的 absgrad 支持）。
+        # 注意：`absgrad` 只有配合 official 才有意义；走 builtin 时它会被忽略。
+        "densify_strategy": "builtin",
         # 以下三个比例都相对 scene_scale（相机中心平均距离），取自官方 gsplat DefaultStrategy。
         # prune_scale3d 是**防发散的关键约束**：漏掉它会让尺度无界增长（实测 log尺度到 739）。
         "grow_scale3d": 0.01,          # 尺度 <= 0.01*scene_scale 走克隆，大于走分裂

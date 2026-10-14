@@ -74,6 +74,11 @@ class TrainConfig:
     # 可选：>0 时改用"梯度的 (1-q) 分位"作阈值（仅用于实验对比）
     densify_quantile: float = 0.0
     densify_grad_max: float = 5e-3           # 自适应阈值的上限
+    # 绝对梯度致密化（AbsGS）。官方 `DefaultStrategy` 支持 `absgrad`；
+    # 开启后栅格化会额外产出 `means2d.absgrad`（**必须同时给 rasterization 传 absgrad=True**），
+    # 致密判据改用绝对值和而不是"正负相消后的梯度"，能恢复更细的结构。
+    # 默认关闭，需实测对照后再决定是否改默认。
+    absgrad: bool = False
     # 以下三个比例都相对 scene_scale（相机中心到均值距离），取自官方 DefaultStrategy：
     #   grow_scale3d  = 0.01 -> 尺度 <= 0.01*scene_scale 走"克隆"
     #   grow_scale3d  >  0.01 -> 走"分裂"
@@ -780,6 +785,9 @@ def train(cfg: TrainConfig, ctx) -> dict:
                 refine_every=cfg.densify_interval,
                 pause_refine_after_reset=cfg.pause_refine_after_reset,
                 revised_opacity=bool(cfg.revised_opacity),
+                # AbsGS 的绝对梯度致密化：官方 strategy 会把 absgrad 透传给栅格化，
+                # 于是 densify 判据用 `means2d.absgrad`（绝对值和）而不是普通梯度。
+                absgrad=bool(cfg.absgrad),
                 key_for_gradient="means2d",
             )
             gs_strategy.check_sanity(params, optimizers)
@@ -939,6 +947,12 @@ def train(cfg: TrainConfig, ctx) -> dict:
             far_plane=1e10,
             packed=False,
             render_mode="RGB",
+            # ⚠️ AbsGS 的绝对梯度**必须同时在这里传 absgrad=True**，否则
+            # `meta["means2d"].absgrad` 是 None，官方 strategy 取 `.clone()` 会失败。
+            # 官方文档明确写了这一点（"the rasterization function should be called
+            # with absgrad=True as well so that the absolute gradients are computed"），
+            # 我第一次只给 strategy 传了、漏了这里。
+            absgrad=bool(cfg.absgrad),
         )
         # 官方的密度控制判据用的是 **2D 屏幕空间**的 means2d 梯度，不是 3D 的 means.grad。
         # 两者量纲完全不同：`grow_grad2d=2e-4` 只在归一化后的屏幕空间里才有意义。
