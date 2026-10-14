@@ -21,25 +21,61 @@ let mvpFinite = [];
 let quiet = false;      // 大量拖拽采样时关掉逐条打印
 const PROG = { id: 'prog' };
 
+// 真实 WebGL1 常量号（必须与浏览器一致，否则"常量合法性"和
+// "每次调用后检查错误"都无法模拟 —— 曾因用假常量而漏掉 INVALID_ENUM）
+const GLV = {
+  DEPTH_TEST: 0x0B71, COLOR_BUFFER_BIT: 0x4000, DEPTH_BUFFER_BIT: 0x0100,
+  VERTEX_SHADER: 0x8B31, FRAGMENT_SHADER: 0x8B30,
+  COMPILE_STATUS: 0x8B81, LINK_STATUS: 0x8B82, VALIDATE_STATUS: 0x8B83,
+  ARRAY_BUFFER: 0x8892, ELEMENT_ARRAY_BUFFER: 0x8893, STATIC_DRAW: 0x88E4,
+  FLOAT: 0x1406, UNSIGNED_INT: 0x1405, UNSIGNED_BYTE: 0x1401,
+  UNSIGNED_SHORT: 0x1403, RGBA: 0x1908, TEXTURE_2D: 0x0DE1,
+  TEXTURE_WRAP_S: 0x2802, TEXTURE_WRAP_T: 0x2803, REPEAT: 0x2901,
+  TEXTURE_MIN_FILTER: 0x2801, TEXTURE_MAG_FILTER: 0x2800,
+  LINEAR_MIPMAP_LINEAR: 0x2703, LINEAR: 0x2601, NEAREST: 0x2600,
+  UNPACK_FLIP_Y_WEBGL: 0x9240, POINTS: 0, TRIANGLES: 4, LINES: 1,
+  TEXTURE0: 0x84C0, VENDOR: 0x1F00, RENDERER: 0x1F01, VERSION: 0x1F02,
+  NO_ERROR: 0, INVALID_ENUM: 0x0500, INVALID_VALUE: 0x0501,
+  INVALID_OPERATION: 0x0502, OUT_OF_MEMORY: 0x0505,
+  CONTEXT_LOST_WEBGL: 0x9242, ACTIVE_TEXTURE: 0x84E0, NO_ERROR_2: 0,
+  DEPTH_FUNC: 0x0B74, LESS: 0x0201, CURRENT_PROGRAM: 0x8B8D,
+  MAX_TEXTURE_SIZE: 0x0D33, SAMPLE_BUFFERS: 0x80A8, SAMPLES: 0x80A9,
+};
+
 function mkGlStub() {
   let obj = 0;
+  // 可用 `--no-uint-index` 模拟"浏览器不提供 OES_element_index_uint"的情形，
+  // 用来验证查看器会给出明确错误而不是静默黑屏。
+  const glHasUintIndex = !process.argv.includes('--no-uint-index');
+  // 错误状态：模拟浏览器"某次调用设置错误码，直到 getError() 读取才清除"
+  let errState = 0;
+  let quietErr = false;
+  const setErr = (code, why) => {
+    if (!errState) errState = code;
+    if (!quietErr) {
+      const names = { 0x0500: 'INVALID_ENUM', 0x0501: 'INVALID_VALUE',
+                      0x0502: 'INVALID_OPERATION', 0x0505: 'OUT_OF_MEMORY' };
+      console.log(`    ** GL ${names[code] || code} 由 ${why} 触发 **`);
+    }
+  };
   const G = {
-    // 常量
-    DEPTH_TEST: 2929, COLOR_BUFFER_BIT: 16384, DEPTH_BUFFER_BIT: 256,
-    VERTEX_SHADER: 35633, FRAGMENT_SHADER: 35632,
-    COMPILE_STATUS: 35713, LINK_STATUS: 35714,
-    ARRAY_BUFFER: 34962, ELEMENT_ARRAY_BUFFER: 34963, STATIC_DRAW: 35044,
-    FLOAT: 5126, UNSIGNED_INT: 5125, UNSIGNED_BYTE: 5121, RGBA: 6408, TEXTURE_2D: 3553,
-    TEXTURE_WRAP_S: 10242, TEXTURE_WRAP_T: 10243, REPEAT: 10497,
-    TEXTURE_MIN_FILTER: 10241, TEXTURE_MAG_FILTER: 10240,
-    LINEAR_MIPMAP_LINEAR: 9987, LINEAR: 9729, UNPACK_FLIP_Y_WEBGL: 37440,
-    POINTS: 0, TRIANGLES: 4, LINES: 1,
-    // 方法
+    ...GLV,
     createShader: () => ({ id: 'sh' }),
     shaderSource: () => {}, compileShader: () => {},
     getShaderParameter: () => true, getShaderInfoLog: () => '',
     createProgram: () => PROG, attachShader: () => {}, linkProgram: () => {},
-    getProgramParameter: () => true, getProgramInfoLog: () => '',
+    // ⚠️ getProgramParameter 只接受这几个 pname；传别的必须报 INVALID_ENUM。
+    // 这正是浏览器报的那个错 —— mock 必须同样严格，否则测不出来。
+    getProgramParameter: (p, pname) => {
+      const OKP = [GLV.LINK_STATUS, GLV.VALIDATE_STATUS, 0x8B84 /*ATTACHED_SHADERS*/,
+                   0x8B86 /*ACTIVE_UNIFORMS*/, 0x8B89 /*ACTIVE_ATTRIBUTES*/,
+                   0x8B8D /*CURRENT_PROGRAM*/, 0x8B80 /*DELETE_STATUS*/];
+      if (!OKP.includes(pname)) {
+        setErr(0x0500, 'getProgramParameter(pname=' + pname + ')');
+        return null;
+      }
+      return true;
+    },
     useProgram: () => {},
     // 故意让"不存在的 uniform"返回 null，模拟真实驱动行为
     getUniformLocation: (p, n) => {
@@ -55,8 +91,15 @@ function mkGlStub() {
     createBuffer: () => ({ id: 'buf' + (++obj) }),
     bindBuffer: (t, b) => calls.push(['bindBuffer', t, b && b.id]),
     bufferData: (t, d) => calls.push(['bufferData', t, d && d.byteLength]),
-    enableVertexAttribArray: (i) => calls.push(['enableAttrib', i]),
-    disableVertexAttribArray: (i) => calls.push(['disableAttrib', i]),
+    enableVertexAttribArray: (i) => {
+      calls.push(['enableAttrib', i]);
+      // 真实 WebGL：索引越界报 INVALID_VALUE；这里也检查一次
+      if (i < 0 || i > 15) setErr(0x0501, 'enableVertexAttribArray(' + i + ')');
+    },
+    disableVertexAttribArray: (i) => {
+      calls.push(['disableAttrib', i]);
+      if (i < 0 || i > 15) setErr(0x0501, 'disableVertexAttribArray(' + i + ')');
+    },
     vertexAttribPointer: (i, n, ty, norm, st, off) => calls.push(['attribPointer', i, n, ty, norm, st, off]),
     vertexAttrib3f: (i, a, b, c) => calls.push(['vertexAttrib3f', i, a, b, c]),
     vertexAttrib2f: (i, a, b) => calls.push(['vertexAttrib2f', i, a, b]),
@@ -85,17 +128,45 @@ function mkGlStub() {
     drawArrays: (m, f, c) => calls.push(['drawArrays', m, f, c]),
     drawElements: (m, c, ty, off) => {
       calls.push(['drawElements', m, c, ty, off]);
-      // 模拟真实 WebGL 的校验：LINES 模式的索引数必须是偶数，
-      // 否则报 INVALID_OPERATION 并且整帧不画（这正是线框全黑的成因）
+      // ⚠️ 两条真实 WebGL1 约束（mock 之前没有，所以漏掉了"全黑"的真凶）：
+      //   1) type 只能是 UNSIGNED_BYTE(0x1401) 或 UNSIGNED_SHORT(0x1403)；
+      //      用 UNSIGNED_INT(0x1405) 必须启用 OES_element_index_uint，否则 INVALID_ENUM。
+      //   2) LINES 模式的索引数必须是偶数，否则 INVALID_OPERATION。
+      const UNSIGNED_SHORT = 0x1403, UNSIGNED_BYTE = 0x1401, UNSIGNED_INT = 0x1405;
+      if (ty !== UNSIGNED_SHORT && ty !== UNSIGNED_BYTE) {
+        if (!(ty === UNSIGNED_INT && glHasUintIndex)) {
+          setErr(0x0500, `drawElements(type=${ty})`);
+        }
+      }
       if (m === 1 && c % 2 !== 0) {
-        console.log('  ** INVALID_OPERATION: LINES 索引数 ' + c + ' 不是偶数 -> 整帧不绘制 **');
-        lastError = 1282;
+        setErr(0x0502, 'drawElements(LINES, ' + c + ') 索引数不是偶数');
       }
     },
-    getError: () => { const e = lastError; lastError = 0; return e; },
+    getExtension: (name) => (name === 'OES_element_index_uint' && glHasUintIndex
+      ? { name } : null),
+    getError: () => { const e = errState; errState = 0; return e; },
+    getParameter: (pname) => {
+      // 合法 pname 集合（含字符串类 VENDOR/RENDERER/VERSION）
+      const OKP = [GLV.VENDOR, GLV.RENDERER, GLV.VERSION, GLV.MAX_TEXTURE_SIZE,
+                   GLV.SAMPLE_BUFFERS, GLV.SAMPLES, GLV.DEPTH_FUNC,
+                   GLV.CURRENT_PROGRAM, 0x0BA2 /*VIEWPORT*/, 0x84E0 /*ACTIVE_TEXTURE*/,
+                   0x8894, 0x8895, 0x8CA6, 0x8CA7, 0x8069, 0x8514,
+                   0x0D3A, 0x846D, 0x846E, 0x0D50, 0x0D52, 0x0D53, 0x0D54,
+                   0x0D55, 0x0D56, 0x0D57, 0x0C10, 0x0C22, 0x0C23];
+      if (!OKP.includes(pname)) {
+        setErr(0x0500, 'getParameter(' + pname + ')');
+        return null;
+      }
+      if (pname === GLV.VENDOR) return 'MockVendor';
+      if (pname === GLV.RENDERER) return 'MockRenderer';
+      if (pname === GLV.VERSION) return 'WebGL 1.0 (mock)';
+      if (pname === 0x0D3A) return new Int32Array([16384, 16384]);
+      return 4096;
+    },
+    depthFunc: () => {},
+    isContextLost: () => false,
     console: { error: (...a) => console.log('  [console.error]', ...a) },
   };
-  let lastError = 0;
   return G;
 }
 
@@ -116,6 +187,9 @@ const canvas = Object.assign(mkTarget(listeners.canvas), {
 });
 const windowStub = Object.assign(mkTarget(listeners.window), { devicePixelRatio: 1 });
 const documentStub = { getElementById: () => canvas };
+// debug() 会读计算样式；node 里没有，补一个最小实现，避免"测不了 debug()"
+globalThis.getComputedStyle = () => ({ width: '800px', height: '600px',
+                                        display: 'block', visibility: 'visible' });
 
 /** 模拟一次鼠标拖拽（按下 -> 移动 -> 抬起） */
 function draggingSim(target, dx, dy) {
@@ -245,6 +319,48 @@ try {
 } catch (e) {
   console.log('  **clear() 抛出**: ' + e.message);
   process.exitCode = 1;
+}
+
+// debug() 也要跑一遍 —— 它内部会调用 getParameter/getProgramParameter，
+// 如果 pname 非法就会报 INVALID_ENUM（浏览器里正是这么暴露的）。
+console.log('\n--- debug() 自检 ---');
+try {
+  const d = V.debug();
+  console.log('  gl = ' + JSON.stringify(d.gl));
+  console.log('  prog = ' + JSON.stringify(d.prog));
+  console.log('  uniforms = ' + JSON.stringify(d.uniforms));
+  console.log('  attribs = ' + JSON.stringify(d.attribs));
+  console.log('  canvas = ' + JSON.stringify(d.canvas));
+  console.log('  obj = ' + JSON.stringify(d.obj));
+} catch (e) {
+  console.log('  **debug() 抛出**: ' + e.message);
+  process.exitCode = 1;
+}
+
+// init() 之后严格自检：GL 包装器是否破坏了方法可用性、是否残留错误码。
+// 这能验证"我给 GL 加错误溯源"本身没有把查看器弄坏（Edge 上报 INVALID_ENUM 时的首要怀疑）。
+console.log('\n--- init() 后严格自检 ---');
+{
+  const gl = canvas.getContext('webgl');
+  const must = ['getParameter', 'getError', 'enable', 'clear', 'viewport',
+                'drawElements', 'drawArrays', 'vertexAttribPointer',
+                'enableVertexAttribArray', 'disableVertexAttribArray',
+                'uniformMatrix4fv', 'uniform1i', 'useProgram', 'bindBuffer'];
+  const broken = must.filter((n) => typeof gl[n] !== 'function');
+  console.log('  GL 方法可用性: ' + (broken.length ? '**缺失 ' + broken.join(',') + ' **' : '全部可用'));
+  const e = gl.getError();
+  console.log('  init 后残留 GL 错误码 = ' + e + (e ? '  **有未清除的错误**' : '  （干净）'));
+  if (gl.__traced) {
+    console.log('  错误溯源已安装: true');
+    // 包装后仍必须能正确取值
+    const v = gl.getParameter(gl.VENDOR);
+    console.log('  包装后 getParameter(VENDOR) = ' + v);
+    const e2 = gl.getError();
+    if (e2) { console.log('  **包装后产生错误码 ' + e2 + '**'); process.exitCode = 1; }
+  } else {
+    console.log('  **错误溯源未安装**');
+  }
+  if (broken.length || e) process.exitCode = 1;
 }
 
 // 退出码：供 pytest 做回归（非 0 表示有退化）

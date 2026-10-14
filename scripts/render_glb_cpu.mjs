@@ -47,16 +47,117 @@ function accessor(gltf, bin, i, asFloat = false) {
 
 const [inFile, outFile, Ws = '900', Hs = '650'] = process.argv.slice(2);
 const W = parseInt(Ws, 10), H = parseInt(Hs, 10);
-const { gltf, bin } = parseGlb(fs.readFileSync(inFile));
-const prim = gltf.meshes[0].primitives[0];
-const P = accessor(gltf, bin, prim.attributes.POSITION, true).raw;
-const Nm = prim.attributes.NORMAL !== undefined ? accessor(gltf, bin, prim.attributes.NORMAL, true).raw : null;
-const Col = prim.attributes.COLOR_0 !== undefined
-  ? accessor(gltf, bin, prim.attributes.COLOR_0, true).raw : null;
-const I = prim.indices !== undefined
-  ? accessor(gltf, bin, prim.indices).raw : null;
-const nv = P.length / 3, nt = I ? I.length / 3 : nv / 3;
-console.log(`顶点 ${nv} 三角形 ${nt}  有法线=${!!Nm} 有颜色=${!!Col}`);
+
+/* ---- 输入：GLB 或 PLY ---- */
+function readPly(buf) {
+  let headEnd = -1, headText = '';
+  for (let j = 0; j < Math.min(buf.length, 65536) - 10; j++) {
+    if (buf[j] === 0x65 && buf[j + 1] === 0x6E && buf[j + 2] === 0x64 && buf[j + 3] === 0x5F) {
+      let k = j, s = '';
+      while (k < buf.length && buf[k] !== 0x0A) { s += String.fromCharCode(buf[k]); k++; }
+      if (s.startsWith('end_header')) { headEnd = k + 1; headText = buf.slice(0, headEnd).toString('latin1'); break; }
+    }
+  }
+  if (headEnd < 0) throw new Error('PLY 缺少 end_header');
+  const lines = headText.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  const fmt = (lines.find((l) => l.startsWith('format')) || '').split(/\s+/)[1] || '';
+  const le = fmt.includes('little');
+  const vcount = parseInt((lines.find((l) => l.startsWith('element vertex')) || '').split(/\s+/)[2], 10);
+  const faceCount = parseInt((lines.find((l) => l.startsWith('element face')) || '').split(/\s+/)[2], 10) || 0;
+  const props = [];
+  let inV = false;
+  for (const l of lines) {
+    if (l.startsWith('element ')) { inV = (l.split(/\s+/)[1] === 'vertex'); continue; }
+    if (inV && l.startsWith('property ')) { const p = l.split(/\s+/); props.push({ type: p[1], name: p[2] }); }
+  }
+  const SZ = { char:1,uchar:1,int8:1,uint8:1,short:2,ushort:2,int16:2,uint16:2,
+               int:4,uint:4,int32:4,uint32:4,float:4,float32:4,double:8,float64:8 };
+  let stride = 0; const offs = {};
+  for (const p of props) { offs[p.name] = stride; stride += SZ[p.type] || 4; }
+  const dv = new DataView(buf.buffer, buf.byteOffset + headEnd);
+  const mk = (name) => {
+    const p = props.find((q) => q.name === name);
+    if (!p) return null;
+    const t = p.type, o = offs[name];
+    return (i) => {
+      const b = i * stride + o;
+      switch (t) {
+        case 'float': case 'float32': return dv.getFloat32(b, le);
+        case 'double': case 'float64': return dv.getFloat64(b, le);
+        case 'uchar': case 'uint8': return dv.getUint8(b);
+        case 'char': case 'int8': return dv.getInt8(b);
+        case 'ushort': case 'uint16': return dv.getUint16(b, le);
+        case 'short': case 'int16': return dv.getInt16(b, le);
+        case 'uint': case 'uint32': return dv.getUint32(b, le);
+        default: return dv.getInt32(b, le);
+      }
+    };
+  };
+  const rx = mk('x'), ry = mk('y'), rz = mk('z');
+  const P = new Float32Array(vcount * 3);
+  for (let i = 0; i < vcount; i++) { P[i*3] = rx(i); P[i*3+1] = ry(i); P[i*3+2] = rz(i); }
+  const Nm = (mk('nx') && mk('ny') && mk('nz'))
+    ? (() => { const a = mk('nx'), b = mk('ny'), c = mk('nz');
+        const out = new Float32Array(vcount * 3);
+        for (let i = 0; i < vcount; i++) { out[i*3] = a(i); out[i*3+1] = b(i); out[i*3+2] = c(i); }
+        return out; })() : null;
+  const rr = mk('red'), gg = mk('green'), bb = mk('blue');
+  let Col = null;
+  if (rr && gg && bb) {
+    const rp = props.find((p) => p.name === 'red');
+    const isByte = /uchar|uint8|char|int8|ushort|uint16|short|int16/.test(rp.type);
+    const sc = isByte ? 1 / 255 : 1;
+    Col = new Float32Array(vcount * 3);
+    for (let i = 0; i < vcount; i++) { Col[i*3] = rr(i)*sc; Col[i*3+1] = gg(i)*sc; Col[i*3+2] = bb(i)*sc; }
+  } else {
+    const f0 = mk('f_dc_0'), f1 = mk('f_dc_1'), f2 = mk('f_dc_2');
+    if (f0) {
+      const C0 = 0.28209479177387814;
+      Col = new Float32Array(vcount * 3);
+      for (let i = 0; i < vcount; i++) {
+        Col[i*3] = Math.min(1, Math.max(0, 0.5 + C0*f0(i)));
+        Col[i*3+1] = Math.min(1, Math.max(0, 0.5 + C0*f1(i)));
+        Col[i*3+2] = Math.min(1, Math.max(0, 0.5 + C0*f2(i)));
+      }
+    }
+  }
+  let I = null;
+  if (faceCount > 0) {
+    const fl = lines.find((l) => l.startsWith('property list'));
+    const it = fl ? fl.split(/\s+/)[3] : 'uint';
+    const IS = SZ[it] || 4;
+    const fdv = new DataView(buf.buffer, buf.byteOffset + headEnd + vcount * stride);
+    const rd = IS === 4 ? (b) => fdv.getUint32(b, le) : (b) => fdv.getUint16(b, le);
+    const out = []; let p = 0;
+    for (let f = 0; f < faceCount; f++) {
+      const n = fdv.getUint8(p); p += 1;
+      const v = []; for (let k = 0; k < n; k++) { v.push(rd(p)); p += IS; }
+      for (let k = 1; k + 1 < n; k++) out.push(v[0], v[k], v[k+1]);
+    }
+    I = new Uint32Array(out);
+  }
+  return { P, Nm, Col, I, nv: vcount,
+           // 无面 -> 点云模式
+           mode: I ? 4 : 0 };
+}
+
+let P, Nm, Col, I, nv, mode;
+const fileBytes = fs.readFileSync(inFile);
+if (inFile.toLowerCase().endsWith('.ply')) {
+  ({ P, Nm, Col, I, nv, mode } = readPly(fileBytes));
+} else {
+  const { gltf, bin } = parseGlb(fileBytes);
+  const prim = gltf.meshes[0].primitives[0];
+  mode = prim.mode === undefined ? 4 : prim.mode;
+  const pa = accessor(gltf, bin, prim.attributes.POSITION, true);
+  P = pa.raw; nv = pa.count;
+  Nm = prim.attributes.NORMAL !== undefined ? accessor(gltf, bin, prim.attributes.NORMAL, true).raw : null;
+  Col = prim.attributes.COLOR_0 !== undefined ? accessor(gltf, bin, prim.attributes.COLOR_0, true).raw : null;
+  I = prim.indices !== undefined ? accessor(gltf, bin, prim.indices).raw : null;
+}
+const nt = I ? I.length / 3 : 0;
+console.log(`输入 ${inFile.split(/[\\/]/).pop()}: mode=${mode} 顶点 ${nv} 三角形 ${nt}`
+            + `  有法线=${!!Nm} 有颜色=${!!Col}`);
 
 // bbox
 let mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];

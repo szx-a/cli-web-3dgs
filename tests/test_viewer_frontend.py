@@ -17,6 +17,7 @@ Node 不可用时跳过（不阻塞 Python 测试）。
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import sys
@@ -100,6 +101,65 @@ def test_viewer_no_gimbal_lock_and_wireframe_index_is_even() -> None:
     assert "LINES" not in out or "INVALID_OPERATION" not in out, (
         "线框用了奇数长度的索引缓冲，WebGL 会整帧不画：\n" + out)
     assert r.returncode == 0, f"探针以 {r.returncode} 退出：\n{out}"
+
+
+@needs_node
+def test_viewer_draw_elements_uses_legal_index_type() -> None:
+    """`drawElements` 的索引类型必须合法 —— 这是"画布全黑"的真凶。
+
+    WebGL1 的 `drawElements` **只接受 UNSIGNED_BYTE / UNSIGNED_SHORT**；
+    用 `UNSIGNED_INT`(0x1405) 必须显式启用 `OES_element_index_uint` 扩展，否则报
+    **INVALID_ENUM 并且一个图元都不画**（画布全黑，无任何可见提示）。
+
+    实测经过（用户的 Edge 控制台）：
+        GL INVALID_ENUM @ gl.drawElements(4, 222885, 5125(0x1405), 0)
+    即无条件传了 UNSIGNED_INT。我们的网格普遍有 3~4 万顶点，
+    超过 UNSIGNED_SHORT 的 65535 上限，所以**每个带面的模型都会黑屏**。
+
+    这条测试让 Node 探针的 mock **模拟那条 WebGL1 约束**（探针里已加），
+    于是"用了非法索引类型"会像浏览器一样报错并使探针非 0 退出。
+    """
+    # 选一个 u16 装得下、和一个装不下的模型，两条路径都要覆盖
+    small = _pick_ply_mesh()
+    if small is None:
+        pytest.skip("workspace 里没有带面的网格 PLY")
+
+    r = _run_probe(small)
+    out = (r.stdout or "") + (r.stderr or "")
+    assert "drawElements(type=" not in out, f"索引类型非法（会全黑）：\n{out}"
+    # 合法的绘制调用：type 只能是 5121(UBYTE) 或 5123(USHORT)，或 5125 在扩展可用时
+    assert '"drawElements",4' in out.replace(" ", ""), out
+    assert r.returncode == 0, f"探针以 {r.returncode} 退出：\n{out}"
+
+
+@needs_node
+def test_viewer_reports_clear_error_without_uint_index_extension() -> None:
+    """若浏览器**没有** `OES_element_index_uint` 且顶点数 > 65535，
+    必须给出明确错误，而不是静默黑屏（这正是原来的失败模式）。"""
+    big = None
+    if WORKSPACE.exists():
+        for job in sorted(WORKSPACE.iterdir(), reverse=True):
+            p = job / "05_export" / "model_mesh.ply"
+            if p.exists():
+                head = p.read_bytes()[:4000]
+                m = re.search(rb"element vertex (\d+)", head)
+                if m and int(m.group(1)) > 65535:
+                    big = p
+                    break
+    if big is None:
+        pytest.skip("workspace 里没有顶点数 > 65535 的网格 PLY")
+
+    py = shutil.which("node") or "node"
+    r = subprocess.run(
+        [py, str(ROOT / "scripts" / "probe_viewer_runtime.mjs"), str(big),
+         "--no-uint-index"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=str(ROOT), timeout=300,
+    )
+    out = (r.stdout or "") + (r.stderr or "")
+    # 必须出现我们自己的、说明原因的报错（含"65535"与"OES_element_index_uint"）
+    assert "65535" in out and "OES_element_index_uint" in out, (
+        "无 32 位索引扩展时没有给出明确错误（会表现为静默黑屏）：\n" + out)
 
 
 @needs_node

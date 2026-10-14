@@ -412,6 +412,17 @@ function createRenderer(canvas) {
   const gl = canvas.getContext('webgl', { antialias: true, alpha: false });
   if (!gl) throw new Error('浏览器不支持 WebGL');
 
+  // ⚠️ **WebGL1 的 drawElements 不接受 UNSIGNED_INT**（只允许 UNSIGNED_BYTE / UNSIGNED_SHORT）。
+  // 要索引 32 位必须显式启用 `OES_element_index_uint` 扩展。
+  // 踩坑（造成"画布全黑"）：之前无条件用 `gl.UNSIGNED_INT`，
+  // 于是 `drawElements(TRIANGLES, n, UNSIGNED_INT, 0)` 报 **INVALID_ENUM** 并且
+  // **一个图元都不画** —— 而我们的网格有 3~4 万顶点，超过 UNSIGNED_SHORT 的 65535 上限，
+  // 所以每个带面的 PLY/GLB 都会黑屏。错误只在 `getError()` 时才暴露。
+  // 修法：探测扩展可用性，按需选择索引类型（见 makeMesh 里的 idxType）。
+  const uintIdxExt = gl.getExtension('OES_element_index_uint');
+  const idxType = uintIdxExt ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
+  const idxMax = uintIdxExt ? 0xFFFFFFFF : 0xFFFF;
+
   function compile(type, src) {
     const s = gl.createShader(type);
     gl.shaderSource(s, src);
@@ -440,13 +451,58 @@ function createRenderer(canvas) {
   };
   gl.enable(gl.DEPTH_TEST);
   gl.clearColor(0.02, 0.03, 0.045, 1);
+  // 错误溯源（默认开启一次即可；它只在出错时打印，不影响正常性能）
+  try { installGlTracer(gl); } catch { /* 忽略 */ }
 
-  return { gl, prog, U, A };
+  return { gl, prog, U, A, idxType, idxMax, hasUintIndex: !!uintIdxExt };
+}
+
+/**
+ * 给 WebGL 上下文装一层"错误溯源"包装。
+ *
+ * 为什么必须这么做：WebGL 的错误是**异步累积**的 —— 某个调用失败后把错误码留在上下文里，
+ * 直到有人调用 `getError()` 才读出。所以原来的做法（在 draw 末尾读一次）
+ * 只知道"有错"，**不知道是哪个调用**，浏览器也只报一句 "INVALID_ENUM"。
+ * 这里把每个可能出错的 GL 方法包一层，调用后立刻读错误码，
+ * 于是能直接打印出**方法名 + 参数 + 调用栈**。
+ *
+ * 只在 `window.__GSVIEWER_TRACE` 为真时启用，避免影响正常路径的性能。
+ */
+function installGlTracer(gl) {
+  if (gl.__traced) return;
+  gl.__traced = true;
+  const NAMES = { 0x0500: 'INVALID_ENUM', 0x0501: 'INVALID_VALUE',
+                  0x0502: 'INVALID_OPERATION', 0x0505: 'OUT_OF_MEMORY',
+                  0x0506: 'INVALID_FRAMEBUFFER_OPERATION', 0x9242: 'CONTEXT_LOST_WEBGL' };
+  const watch = ['getParameter', 'getProgramParameter', 'getShaderParameter',
+                 'enable', 'disable', 'depthFunc', 'clearColor', 'clear', 'viewport',
+                 'enableVertexAttribArray', 'disableVertexAttribArray',
+                 'vertexAttribPointer', 'vertexAttrib2f', 'vertexAttrib3f',
+                 'drawArrays', 'drawElements', 'activeTexture', 'bindTexture',
+                 'texParameteri', 'texImage2D', 'generateMipmap', 'pixelStorei',
+                 'uniform1i', 'uniform1f', 'uniform3f', 'uniformMatrix4fv',
+                 'useProgram', 'bindBuffer', 'bufferData', 'linkProgram', 'compileShader'];
+  watch.forEach((name) => {
+    const orig = gl[name];
+    if (typeof orig !== 'function') return;
+    gl[name] = function (...args) {
+      const r = orig.apply(gl, args);
+      const e = gl.getError();
+      if (e !== 0) {
+        const label = NAMES[e] || ('0x' + e.toString(16));
+        // 参数里的 GL 常量映射回名字，便于读懂
+        const pretty = args.map((a) => (typeof a === 'number' && a > 0x1000 && a < 0x10000)
+          ? `${a}(0x${a.toString(16)})` : String(a)).join(', ');
+        console.error(`[GsViewer] GL ${label} @ gl.${name}(${pretty})`,
+                      '\n调用栈:\n' + new Error().stack);
+      }
+      return r;
+    };
+  });
 }
 
 /** 一个可渲染对象：缓冲 + 元信息 */
-function makeMesh(R, model, wireframe) {
-  const { gl } = R;
+function makeMesh(R, model, wireframe) {  const { gl } = R;
   const vbuf = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, vbuf);
   gl.bufferData(gl.ARRAY_BUFFER, model.position, gl.STATIC_DRAW);
@@ -468,12 +524,30 @@ function makeMesh(R, model, wireframe) {
     gl.bindBuffer(gl.ARRAY_BUFFER, nbuf);
     gl.bufferData(gl.ARRAY_BUFFER, model.normal, gl.STATIC_DRAW);
   }
-  let ibuf = null, indexCount = 0;
+  let ibuf = null, indexCount = 0, idxType = R.idxType;
   if (model.indices) {
+    // 索引类型：WebGL1 默认只支持 UNSIGNED_SHORT（上限 65535）。
+    // 顶点数超过该上限时**必须**用 UNSIGNED_INT，而它要求 `OES_element_index_uint`。
+    const nVert = model.position.length / 3;
+    if (nVert > 65535) {
+      if (!R.hasUintIndex) {
+        throw new Error(
+          `该模型有 ${nVert} 个顶点，超过 WebGL1 无扩展时的 65535 索引上限，`
+          + '且浏览器/驱动未提供 OES_element_index_uint 扩展。'
+          + '请改用支持该扩展的浏览器，或用 export.mesh_target_triangles 生成更小的网格。');
+      }
+      idxType = R.gl.UNSIGNED_INT;
+    } else {
+      idxType = R.gl.UNSIGNED_SHORT;
+    }
+    // 按选定类型构造索引数组（Uint16Array 时需确保索引确实在范围内）
+    const idxArr = idxType === R.gl.UNSIGNED_INT
+      ? new Uint32Array(model.indices)
+      : new Uint16Array(model.indices);
     ibuf = gl.createBuffer();
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibuf);
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, model.indices, gl.STATIC_DRAW);
-    indexCount = model.indices.length;
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idxArr, gl.STATIC_DRAW);
+    indexCount = idxArr.length;
   }
   // 线框用的线段索引：每个三角形贡献 3 条边 (a-b, b-c, c-a)。
   // 必须单独建缓冲 —— 直接拿三角形索引去 drawElements(gl.LINES) 会报
@@ -482,17 +556,18 @@ function makeMesh(R, model, wireframe) {
   if (model.indices && model.indices.length >= 3) {
     const tri = model.indices;
     const nTri = Math.floor(tri.length / 3);
-    const lines = new Uint32Array(nTri * 6);
+    // 线框也走同一索引类型（否则索引数翻倍后更容易越界）
+    const L = idxType === R.gl.UNSIGNED_INT ? new Uint32Array(nTri * 6) : new Uint16Array(nTri * 6);
     for (let t = 0; t < nTri; t++) {
       const a = tri[t * 3], b = tri[t * 3 + 1], c = tri[t * 3 + 2];
-      lines[t * 6] = a; lines[t * 6 + 1] = b;
-      lines[t * 6 + 2] = b; lines[t * 6 + 3] = c;
-      lines[t * 6 + 4] = c; lines[t * 6 + 5] = a;
+      L[t * 6] = a; L[t * 6 + 1] = b;
+      L[t * 6 + 2] = b; L[t * 6 + 3] = c;
+      L[t * 6 + 4] = c; L[t * 6 + 5] = a;
     }
     lineIbuf = gl.createBuffer();
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, lineIbuf);
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, lines, gl.STATIC_DRAW);
-    lineIndexCount = lines.length;
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, L, gl.STATIC_DRAW);
+    lineIndexCount = L.length;
   }
   // 包围盒 -> 自动取景
   let mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
@@ -505,7 +580,7 @@ function makeMesh(R, model, wireframe) {
   }
   const center = [(mn[0]+mx[0])/2, (mn[1]+mx[1])/2, (mn[2]+mx[2])/2];
   const radius = Math.max(1e-6, 0.5 * Math.hypot(mx[0]-mn[0], mx[1]-mn[1], mx[2]-mn[2]));
-  return { vbuf, cbuf, ubuf, nbuf, ibuf, lineIbuf, indexCount, lineIndexCount,
+  return { vbuf, cbuf, ubuf, nbuf, ibuf, lineIbuf, indexCount, lineIndexCount, idxType,
            count: model.position.length / 3, mode: model.mode,
            center, radius, wireframe,
            useCol: !!model.color, useUV: !!model.uv, useNrm: !!model.normal,
@@ -629,10 +704,12 @@ window.GsViewer = (function () {
       //   WebGL 会报 INVALID_OPERATION 并且**整帧什么都不画**（表现为全黑），
       //   而不是画错。现在改为在载入时预生成 (3*面数) 条边的 LINES 索引。
       gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, obj.lineIbuf);
-      gl.drawElements(gl.LINES, obj.lineIndexCount, gl.UNSIGNED_INT, 0);
+      gl.drawElements(gl.LINES, obj.lineIndexCount, obj.idxType, 0);
     } else if (obj.ibuf) {
       gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, obj.ibuf);
-      gl.drawElements(gl.TRIANGLES, obj.indexCount, gl.UNSIGNED_INT, 0);
+      // ⚠️ 索引类型必须是该缓冲**实际使用**的类型（UNSIGNED_INT 需要
+      // `OES_element_index_uint` 扩展，否则报 INVALID_ENUM 且整帧不画 —— 见 createRenderer）
+      gl.drawElements(gl.TRIANGLES, obj.indexCount, obj.idxType, 0);
     } else {
       gl.drawArrays(gl.TRIANGLES, 0, obj.count);
     }
@@ -720,9 +797,59 @@ window.GsViewer = (function () {
     },
     toggleWire() { wire = !wire; draw(); return wire; },
 
+    /**
+     * 诊断接口：返回查看器的实际运行状态。
+     *
+     * 为什么需要：浏览器里"全黑"看不到任何线索（异常、GL 状态、矩阵都在内部）。
+     * 在控制台执行 `GsViewer.debug()` 就能拿到决定性数据：
+     *   - GL 上下文是否创建成功、着色器/程序是否有效
+     *   - 每个 uniform / attribute 的 location（**-1 表示 GLSL 里没被用到或名字不匹配**，
+     *     这会导致该 attribute 完全不生效）
+     *   - 画布尺寸（0 就会黑屏）、视口、相机取景
+     *   - 顶点/索引数量、是否有颜色/法线
+     */
+    debug() {
+      const out = { ok: !!(R && canvas), obj: null, gl: null, prog: null,
+                    uniforms: {}, attribs: {}, canvas: null, camera: null };
+      if (!R || !canvas) return out;
+      const { gl } = R;
+      out.gl = {
+        contextLost: typeof gl.isContextLost === 'function' ? gl.isContextLost() : null,
+        vendor: gl.getParameter(gl.VENDOR),
+        renderer: gl.getParameter(gl.RENDERER),
+        version: gl.getParameter(gl.VERSION),
+        glError: gl.getError(),
+      };
+      out.prog = {
+        valid: gl.getProgramParameter(R.prog, gl.VALIDATE_STATUS),
+        linked: gl.getProgramParameter(R.prog, gl.LINK_STATUS),
+      };
+      Object.keys(R.U).forEach((k) => { out.uniforms[k] = R.U[k] ? 'ok' : 'NULL'; });
+      Object.keys(R.A).forEach((k) => { out.attribs[k] = R.A[k]; });
+      out.canvas = {
+        client: [canvas.clientWidth, canvas.clientHeight],
+        buffer: [canvas.width, canvas.height],
+        css: [getComputedStyle(canvas).width, getComputedStyle(canvas).height],
+        display: getComputedStyle(canvas).display,
+        visibility: getComputedStyle(canvas).visibility,
+      };
+      if (obj) {
+        out.obj = {
+          mode: obj.mode, count: obj.count, indexCount: obj.indexCount,
+          useCol: obj.useCol, useNrm: obj.useNrm, useUV: obj.useUV,
+          hasTexture: !!obj.texture,
+          center: obj.center, radius: obj.radius,
+          buffers: { vbuf: !!obj.vbuf, cbuf: !!obj.cbuf, nbuf: !!obj.nbuf,
+                     ibuf: !!obj.ibuf, lineIbuf: !!obj.lineIbuf },
+        };
+      }
+      out.camera = { yaw, pitch, dist, target, wire,
+                     pitchLimit: PITCH_LIMIT };
+      return out;
+    },
+
     /** 清空当前模型（"清空视图"按钮用） */
-    clear() {
-      if (obj && R) {
+    clear() {      if (obj && R) {
         const { gl } = R;
         [obj.vbuf, obj.cbuf, obj.ubuf, obj.nbuf, obj.ibuf, obj.lineIbuf]
           .forEach((b) => { if (b) gl.deleteBuffer(b); });
