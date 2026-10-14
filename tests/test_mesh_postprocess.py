@@ -197,3 +197,55 @@ def test_multiview_consistency_keeps_everything_without_voxel() -> None:
     pts = np.zeros((10, 3))
     out, _, _, st = filter_by_multiview_consistency(pts, voxel=0.0, min_views=2)
     assert len(out) == 10 and st["points_out"] == 10
+
+
+def test_multiview_normals_are_averaged_not_left_raw() -> None:
+    """同一体素内的法线应被**平均**后输出，而不是保留各自的原始噪声法线。
+
+    为什么重要：原来的实现虽然算了体素平均法线，但**只用于投票、从不输出** ——
+    保留下来的仍是各视角的逐点原始法线（含深度噪声），于是噪声照旧传给泊松，
+    表现为"表面碎/毛刺"。社区做法（2DGS / Gaussian Opacity Fields）是取平均。
+    """
+    from gsflow.gsdata.mesh_export import filter_by_multiview_consistency
+
+    # 同一体素内 4 个点，来自 4 个视角，法线在 (0,0,1) 附近抖动
+    pts = np.array([[0.0, 0.0, 0.0]] * 4)
+    nrm = np.array([[0.10, 0.00, 0.99],
+                    [-0.10, 0.00, 0.99],
+                    [0.00, 0.10, 0.99],
+                    [0.00, -0.10, 0.99]])
+    vid = np.array([0, 1, 2, 3])
+    out, out_n, _, st = filter_by_multiview_consistency(
+        pts, nrm, None, view_id=vid, voxel=1.0, min_views=2)
+    assert st["points_out"] == 4
+    # 全都被替换为同一个平均法线（x/y 抖动被抹平）
+    assert np.allclose(out_n, out_n[0]), "同一体素内的法线未被平均"
+    assert abs(out_n[0][0]) < 1e-9 and abs(out_n[0][1]) < 1e-9, \
+        f"平均后 x/y 应为 0，实际 {out_n[0]}"
+    assert out_n[0][2] > 0.98, f"平均法线应保持单位朝向 +z，实际 {out_n[0]}"
+
+
+def test_multiview_normal_sign_is_disambiguated() -> None:
+    """法线**符号**必须消歧后再平均。
+
+    法线的正负号本身是任意的（n 与 -n 描述同一平面）。若直接相加，
+    两个相反符号的法线会互相抵消得到接近零的向量 —— 这正是历史上
+    "法线翻转 ~35%" 的成因，必须先把符号对齐到体素平均值再平均。
+    """
+    from gsflow.gsdata.mesh_export import filter_by_multiview_consistency
+
+    pts = np.array([[0.0, 0.0, 0.0]] * 4)
+    # 3 个朝 +z，1 个朝 -z（符号相反，但描述同一平面朝向）
+    nrm = np.array([[0.0, 0.0, 1.0],
+                    [0.0, 0.0, 1.0],
+                    [0.0, 0.0, 1.0],
+                    [0.0, 0.0, -1.0]])
+    vid = np.array([0, 1, 2, 3])
+    # normal_dot_min 放宽，确保这一项不是靠"删点"通过的
+    out, out_n, _, st = filter_by_multiview_consistency(
+        pts, nrm, None, view_id=vid, voxel=1.0, min_views=2, normal_dot_min=-1.0)
+    assert st["points_out"] == 4, "不应删点（本测试只验证平均的符号消歧）"
+    L = float(np.linalg.norm(out_n[0]))
+    assert L > 0.9, f"平均法线长度仅 {L:.3f} —— 相反符号被抵消了（未做消歧）"
+    # 多数派是 +z，故结果应为 +z
+    assert out_n[0][2] > 0.9, f"平均法线方向应为 +z，实际 {out_n[0]}"

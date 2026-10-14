@@ -410,6 +410,38 @@ def filter_by_multiview_consistency(points, normals=None, colors=None,
         keep = keep & ok_n
 
     out_pts = pts[keep]
+    out_nrm = (nrm[keep] if nrm is not None else None)
+
+    # ---- 多视角法线**平均**（社区标准做法：2DGS / Gaussian Opacity Fields 系）----
+    #
+    # 为什么必须做：上面虽然算了体素平均法线，但**只用于投票，从不输出** ——
+    # 保留下来的仍是每个视角各自的**逐点原始法线**（含深度噪声）。
+    # 同一个表面被相邻视角各投一份点，两份法线方向略有差异；体素下采样只是
+    # 把它们混在一起，噪声照旧传递到泊松，表现为**表面碎/毛刺**。
+    #
+    # 做法：把同一体素内**一致**的法线取平均，用平均法线替换该体素内所有点。
+    # 关键细节是**符号消歧**：法线的正负号本身是任意的（n 与 -n 表示同一平面），
+    # 直接相加会让相反的符号互相抵消、得到接近零的法线 —— 这正是历史上
+    # "法线翻转 ~35%" 的成因。因此先与体素平均值对齐符号，再平均。
+    if nrm is not None and len(out_pts):
+        inv_k = inv[keep]
+        nk = np.array(out_nrm, dtype=np.float64, copy=True)
+        # 先做一次不带符号的平均，用来判断"多数派朝向"（消歧基准）。
+        # ⚠️ 不能复用上面的 `dot`：那个变量只在 normal_dot_min > -1.0 时才被赋值，
+        #    在这里引用会 UnboundLocalError（实测踩到）。
+        acc0 = np.zeros((len(counts), 3), dtype=np.float64)
+        np.add.at(acc0, inv_k, nk)
+        ref = acc0[inv_k]
+        # 与多数派反向的点先把符号翻过来，再加入平均
+        flip = (nk * ref).sum(1) < 0
+        if flip.any():
+            nk[flip] = -nk[flip]
+        acc2 = np.zeros((len(counts), 3), dtype=np.float64)
+        np.add.at(acc2, inv_k, nk)
+        cnt2 = np.bincount(inv_k, minlength=len(counts)).astype(np.float64)
+        mean2 = acc2 / np.maximum(cnt2, 1.0)[:, None]
+        out_nrm = mean2[inv_k]
+
     out_stats = {
         "points_in": n,
         "points_out": int(keep.sum()),
@@ -421,7 +453,7 @@ def filter_by_multiview_consistency(points, normals=None, colors=None,
         "views_total": int(len(np.unique(vid))),
     }
     return (out_pts,
-            (nrm[keep] if nrm is not None else None),
+            out_nrm,
             (col[keep] if col is not None else None),
             out_stats)
 
