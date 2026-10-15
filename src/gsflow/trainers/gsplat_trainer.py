@@ -1010,6 +1010,22 @@ def train(cfg: TrainConfig, ctx) -> dict:
             render = render + background * (1 - alphas[0])
 
         l1 = (render - gt).abs()
+        # ---- 掩码处理：**合成背景后在全图上算损失**（本轮的重要算法修正）----
+        #
+        # 原实现是 `l1 = l1[m].mean()`（只在掩码内取均值），有两个真实后果：
+        #   1) **loss 量级随前景占比变化**：实测各视角前景占比 12%~55%，
+        #      同样的像素误差下 loss 量级相差 4.6 倍，前景小的视角被系统性欠训练；
+        #   2) **更严重：掩码外完全没有监督** ⇒ 模型可以在背景区域任意生成高斯
+        #      （渲染成什么都不受惩罚），于是渲染内容远超真实范围。
+        #      实测证据：`preview_*.png` 里渲染/真值的内容高度比达 **2.31 倍**
+        #      （渲染把牌坊画满整幅、真值只有顶部）——
+        #      这正是"该空洞的地方出现破碎网格"的来源。
+        #
+        # 正确做法（3DGS / gsplat 官方示例同源）：把 GT 在**掩码外合成为已知背景色**，
+        # 损失仍在**全图**上计算。于是：
+        #   * 前景：照常监督真实像素；
+        #   * 背景：监督"必须渲染成背景色"⇒ 抑制背景里的游离高斯；
+        #   * 每个视角的 loss 尺度一致（不再随前景占比漂移）。
         if masks and step < int(cfg.iterations * cfg.mask_loss_until):
             m = masks[idx]
             if max_side and m.shape[0] != gt.shape[0]:
@@ -1018,12 +1034,10 @@ def train(cfg: TrainConfig, ctx) -> dict:
                 )[0, 0] > 0.5
             else:
                 m = m.to(device)
-            if m.any():
-                l1 = l1[m].mean() if l1[m].numel() else l1.mean()
-            else:
-                l1 = l1.mean()
-        else:
-            l1 = l1.mean()
+            if m.any() and not bool(m.all()):
+                # m: [H,W] bool；把背景像素替换成 background 色
+                gt = torch.where(m[..., None], gt, background.to(gt.dtype))
+        l1 = l1.mean()
 
         ssim_val = ssim_simple(render.permute(2, 0, 1)[None], gt.permute(2, 0, 1)[None])
         loss = (1.0 - cfg.ssim_weight) * l1 + cfg.ssim_weight * (1.0 - ssim_val)

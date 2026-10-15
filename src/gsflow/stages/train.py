@@ -79,8 +79,20 @@ class TrainStage(Stage):
         n_undist = 0
         if have_imgs:
             n_undist = sum(1 for p in (data_dir / "images").iterdir() if p.is_file())
-        data_ready = have_cam and have_imgs and n_undist > 0 and (
-            registered == 0 or n_undist >= registered)
+        # ⚠️ `registered == 0`（没有 COLMAP 模型可比对）时**不能**无条件认为数据可用。
+        # 原写法 `registered == 0 or n_undist >= registered` 会在没有模型时直接放行，
+        # 于是**任何残留的旧 04_train/data 都会被静默复用** —— 哪怕它只有 31 张图，
+        # 而当前数据集有 202 张。后果是跑出一个完全不可比的"实验"（本人在做
+        # `densify_until` 对照时就踩了：31 张 vs 202 张，结论全废）。
+        # 现在的规则：没有模型可比对时，记录数量并**明确警告**；有模型时数量不足则重生成。
+        if registered == 0:
+            if n_undist > 0:
+                ctx.warn(f"复用已有的去畸变数据（{n_undist} 张），但当前没有 COLMAP 模型可比对 —— "
+                         f"若这个数量与预期数据集不符（例如应为 200+ 张），说明复用了残留数据，"
+                         f"请换新 job-id 或删除 04_train/data 后重跑。")
+            data_ready = have_cam and have_imgs and n_undist > 0
+        else:
+            data_ready = have_cam and have_imgs and n_undist > 0 and n_undist >= registered
 
         if not data_ready:
             if have_imgs and n_undist:
