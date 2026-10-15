@@ -121,7 +121,18 @@
         </div>
         <p class="hint">8GB 显存建议：150~250 张图 / 长边 1400~1600 / 迭代 15000~30000。
           实测：<b>densify_until=4000</b> 比官方默认 15000 更省（高斯少 68%）
-          且不会过训练退化；<b>mask_loss_until=1.0</b>（全程掩码约束）能让模型轮廓更干净、网格更准。</p>
+          且不会过训练退化。注意 <b>resolution 只会缩小、不会放大</b>：
+          若素材原生长边小于该值，会按原生尺寸训练（放大不增加信息、只会更慢）。</p>
+        <details class="adv">
+          <summary>高级参数（任意配置项，每行 <code>段.键=值</code>）</summary>
+          <p class="hint">界面上没有控件的配置项都可以在这里设置，例如：
+            <code>train.ssim_weight=0.2</code>、<code>train.eval_interval=2000</code>、
+            <code>train.white_background=false</code>、<code>train.pause_refine_after_reset=0</code>、
+            <code>export.mesh_normal_transfer_voxels=9</code>。
+            <code>#</code> 开头为注释；这里填的键会<b>覆盖</b>上面的同名控件。</p>
+          <textarea id="p-advanced" rows="5" spellcheck="false"
+            placeholder="train.ssim_weight=0.2&#10;# train.eval_interval=2000"></textarea>
+        </details>
       </div>
 
       <div class="card">

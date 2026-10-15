@@ -66,6 +66,35 @@ async function loadStages() {
 const checkedStages = () => Array.from(document.querySelectorAll('#stage-list input:checked')).map((i) => i.dataset.stage);
 
 /* --------------------------------------------------------------- 参数收集 */
+/**
+ * 解析「高级参数」文本框：每行 `段.键=值`（`#` 开头为注释）。
+ *
+ * 为什么要这个：GUI 的参数控件是**手工 HTML**（22 个），所以任何没写控件的配置键
+ * 在界面上都改不到 —— 实测有 **9 个**已实现且有用的训练旋钮属于这种
+ * （`ssim_weight` / `eval_interval` / `white_background` / `pause_refine_after_reset`
+ *  / `min_imgs_for_holdout` / `eval_quick_views` / `log_every` / `flip_camera` /
+ *  `reset_opacity`）。用户明确提过"参数同步"的问题。
+ * 有了这个框，**任何**配置键都能从界面设置，而且以后新增参数不必再改前端。
+ */
+function parseAdvancedParams(text) {
+  const out = {};
+  const bad = [];
+  String(text || '').split(/\r?\n/).forEach((raw) => {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) return;
+    const i = line.indexOf('=');
+    if (i <= 0) { bad.push(line); return; }
+    const k = line.slice(0, i).trim();
+    const v = line.slice(i + 1).trim();
+    if (!k.includes('.')) { bad.push(line); return; }
+    out[k] = v;
+  });
+  if (bad.length) {
+    console.warn('[参数] 以下行格式不对（应为 段.键=值）：', bad);
+  }
+  return out;
+}
+
 function collectParams() {
   const p = {};
   const put = (k, v) => { if (v !== '' && v !== null && v !== undefined) p[k] = v; };
@@ -93,6 +122,9 @@ function collectParams() {
   put('export.mesh_density_quantile', $('p-mesh-densq').value);
   put('export.mesh_texture', $('p-mesh-texture').value);
   put('export.mesh_texture_size', $('p-mesh-texsize').value);
+  // 高级参数：覆盖上面的同名键（放在最后 ⇒ 以用户显式输入为准）
+  const adv = $('p-advanced') ? parseAdvancedParams($('p-advanced').value) : {};
+  Object.assign(p, adv);
   return p;
 }
 
@@ -420,6 +452,7 @@ $('btn-reset-config').onclick = async () => { await api('/api/config/reset', { m
   'p-train-res', 'p-train-cap', 'p-train-densify', 'p-train-maskloss',
   'p-export-formats', 'p-mesh-method', 'p-mesh-depth', 'p-mesh-tris', 'p-mesh-smooth',
   'p-mesh-width', 'p-mesh-views', 'p-mesh-densq', 'p-mesh-texture', 'p-mesh-texsize',
+  'p-advanced',
 ].forEach((id) => { const el = $(id); if (el) el.addEventListener('input', updateCliPreview); });
 
 /* ------------------------------------------------------ 模型查看（独立功能页） */

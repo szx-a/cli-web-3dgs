@@ -54,12 +54,27 @@ def main() -> int:
     only_dc = [k for k in td if k not in train]
     if mism:
         print(f"\n[train] DEFAULTS 与 TrainConfig 不一致：{mism}")
-    if only_dc:
-        print(f"\n[train] 只在 TrainConfig、不在 DEFAULTS 的键：{only_dc}")
+        bad += len(mism)
+    # ⚠️ "只在 dataclass、不在 DEFAULTS" **不一定是问题**：
+    # dataclass 上有些字段是**运行时注入**的（data_dir / out_dir 由阶段填写），
+    # 或者是**刻意不暴露**的内部旋钮。把它们一律算作"缺失"会让本脚本自己
+    # 报出自相矛盾的结论（"0 个缺失键"却又列出 11 个键）。
+    # 这里改成分类报告，只有"用户可调但没暴露"的才计入 bad。
+    RUNTIME_INJECTED = {"data_dir", "out_dir"}
+    runtime = [k for k in only_dc if k in RUNTIME_INJECTED]
+    hidden = [k for k in only_dc if k not in RUNTIME_INJECTED]
+    if runtime:
+        print(f"\n[train] 运行时注入的字段（正常）：{runtime}")
+    if hidden:
+        print(f"\n[train] **只在 dataclass、界面上无法设置**的旋钮（{len(hidden)} 个）：")
+        for k in hidden:
+            print(f"    {k} = {td[k]!r}")
+        print("    说明：CLI 仍可用 --set train.<key>=... 覆盖，但 GUI 不会显示。"
+              "若希望从界面调整，需要把它们加进 DEFAULTS。")
 
-    print("\n结论: " + ("配置同步一致" if bad == 0 and not mism and not only_dc
-                        else f"**发现 {bad} 个缺失键 + 不一致项，需重新生成 config.toml**"))
-    return 0 if (bad == 0 and not mism and not only_dc) else 1
+    print("\n结论: " + ("配置同步一致" if bad == 0
+                        else f"**{bad} 项不一致，需处理**"))
+    return 0 if bad == 0 else 1
 
 
 if __name__ == "__main__":

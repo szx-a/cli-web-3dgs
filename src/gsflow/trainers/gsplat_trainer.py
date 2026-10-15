@@ -158,6 +158,13 @@ class TrainConfig:
     eval_quick_views: int = 3
     white_background: bool = False
     mask_loss_until: float = 1.0
+    # 掩码损失口径：
+    #   "composite"（默认）—— 把 GT 在掩码外合成为背景色，损失在**全图**上计算。
+    #      前景监督真实像素、背景监督"必须渲染成背景色"、各视角 loss 尺度一致。
+    #      （与 3DGS / gsplat 官方示例同源。修复了"掩码外无监督 ⇒ 渲染糊出去/破碎"。）
+    #   "inside" —— 旧行为：只在掩码内取均值。loss 量级随前景占比漂移（12%~55% ⇒ 4.6 倍），
+    #      且掩码外完全无监督。保留仅供复现旧结果与受控对照。
+    mask_loss_mode: str = "composite"
     # ---- 正则项（参考 Faster-GS / 3DGS-MCMC；默认 0 = 不启用，保持既有行为不变）----
     # 开启后能显著压制"半透明浮点"（表现为点云/网格周围的雾状杂点）。
     # 3DGS-MCMC 论文与 Faster-GS 都用 0.01（两者同时开）。
@@ -659,10 +666,21 @@ def train(cfg: TrainConfig, ctx) -> dict:
     ctx.info(f"已注册视图 {len(names)} 个，稀疏点 {len(data['points'])}")
 
     # 分辨率：按长边缩放到 cfg.resolution
+    #
+    # ⚠️ `resolution` 的语义是"长边**缩放**到该值"，**放大也照做** ——
+    # 而默认 `resolution=1600` 在 720px 的素材上会把图**放大 2.2 倍**：
+    # 既不增加任何信息，又让训练更慢、显存更紧张。
+    # 实测本项目 IMG2 素材原图 720×720（去畸变后 721×721），我却一直用 900 ~ 1600 训练。
+    # 这里以**数据集原生长边**为上限：只缩小、不放大。
+    native = max(int(data["widths"][0]), int(data["heights"][0]))
     max_side = cfg.resolution if cfg.resolution > 0 else None
+    if max_side and native and max_side > native:
+        ctx.info(f"分辨率上限下调：请求 {max_side} > 原生长边 {native}，"
+                 f"按原生 {native} 训练（避免无意义的放大）")
+        max_side = native
     imgs, masks = _load_images(cfg.data_dir, names, max_side)
     h, w = imgs[0].shape[:2]
-    ctx.info(f"训练分辨率：{w}x{h}，共 {len(imgs)} 张")
+    ctx.info(f"训练分辨率：{w}x{h}（原生长边 {native}），共 {len(imgs)} 张")
 
     # 相机：按最终图像尺寸重算 K
     ks = torch.from_numpy(data["ks"]).float()
@@ -1034,8 +1052,12 @@ def train(cfg: TrainConfig, ctx) -> dict:
                 )[0, 0] > 0.5
             else:
                 m = m.to(device)
-            if m.any() and not bool(m.all()):
-                # m: [H,W] bool；把背景像素替换成 background 色
+            if str(cfg.mask_loss_mode).lower() == "inside":
+                # 旧行为（仅用于对照/复现）：只在掩码内取均值
+                if m.any():
+                    l1 = l1[m].mean() if l1[m].numel() else l1.mean()
+            elif m.any() and not bool(m.all()):
+                # 默认：掩码外合成背景色，损失在全图上算
                 gt = torch.where(m[..., None], gt, background.to(gt.dtype))
         l1 = l1.mean()
 
