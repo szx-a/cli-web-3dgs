@@ -1,117 +1,156 @@
-"""生成项目文件树（Markdown），便于梳理工程结构。
+"""生成文件树文档（`docs/04-文件树.md`），可重复运行、不手工维护。
 
-用法：
-    env\\venv\\Scripts\\python.exe scripts\\make_tree.py                 # 打印到屏幕
-    env\\venv\\Scripts\\python.exe scripts\\make_tree.py --out docs\\04-文件树.md
+要点：
+* 只列**有意义的**内容：跳过 `.git` / `__pycache__` / `env`（虚拟环境）/
+  `workspace` 里成千上万的产物，但把它们的**规模与用途**用一行说明，避免"看不出体量"。
+* Python 文件带**行数**，便于判断模块分量。
+* 结尾附**架构红线**与模块职责，让文件树能当索引用。
+
+用法: python scripts/make_tree.py [--out docs/04-文件树.md]
 """
-
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# 这些目录不入树（体积大 / 运行期产物），但会在末尾单独说明
-SKIP_DIRS = {
-    ".git", "__pycache__", ".pytest_cache", ".mypy_cache",
-    "env", "downloads", "workspace", "models", "logs", "tools",
-    # 用户素材目录：内容是多视角视频/图片，不属于源码结构
-    "data",
-    # 打包元数据（pip install -e 失败时留下的中间产物）
-    "gsflow.egg-info",
+# 目录 -> 是否递归展开、说明
+DIR_NOTES = {
+    "src/gsflow": "流程核心（不依赖 UI）",
+    "src/gsflow/pipeline": "编排：阶段注册、上下文、事件、作业状态",
+    "src/gsflow/stages": "六个阶段：frames/mask/colmap/train/export/metrics",
+    "src/gsflow/trainers": "训练后端（gsplat 默认）",
+    "src/gsflow/gsdata": "数据 IO 与几何（COLMAP 读写、网格提取）",
+    "src/gsflow/segment": "可插拔分割后端",
+    "src/gsflow/tools": "外部工具适配（COLMAP/FFmpeg 定位与调用）",
+    "src/gsflow/web": "FastAPI Web GUI（+ static 前端）",
+    "src/gsflow/web/static": "前端（无构建步骤的纯 JS/CSS）",
+    "scripts": "运维/诊断/实验脚本（不参与产品运行）",
+    "tests": "pytest 回归",
+    "docs": "文档",
+    "config": "config.toml（写配置即改行为）",
+    "data": "输入素材（视频）",
+    "tools": "第三方可执行（COLMAP / FFmpeg），已解压免安装",
+    "models": "模型权重（分割后端等）",
+    "env": "Python 虚拟环境与临时目录（不入库）",
+    "workspace": "每个作业一个目录：01..05 阶段产物 + logs",
+    "downloads": "下载缓存",
+    "logs": "运行日志",
 }
-SKIP_EXT = {".pyc", ".pyo", ".part", ".lnk"}
-
-# 每个顶层目录/文件的一句话说明
-NOTES = {
-    "AGENTS.md": "给 AI 协作者的既定事实与红线（必读）",
-    "README.md": "项目总览、快速开始、目录说明",
-    "pyproject.toml": "包元数据与可选依赖（train / segment / dev）",
-    "requirements.txt": "核心运行依赖",
-    "requirements-gpu.txt": "GPU 与分割后端的可选依赖（torch cu128 等）",
-    ".gitignore": "忽略运行期产物与凭据",
-    "config": "配置与凭据（credentials.json 不入库）",
-    "docs": "环境核查 / 架构 / 操作手册 / 踩坑记录 / 文件树",
-    "scripts": "环境搭建、工具下载、验证脚本、启动器",
-    "src": "流程核心源码（gsflow 包）",
-    "tests": "pytest 测试（适配本机沙箱的临时目录方案）",
-    "tools": "自带的 colmap / ffmpeg / 便携 CUDA（体积大，不入树）",
-    "workspace": "每个作业一个子目录：01_images_raw … 06_reports",
-}
+SKIP_NAMES = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+              "node_modules", ".ipynb_checkpoints"}
+# 这些目录只统计、不展开（体量太大或内容无信息量）
+COLLAPSE = {"env", "workspace", "downloads", "logs", "models", "tools/ffmpeg", "tools/colmap"}
 
 
-def render(root: Path) -> str:
-    lines: list[str] = []
+def py_lines(p: Path) -> int:
+    try:
+        return len(p.read_text(encoding="utf-8", errors="replace").splitlines())
+    except OSError:
+        return 0
 
-    def walk(d: Path, prefix: str = "") -> None:
-        entries = sorted(
-            (p for p in d.iterdir() if p.name not in SKIP_DIRS and p.suffix not in SKIP_EXT),
-            key=lambda p: (p.is_file(), p.name.lower()),
-        )
-        for i, p in enumerate(entries):
-            last = i == len(entries) - 1
-            branch = "└── " if last else "├── "
-            note = ""
-            if prefix == "" and p.name in NOTES:
-                note = f"   # {NOTES[p.name]}"
-            elif p.name == "__init__.py":
-                note = "   # 包导出"
-            lines.append(f"{prefix}{branch}{p.name}{'/' if p.is_dir() else ''}{note}")
-            if p.is_dir():
-                walk(p, prefix + ("    " if last else "│   "))
 
-    lines.append(f"{root.name}/")
-    walk(root)
-    return "\n".join(lines)
+def dir_size(p: Path) -> tuple[int, int]:
+    files = dirs = 0
+    try:
+        for x in p.rglob("*"):
+            if any(s in x.parts for s in SKIP_NAMES):
+                continue
+            if x.is_file():
+                files += 1
+            elif x.is_dir():
+                dirs += 1
+    except OSError:
+        pass
+    return files, dirs
+
+
+def walk(p: Path, prefix: str, rel: str, out: list[str], max_depth: int, depth: int = 0) -> None:
+    if depth > max_depth:
+        return
+    try:
+        items = [x for x in p.iterdir() if x.name not in SKIP_NAMES]
+    except OSError:
+        return
+    items.sort(key=lambda x: (not x.is_dir(), x.name.lower()))
+    for i, x in enumerate(items):
+        last = i == len(items) - 1
+        branch = "└── " if last else "├── "
+        r = f"{rel}/{x.name}" if rel else x.name
+        note = DIR_NOTES.get(r, "")
+        if x.is_dir():
+            collapse = x.name in COLLAPSE or r in COLLAPSE
+            if collapse:
+                f, d = dir_size(x)
+                out.append(f"{prefix}{branch}{x.name}/   "
+                           f"[{f} 文件, {d} 目录]{('  —— ' + note) if note else ''}")
+            else:
+                out.append(f"{prefix}{branch}{x.name}/"
+                           f"{('  —— ' + note) if note else ''}")
+                walk(x, prefix + ("    " if last else "│   "), r, out, max_depth, depth + 1)
+        else:
+            if x.suffix == ".py":
+                out.append(f"{prefix}{branch}{x.name}   ({py_lines(x)} 行)"
+                           f"{('  —— ' + note) if note else ''}")
+            else:
+                kb = x.stat().st_size / 1024
+                size = f"{kb:.1f} KB" if kb < 1024 else f"{kb / 1024:.1f} MB"
+                out.append(f"{prefix}{branch}{x.name}   ({size})"
+                           f"{('  —— ' + note) if note else ''}")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="", help="写入的文件；留空则打印")
+    ap.add_argument("--out", default="docs/04-文件树.md")
+    ap.add_argument("--depth", type=int, default=3)
     args = ap.parse_args()
-    tree = render(ROOT)
 
-    extra = """
-## 未入树的目录（体积大或运行期产物）
+    lines: list[str] = []
+    lines.append("# 04 · 文件树")
+    lines.append("")
+    lines.append("> 本文件由 `python scripts\\make_tree.py` **自动生成**，请勿手工编辑。")
+    lines.append("> Python 文件标注行数；`env/` `workspace/` 等只统计不展开。")
+    lines.append("")
+    lines.append("```text")
+    lines.append("3dgs-and-ai/")
+    body: list[str] = []
+    walk(ROOT, "", "", body, args.depth)
+    lines.extend(body)
+    lines.append("```")
+    lines.append("")
 
-| 目录 | 说明 |
-|---|---|
-| `env/` | 虚拟环境（`venv/`）、缓存、临时目录、便携 CUDA 解包中间产物 |
-| `tools/` | 自带外部工具：`colmap/`（COLMAP 3.12）、`ffmpeg/`（FFmpeg 9.0.2）、`cuda/`（便携 CUDA 12.8，358MB） |
-| `downloads/` | 下载的安装包（COLMAP / FFmpeg / CUDA 3.2GB） |
-| `models/` | 模型权重：FastSAM、rembg 的 ONNX、HF 缓存 |
-| `workspace/` | 每个作业的产物，结构见 `docs/02-操作手册.md` |
-| `logs/` | 全局日志：环境自检报告、CUDA 安装日志、g++ 构建日志 |
+    # 训练包单独一张（最常被查阅）
+    lines.append("## 训练框架（`src/gsflow/trainers/`）")
+    lines.append("")
+    lines.append("```text")
+    lines.append("trainers/")
+    body2: list[str] = []
+    walk(ROOT / "src" / "gsflow" / "trainers", "", "", body2, 2)
+    lines.extend(body2)
+    lines.append("```")
+    lines.append("")
 
-## 作业产物结构（workspace/<job_id>/）
+    # 模块职责（人工维护，改动少）
+    lines.append("## 模块职责")
+    lines.append("")
+    lines.append("| 模块 | 职责 | 关键约束 |")
+    lines.append("|---|---|---|")
+    lines.append("| `pipeline/` | 阶段注册、编排、事件总线、作业状态 | **不依赖 UI**；阶段间只通过磁盘产物 + `job.json` 通信 |")
+    lines.append("| `stages/` | frames → mask → colmap → train → export → metrics | 每个阶段可单独重跑，产物落 `0N_*` 目录 |")
+    lines.append("| `trainers/` | 训练后端（gsplat 默认 / official / external） | 实现 `base.py` 协议即可插拔 |")
+    lines.append("| `gsdata/` | COLMAP 读写、深度反投影、泊松/TSDF 网格提取 | 纯几何，不依赖训练栈 |")
+    lines.append("| `segment/` | 分割后端（rembg/classical/FastSAM/SAM2/SAM3） | 实现 `Segmenter` 协议 |")
+    lines.append("| `web/` | FastAPI + 静态前端 | 与 CLI **共用同一 Orchestrator**（同构红线） |")
+    lines.append("| `cli.py` | 命令行入口 | 与 GUI 等价，GUI 会打印等价 CLI 命令 |")
+    lines.append("")
 
-```
-<job_id>/
-├─ job.json                          参数快照 + 各阶段状态（唯一状态源）
-├─ logs/events.jsonl                 全部事件（CLI 与 GUI 共用）
-├─ logs/colmap.log 等                外部工具的原始输出
-├─ 01_images_raw/                    抽帧或导入后的原始图 + _frames.json
-├─ 02_masks/                         掩码（两种命名）+ _overlay/ 效果图 + manifest.json
-├─ 02_images_clean/                  ★ 清理后的图（COLMAP 的输入）
-├─ 03_colmap/                        database.db / sparse/ / sparse_txt/ / report.json
-├─ 04_train/                         data/（去畸变）+ point_cloud/iteration_N/point_cloud.ply
-├─ 05_export/                        model.glb / model.obj / viewer.html / preview_*.png
-└─ 06_reports/                       report.md + report.json
-```
-"""
-    text = "# gsflow 项目文件树\n\n> 由 `scripts/make_tree.py` 生成，改动目录结构后可重新生成。\n\n```\n" \
-           + tree + "\n```\n" + extra
-
-    if args.out:
-        out = ROOT / args.out
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(text, encoding="utf-8")
-        print(f"已写入 {out}")
-    else:
-        print(tree)
+    out = ROOT / args.out
+    out.write_text("\n".join(lines), encoding="utf-8")
+    print(f"已生成 {out}  ({len(lines)} 行)")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

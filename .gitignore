@@ -32,3 +32,6 @@ venv/
 Thumbs.db
 desktop.ini
 *.pyc
+
+# Windows 快捷方式（误入库过一次）
+*.lnk
