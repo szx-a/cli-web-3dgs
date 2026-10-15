@@ -291,7 +291,14 @@ class ExportStage(Stage):
                 produced.extend(mesh_items)
                 _flush_manifest("网格已就绪")
             except Exception as exc:  # noqa: BLE001
+                # 记录**完整 traceback**：只记 `type: msg` 时，
+                # "array is not broadcastable to correct shape" 这类错误完全无法定位
+                # （本轮因此多绕了一轮）。把最后几帧写进日志，直接看行号。
+                import traceback as _tb
+
                 ctx.warn(f"网格导出失败（不影响其它产物）：{type(exc).__name__}: {exc}")
+                for _line in _tb.format_exc().strip().splitlines()[-6:]:
+                    ctx.warn(f"  {_line}")
                 _flush_manifest(f"网格导出失败：{type(exc).__name__}")
 
         previews = self._render_previews(ctx, gauss, out_dir)
@@ -443,12 +450,30 @@ class ExportStage(Stage):
 
         from ..gsdata.mesh_export import (_scene_extent, auto_crop_bounds, clean_mesh,
                                           filter_by_multiview_consistency,
-                                          poisson_mesh, to_largest_component)
+                                          gaussian_axis_normals, poisson_mesh,
+                                          to_largest_component,
+                                          transfer_normals_from_gaussians)
 
         gauss = self._read_ply(ply, max_points=0)
         n = len(gauss["xyz"])
         method = str(ctx.cfg("mesh_method", "poisson") or "poisson").lower()
         ctx.info(f"网格导出：方法={method}，读取 {n} 个高斯")
+
+        # ---- 高斯自带法线（实验开关，**默认关闭**）----
+        # 动机：高斯法线的**局部**一致度（0.787 / 翻转 0.2%）远好于深度梯度法线（翻转 ~17%）。
+        # ⚠️ 但实测**用它会明显变差**，所以默认不开（`mesh_normals=depth`）：
+        #   poisson 路线基准（深度梯度法线）翻转 43.4%；
+        #   迁移 24% 的高斯法线后 -> 45.4%；迁移 39% -> 45.6%（还试过朝向对齐，无效）。
+        # 原因：高斯的 +z 轴是**该高斯的朝向**，而泊松需要的是**一致定向的切线平面法线**。
+        # 局部一致 ≠ 全局可积；混入 24~39% 不同来源的法线会让泊松的全局解更差。
+        # 因此保留开关供后续研究（例如先做全局定向再迁移），但不作为默认。
+        gauss_nrm = None
+        if str(ctx.cfg("mesh_normals", "depth") or "depth").lower() == "gaussian":
+            try:
+                gauss_nrm = gaussian_axis_normals(np.asarray(gauss["quats"], dtype=np.float64))
+            except Exception as exc:  # noqa: BLE001
+                ctx.warn(f"高斯法线不可用（{type(exc).__name__}: {exc}），退回深度梯度法线")
+                gauss_nrm = None
 
         # 先把网格提取聚焦到"主体"上：COLMAP 会把桌面/背景杂物也重建出来。
         # 泊松对远处杂点比 TSDF 更敏感（会生成巨大的"鼓包"），所以默认裁得更紧。
@@ -623,6 +648,38 @@ class ExportStage(Stage):
 
             bp_pts, bp_cols, bp_nrm = voxel_downsample(bp_pts, bp_cols, bp_nrm, voxel=vds)
             ctx.info(f"③ 体素下采样（{vds:.5f}）后剩 {len(bp_pts)} 个点")
+
+            # ---- 用高斯法线替换深度梯度法线（关键质量改动）----
+            # 深度梯度法线的翻转率在 poisson 路线上实测 43%，是"网格碎/毛刺"的直接来源；
+            # 高斯自带法线只有 0.2%。把每个反投影点关联到最近的高斯并改用它的法线。
+            if gauss_nrm is not None:
+                _gx = np.asarray(gauss["xyz"], dtype=np.float64)
+                # ⚠️ 必须**现算**：`gauss` 会被上面的"网格聚焦"裁剪（实测 166892 -> 163195），
+                # 而在读取时预先算好的法线仍是旧长度，于是下游出现
+                # `ValueError: array is not broadcastable to correct shape`。
+                # （第一次实现就是在读取处算好再传下来，踩了这个坑。）
+                _gn = gaussian_axis_normals(np.asarray(gauss["quats"], dtype=np.float64))
+                # 搜索半径：高斯是**体**、反投影点是**面采样**，点到最近高斯中心的距离
+                # 通常大于一个体素。实测 `voxel*1.75` 只命中 **3.9%** 的点（太严），
+                # 改为可按体素倍数配置，默认 4 倍。
+                _nvox = float(ctx.cfgt("mesh_normal_transfer_voxels", 4.0, float))
+                tr_nrm, tr_stat = transfer_normals_from_gaussians(
+                    bp_pts, _gx, _gn,
+                    voxel=vds,
+                    max_dist=vds * max(1.0, _nvox),
+                    fallback=bp_nrm,
+                    # 朝向必须对齐到既有法线场（深度梯度法线已统一为"朝向相机"）。
+                    # 不做这一步，混入"朝外"的高斯法线会让翻转率从 20% 恶化到 45%。
+                    orient_ref=bp_nrm,
+                )
+                ctx.info(f"③b 法线改用高斯 +z 轴：{tr_stat['transferred']}/{len(bp_pts)} 点"
+                         f"（{tr_stat['transfer_ratio'] * 100:.1f}%），"
+                         f"其余 {tr_stat['dropped']} 点退回深度梯度法线；"
+                         f"最近高斯距离 p50={tr_stat['dist_voxels_p50']:.2f} "
+                         f"p90={tr_stat['dist_voxels_p90']:.2f} "
+                         f"p99={tr_stat['dist_voxels_p99']:.2f} 体素，"
+                         f"半径上限 {tr_stat['max_dist'] / tr_stat['voxel']:.2f} 体素")
+                bp_nrm = tr_nrm
 
             mesh, info = poisson_mesh(
                 bp_pts, bp_cols, normals=bp_nrm,

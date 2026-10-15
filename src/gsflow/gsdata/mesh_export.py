@@ -36,6 +36,160 @@ from __future__ import annotations
 import numpy as np
 
 
+def gaussian_axis_normals(quats: np.ndarray, scales: np.ndarray | None = None) -> np.ndarray:
+    """把每个高斯的**旋转后 +z 轴**作为它的表面法线（单位向量）。
+
+    为什么这是本项目**最干净的法线来源**（实测）：
+      * 高斯自带法线：邻域一致度 mean_dot **0.787**、翻转率 **0.2%**；
+      * 深度梯度法线：翻转率约 **17%**（是"网格碎/毛刺"的直接来源，见 docs/03 G62）。
+    两者差两个数量级。而且 `argmin(scales)` 取"最短轴"是**错**的 ——
+    在压平模型上只有 19.2% 的高斯最短轴恰好是 z，其余会取到水平轴（见 docs/03 G65）。
+    压平（`scatter(-1, argmin, cap)`）压的就是**最小**尺度，所以最短轴与 +z 本是同一根，
+    直接取旋转第 3 列既正确又无索引歧义。
+
+    `scales` 参数保留以兼容调用方，当前不使用。
+    """
+    q = np.asarray(quats, dtype=np.float64)
+    if q.ndim != 2 or q.shape[1] != 4:
+        raise ValueError(f"quats 形状应为 [N,4]，实际 {q.shape}")
+    q = q / np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-12)
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    n = np.stack([2 * (x * z + w * y),
+                  2 * (y * z - w * x),
+                  1 - 2 * (x * x + y * y)], axis=1)
+    return n / np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-12)
+
+
+def transfer_normals_from_gaussians(points: np.ndarray, gauss_xyz: np.ndarray,
+                                    gauss_nrm: np.ndarray,
+                                    voxel: float, max_dist: float | None = None,
+                                    fallback: np.ndarray | None = None,
+                                    orient_ref: np.ndarray | None = None):
+    """把每个反投影点关联到**最近的高斯**，并用该高斯的法线替换它的法线。
+
+    为什么需要（本轮发现的真问题）：
+    导出流程里泊松拿到的法线一直是 `backproject_depth_to_points` 算的**深度梯度法线**，
+    实测翻转率 **43%**（`mesh_method=poisson`）。而高斯自带法线只有 **0.2%** ——
+    差两个数量级，却没有被送进泊松。
+
+    ⚠️ **朝向必须与既有法线场一致，否则会更糟**（这是我踩的坑）：
+    高斯法线是"朝外"的，而深度梯度法线在反投影里已被统一成 **`dot(n, P_cam) > 0`（朝向相机）**。
+    两者混在同一个点云里，泊松会收到互相矛盾的方向 —— 实测翻转率**反而升到 45%**
+    （对照：同模型 `mesh_method=2dgs` 是 20%）。
+    所以传入 `orient_ref`（通常就是原来的深度梯度法线），用它的符号约定对齐高斯法线：
+    与参照反向的点先把法线取反。这一步不做，迁移越成功、结果越差。
+
+    做法（体素哈希，O(N)，不用 KDTree —— open3d 的 KDTreeFlann 在百万级重合点上会
+    报 `search_knn_vector_3d() error!` 且不说明原因，本项目踩过）：
+      1. 以 `3×voxel` 为边长给高斯建哈希桶（桶必须比查询尺度大：
+         实测最近高斯距离 p99 = 2.5 体素，±1 桶在 1 倍桶长下只覆盖 ±1 体素，
+         曾导致"只迁移 5.3% 的点"，看起来像半径问题、实际是搜索范围不足）；
+      2. 每桶记平均位置与**平均法线**（先做符号消歧，否则相反符号互相抵消）；
+      3. 每个点查所在桶及相邻 26 桶，取最近桶作为法线来源；
+      4. 超过 `max_dist` 的点用 `fallback`（没有则置零）。
+
+    返回 `(normals, stats)`。
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    gx = np.asarray(gauss_xyz, dtype=np.float64)
+    gn = np.asarray(gauss_nrm, dtype=np.float64)
+    n = len(pts)
+    if n == 0 or len(gx) == 0:
+        return (np.asarray(fallback) if fallback is not None else np.zeros((n, 3))), {
+            "transferred": 0, "dropped": int(n), "transfer_ratio": 0.0}
+
+    # ⚠️ 桶边长取 **3 倍**查询体素，而不是 1 倍。
+    # 原因（实测教训）：搜索只覆盖"点所在桶 ± 1 桶"，若桶边长 = 查询体素，
+    # 覆盖范围就只有 ±1 体素；而真实最近高斯距离实测 p99 = **2.50 体素**，
+    # 于是大头部的近邻**根本没被查到** —— 表现为"只迁移了 5.3% 的点"，
+    # 看起来像"半径太小"，实际是**搜索范围不足**。
+    # 桶放大 3 倍后，±1 桶即覆盖 ±3 体素，能包住 p99 的 2.50。
+    cell = float(voxel) * 3.0
+    keys = np.floor(gx / cell).astype(np.int64)
+    uniq, inv = np.unique(keys, axis=0, return_inverse=True)
+    inv = inv.reshape(-1)
+    ncell = len(uniq)
+
+    # 符号消歧：整体对齐到一个参考方向，避免桶内平均被抵消
+    ref = gn.sum(0)
+    rl = float(np.linalg.norm(ref))
+    if rl > 1e-12:
+        s = np.sign(gn @ (ref / rl))
+        s[s == 0] = 1.0
+        gn = gn * s[:, None]
+
+    acc_p = np.zeros((ncell, 3))
+    acc_n = np.zeros((ncell, 3))
+    cnt = np.zeros(ncell)
+    np.add.at(acc_p, inv, gx)
+    np.add.at(acc_n, inv, gn)
+    np.add.at(cnt, inv, 1.0)
+    cnt = np.maximum(cnt, 1.0)
+    cell_p = acc_p / cnt[:, None]
+    cell_n = acc_n / cnt[:, None]
+    cell_n /= np.maximum(np.linalg.norm(cell_n, axis=1, keepdims=True), 1e-12)
+
+    lut: dict[tuple[int, int, int], int] = {
+        (int(uniq[i, 0]), int(uniq[i, 1]), int(uniq[i, 2])): i for i in range(ncell)}
+
+    out = np.zeros((n, 3))
+    ok = np.zeros(n, dtype=bool)
+    pkeys = np.floor(pts / cell).astype(np.int64)
+    lim = float(max_dist) if max_dist else float(voxel) * 1.75
+    # 记录每个点的最近距离，用于**有依据地**选半径。
+    # 不记录的话只能靠猜：我先用 voxel*1.75 只命中 3.9%、voxel*4 只命中 5.3%，
+    # 却无法判断"是半径太小"还是"这些点本来就没有近邻高斯"。
+    nd = np.full(n, np.inf)
+    for i in range(n):
+        cx, cy, cz = int(pkeys[i, 0]), int(pkeys[i, 1]), int(pkeys[i, 2])
+        best, best_d2 = -1, np.inf
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    j = lut.get((cx + dx, cy + dy, cz + dz))
+                    if j is None:
+                        continue
+                    d2 = float(((cell_p[j] - pts[i]) ** 2).sum())
+                    if d2 < best_d2:
+                        best_d2, best = d2, j
+        if best >= 0:
+            nd[i] = np.sqrt(best_d2)
+        if best >= 0 and best_d2 <= lim * lim:
+            out[i] = cell_n[best]
+            ok[i] = True
+
+    dropped = int((~ok).sum())
+    if dropped and fallback is not None:
+        fb = np.asarray(fallback, dtype=np.float64)
+        if len(fb) == n:
+            out[~ok] = fb[~ok]
+
+    # ---- 朝向对齐（不做这一步会让结果明显变差，见 docstring）----
+    flipped = 0
+    if orient_ref is not None:
+        rf = np.asarray(orient_ref, dtype=np.float64)
+        if rf.shape == out.shape:
+            d = (out * rf).sum(1)
+            need = ok & (d < 0)
+            flipped = int(need.sum())
+            out[need] = -out[need]
+    fin = nd[np.isfinite(nd)]
+    stats = {
+        "transferred": int(ok.sum()),
+        "dropped": dropped,
+        "transfer_ratio": float(ok.mean()) if n else 0.0,
+        "voxel": float(voxel),
+        "max_dist": lim,
+        "gaussians": int(len(gx)),
+        "dist_voxels_p50": float(np.median(fin) / voxel) if len(fin) else float("nan"),
+        "dist_voxels_p90": float(np.percentile(fin, 90) / voxel) if len(fin) else float("nan"),
+        "dist_voxels_p99": float(np.percentile(fin, 99) / voxel) if len(fin) else float("nan"),
+        "no_neighbour": int((~np.isfinite(nd)).sum()),
+        "flipped_for_orientation": flipped,
+    }
+    return out, stats
+
+
 def scale_intrinsics(K: np.ndarray, src_wh: tuple[int, int], dst_wh: tuple[int, int]) -> np.ndarray:
     """把内参从原始分辨率缩放到目标分辨率。
 
