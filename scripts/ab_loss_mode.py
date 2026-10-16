@@ -93,6 +93,19 @@ def main() -> int:
         settings = load_settings(dict(params))
         ctx = StageContext(job_id=job, job_dir=job_dir, settings=settings,
                            events=EventBus(), params=params)
+        # ⚠️ 必须设置 `_stage`：`ctx.cfg("k")` 会先拼成 `train.k` 再查。
+        # 不设置时前缀为空，短键解析路径与生产环境（`stages/train.py`）**不一致**，
+        # 表现为"覆盖看起来传进去了、实际没生效"。
+        # （同类坑已在 run_export_direct.py 踩过一次：导出"成功"但没有网格。）
+        ctx._stage = "train"
+        # 自证：把将要生效的关键参数打出来，避免"静默无效"
+        _probe = {k: ctx.cfg(k, None) for k in
+                  ("lambda_lpips", "lambda_depth_distortion", "opacity_decay",
+                   "utilization_prune_interval", "iterations", "mask_loss_mode",
+                   "ssim_legacy_eps", "lr_schedule", "warmup_iters")}
+        print("  生效参数: " + "  ".join(f"{k}={v}" for k, v in _probe.items()
+                                          if v not in (None, 0, 0.0, "1.0", False)),
+              flush=True)
         res = GsplatBackend().run(ctx, data_dir=data_dir, out_dir=out_dir,
                                   iterations=args.iters)
         out_rows.append((job, mode, res if isinstance(res, dict) else {}))

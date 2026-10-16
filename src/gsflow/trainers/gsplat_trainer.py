@@ -132,6 +132,25 @@ class TrainConfig:
     #   （即把 gsplat 的 DefaultStrategy 完整移植过来）。
     #   在那之前，默认 0（关闭）是更稳的选择。
     opacity_reset_interval: int = 0
+    # ---- 不透明度重置的**替代方案**（用户方案第 5 项）----
+    # 为什么需要替代：官方的周期重置是一次**不连续跳变**（把 logit 不透明度硬钳到
+    # logit(0.01)）。实测后果：所有高斯的梯度突然变大 ⇒ 触发致密化 ⇒
+    # 高斯数 279,534（不重置仅 78,526），并且"最终检查点"会被污染成一片黑。
+    # 下面三个替代都**不做跳变**，因此不引入那一波梯度尖峰。
+    #
+    # 方案 C：梯度感知的不透明度衰减（本实现，最简、最稳）
+    #   每 `opacity_decay_interval` 步把**实际不透明度**乘以 `opacity_decay`，
+    #   让"贡献低"的高斯平滑淡出，而不是周期性地一刀切。
+    #   实现要点：不透明度是 logit 参数化（`data` 是 logit），所以
+    #       σ(x·k) = σ(x)/(σ(x) + k·(1-σ(x)))     （k 为衰减系数）
+    #   是**精确**的乘法衰减在 logit 域的等价形式，不需要先转 sigmoid 再转回来。
+    #   1.0 = 关闭。
+    opacity_decay: float = 1.0
+    opacity_decay_interval: int = 50
+    # 方案 A/B 的实现位置见 `utilization_prune_*`：按"利用率"（梯度贡献）剪枝，
+    # 只剪真正没用的，不动其他高斯。
+    utilization_prune_interval: int = 0
+    utilization_prune_quantile: float = 0.2
     # 重置时压到的目标不透明度；<=0 表示用 prune_opacity*2.0（官方行为）
     reset_opacity: float = 0.0
     # 重置后暂停精修的步数（0=不暂停）。建议设为训练图片数。
@@ -929,6 +948,14 @@ def train(cfg: TrainConfig, ctx) -> dict:
                 group["lr"] = lr
     optimizers = make_optimizers()
     sched = None  # 用 schedule_lrs 手动等价实现，避免替换参数后调度器失效
+    # 利用率统计（方案 B）：累积 |∂L/∂opacity|。关闭时保持 None，不产生任何开销。
+    # 形状随高斯数变化（密度控制会增删高斯），所以每次用前先对齐长度。
+    util_acc = (torch.zeros(int(opac.shape[0]), device=device)
+                if int(getattr(cfg, "utilization_prune_interval", 0) or 0) > 0 else None)
+    # ⚠️ 用**可变容器**承载需要在嵌套函数里改写的状态。
+    # 直接写 `util_acc = ...` 会让它变成 `densify_and_prune` 的**局部变量**
+    # （实测 UnboundLocalError），因为嵌套函数里的赋值总是创建局部名。
+    util_state: dict = {"acc": util_acc}
 
     # ---- 可选：直接复用官方 `gsplat.DefaultStrategy` ----
     # 这是"移植官方机制"的正确形态：整套复用（含 ops.py 的
@@ -1061,6 +1088,16 @@ def train(cfg: TrainConfig, ctx) -> dict:
             if n_prune:
                 _apply_keep(params, optimizers, ~is_prune)
                 refresh_params()
+
+            # ⚠️ 形状同步：密度控制会增删高斯，而 `util_acc` 是在**反向**时按当时的高斯数
+            # 累加的 ⇒ 到这一步长度可能已经不匹配。
+            # 实测：`step 800` 同时是致密化步（500+100k）与利用率剪枝步（400 的倍数），
+            # 打印出"高斯 38541，统计量长度 36889" ⇒ 剪枝被长度守护条件跳过，
+            # 表现为"参数生效了但功能从不执行"。
+            # ⚠️ 形状同步**移到反向之前**（见循环里 `util_state["acc"]` 的同步）。
+            # 曾放在这里：致密化窗口内每 100 步都增删高斯 ⇒ 累加器每步被清零
+            # ⇒ 阈值恒为 0、剪枝永不生效（实测"参数生效了但功能从不执行"）。
+            # 现在只在反向之前按梯度长度重建一次，之后正常累积。
 
             smax = torch.exp(params["scales"].data).max(dim=-1).values
             ctx.info(f"step {step} 密度：阈值={thr:.2e} 克隆 {n_dup} 分裂 {n_split} "
@@ -1297,6 +1334,21 @@ def train(cfg: TrainConfig, ctx) -> dict:
                 grad_norm_cache = means.grad.norm(dim=-1).detach().clone()
                 ctx.warn("未取到 means2d 梯度，密度控制退回 3D 梯度（阈值需另行标定）")
 
+        # 利用率统计（方案 B）：累积 |∂L/∂opacity|。
+        # 语义：一个高斯若长期对渲染颜色没有影响，它的不透明度梯度就长期接近 0
+        # ⇒ 它不"被需要"。与"一刀切重置"的区别是**只删确实无贡献的**。
+        # 注意必须在 zero_grad 之前读，否则拿不到。
+        if util_state["acc"] is not None and opac.grad is not None:
+            with torch.no_grad():
+                g = opac.grad.detach().abs().reshape(-1)
+                # ⚠️ 形状同步必须放在**这里**（反向之后、累加之前）。
+                # 曾放在 `densify_and_prune` 末尾：致密化窗口内每 100 步都增删高斯
+                # ⇒ 累加器每步刚攒起来就被清零 ⇒ 阈值恒为 0 ⇒ 剪枝永不生效
+                # （实测"配置生效了但功能从不执行"）。
+                if util_state["acc"].numel() != g.numel():
+                    util_state["acc"] = torch.zeros_like(g)
+                util_state["acc"] += g
+
         # 探针：确认渲染确实覆盖了像素、且位置参数拿到梯度。
         # 曾经出现 alpha 和 = 0 / means.grad = 0（相机位姿翻转写错，高斯全在相机背后）。
         # 训练"能跑完"不等于"在工作"，这是最省事的健康断言。
@@ -1465,6 +1517,75 @@ def train(cfg: TrainConfig, ctx) -> dict:
                 sh_degree=cfg.sh_degree,
             )
             ctx.info(f"已保存检查点 iteration_{step}")
+
+        # ================= 不透明度重置的替代方案（用户方案第 5 项）=================
+        #
+        # 为什么要替代官方重置：它是一次**不连续跳变**（把 logit 不透明度硬钳到
+        # logit(0.01)）。实测后果是"所有高斯的梯度同时变大" ⇒ 触发致密化 ⇒
+        # 高斯数 279,534（不重置仅 78,526），且"最终检查点"被污染成一片黑。
+        # 下面两个替代都**不做跳变**，因此不引入那波梯度尖峰。
+        # 同样遵守顺序红线：放在"保存 + 评估"之后。
+        if step > 0 and step != cfg.iterations:
+            # 方案 C：梯度感知的不透明度衰减（平滑淡出低贡献高斯）
+            _decay = float(getattr(cfg, "opacity_decay", 1.0) or 1.0)
+            _dint = int(getattr(cfg, "opacity_decay_interval", 50) or 50)
+            if 0.0 < _decay < 1.0 and _dint > 0 and step % _dint == 0:
+                with torch.no_grad():
+                    # 不透明度是 logit 参数化：σ(x·k) = σ(x)/(σ(x)+k(1-σ(x)))
+                    # 这是"实际不透明度乘以 k"在 logit 域的**精确**等价形式，
+                    # 不需要先 sigmoid 再 logit（那会引入数值误差与额外拷贝）。
+                    s = torch.sigmoid(opac.data)
+                    new_s = s / (s + _decay * (1.0 - s)).clamp_min(1e-12)
+                    opac.data.copy_(torch.logit(new_s.clamp(1e-6, 1 - 1e-6)))
+
+            # 方案 A/B：按**利用率**剪枝（只剪真正没用的，不动其他高斯）
+            # 判据用 |∂L/∂opacity| 的累积：一个高斯若长期对渲染颜色没有影响，
+            # 它的不透明度梯度就长期接近 0 ⇒ 它不"被需要"。
+            # 与"随机/一刀切重置"的区别在于：**只删掉确实无贡献的**。
+            _uint = int(getattr(cfg, "utilization_prune_interval", 0) or 0)
+            _acc = util_state["acc"]
+            if _uint > 0 and _acc is not None and step % _uint == 0 and step > _uint:
+                _q = float(getattr(cfg, "utilization_prune_quantile", 0.2) or 0.2)
+                n_now = int(params["means"].shape[0])
+                # ⚠️ 长度对齐：致密化**就在本步之前**可能增删高斯，而累加器是反向时按
+                # 更早的长度算的。实测 `step 800` 出现 "高斯 38961，统计量长度 37278"
+                # ⇒ 若要求严格相等，剪枝会被永久跳过（"参数生效了但功能从不执行"）。
+                # 这里**对齐到较短长度**：前 m 个高斯在本次致密化中未被重排
+                # （`_grow` 是 append 式、`_apply_keep` 用 `torch.where` 保序），
+                # 所以前缀对应关系仍然有效，只对前缀做判定。
+                m = min(n_now, int(_acc.numel()))
+                if m >= 64:
+                    thresh = _quantile(_acc[:m], _q)
+                    keep_m = _acc[:m] > thresh
+                    # 保护：至少留 50%，避免把有效结构剪掉
+                    if int(keep_m.sum()) >= max(16, int(0.5 * m)):
+                        # 只对前缀做判定；致密化**新增**的那部分高斯无法判断
+                        # （它们还没有任何梯度历史），一律保留，避免误删。
+                        if m < n_now:
+                            keep = torch.cat([
+                                keep_m.to(device),
+                                torch.ones(n_now - m, dtype=torch.bool, device=device)])
+                        else:
+                            keep = keep_m.to(device)
+                        _apply_keep(params, optimizers, keep)   # 原地修改，返回 None
+                        # ⚠️ `_apply_keep` 只改 `params` 字典，`train()` 里的
+                        # `means`/`quats`/`scales`/`opac` 等局部变量仍指向**旧**张量。
+                        # 不重新绑定，后面的保存/评估会用错数据（形状甚至可能恰好兼容
+                        # 而不报错）。密度控制路径也是这么做的（见 densify_and_prune）。
+                        refresh_params()
+                        n_after = int(params["means"].shape[0])
+                        ctx.info(f"step {step}：利用率剪枝（阈值 {thresh:.3e}，"
+                                 f"分位 {_q}）{n_now} -> {n_after} 个高斯")
+                        # ⚠️ 形状红线：`grad_norm_cache` 是按**旧**高斯数算出来的，
+                        # 下一轮 densify_and_prune 会按它做布尔运算 ⇒ 不重算就
+                        # `size of tensor a (38861) must match b (29757)`（实测崩溃）。
+                        # 剪枝后最稳妥的做法是**置空**：`grad_norm_cache=None` 会让
+                        # densify 那一轮退回固定阈值，不会用错长度的张量。
+                        grad_norm_cache = None
+                        util_state["acc"] = torch.zeros(n_after, device=device)
+                        _sh_needs_refresh = True
+                elif util_state["acc"].numel() != n_now:
+                    util_state["acc"] = torch.zeros(n_now, device=device)
 
         # ================= 不透明度重置（必须在保存/评估之后）=================
         # ⚠️ 顺序红线（踩过，且会污染所有下游产物）：

@@ -151,6 +151,21 @@ DEFAULTS: dict[str, Any] = {
         # 实测 PLY 的不透明度中位数被压到 0.012（正常应 ~0.5），渲染出一张**近乎全白**的图。
         # 教训见 docs/03 G39：默认值只能有**一处**权威来源。
         "opacity_reset_interval": 0,
+        # ---- 不透明度重置的**替代方案**（用户方案第 5 项）----
+        # 官方周期重置是不连续跳变（硬钳 logit 到 logit(0.01)）⇒ 梯度同时变大
+        # ⇒ 触发致密化失控（实测 279,534 高斯 vs 不重置 78,526），且污染末次检查点。
+        # 下面两个替代都**不做跳变**，所以不引入那波梯度尖峰。
+        #
+        # 方案 C：梯度感知的不透明度衰减 —— 每 opacity_decay_interval 步把**实际**
+        #   不透明度乘以 opacity_decay，让低贡献高斯平滑淡出。
+        #   1.0 = 关闭（默认）；建议 0.999 ~ 0.9999。
+        "opacity_decay": 1.0,
+        "opacity_decay_interval": 50,
+        # 方案 A/B：按**利用率**剪枝 —— 累积 |∂L/∂opacity|，周期性剪掉最低的
+        #   `utilization_prune_quantile` 比例。只删长期无贡献的高斯，
+        #   其余不动（不像重置那样影响全部高斯）。0 = 关闭（默认）。
+        "utilization_prune_interval": 0,
+        "utilization_prune_quantile": 0.2,
         # 掩码内损失生效的迭代占比：1.0 = 全程约束在掩码内。
         # （同样是曾与 trainer 不一致的一项：这里 0.25、trainer 1.0。）
         "mask_loss_until": 1.0,
