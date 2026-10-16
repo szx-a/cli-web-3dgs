@@ -177,6 +177,32 @@ class TrainConfig:
     # 我们默认关闭重置，0.05 会导致不透明度持续塌陷成"薄雾"（见 G43）。
     # Faster-GS / 3DGS-MCMC 用 0.025，这里对齐。
     lr_opacities: float = 0.025
+    # ---- 学习率调度（用户方案第 1、2 项）----
+    # lr_schedule: "cosine"（默认，线性预热 + 余弦退火）| "exp"（旧的纯指数衰减）
+    # warmup_iters: 线性预热的步数。0 = 关闭预热。"前 5%~10% 步数"由调用方决定；
+    #   默认给 0（保持旧行为，便于受控对照），显式打开后才生效 —— 这样
+    #   "加了预热"与"没加预热"可以在**同一份数据**上直接对比。
+    lr_schedule: str = "cosine"
+    warmup_iters: int = 0
+    # 余弦退火的下限（占峰值的比例）。用户方案建议衰减到 1/10 或更低。
+    lr_min_ratio: float = 0.1
+    # 四元数学习率。用户方案建议降到 5e-4，但**受控实测不支持**：
+    # 同数据 20000 迭代下 1e-3 → 24.264 dB，5e-4 → 24.187 dB（反低 0.077）。
+    # 保持 1e-3；若日后换参数化（如压平高斯）应重新验证。
+    lr_quats: float = 1e-3
+    # ---- 感知损失 LPIPS（用户方案第 3 项）----
+    # L1 + SSIM 容易导致渲染偏平滑/纹理发糊；LPIPS 用预训练 VGG 特征约束纹理。
+    # 默认 0（关闭）—— 打开前后必须有**同数据对照**才改默认值。
+    lambda_lpips: float = 0.0
+    # 每 N 步算一次 LPIPS（论文/社区常用做法）：VGG 前向开销与显存都不小。
+    lpips_every: int = 4
+    # ---- 多指标评估（用户方案第 6 项）----
+    # 在 metrics.json 里同时记录 PSNR / SSIM / LPIPS，并额外保存 best_ssim / best_lpips
+    # 的检查点。理由：PSNR 高但 SSIM/LPIPS 差的模型视觉上往往是模糊的，
+    # 不能只用 PSNR 决定"哪个检查点用于导出"。
+    eval_metrics: bool = True
+    # 用哪个指标挑选"最佳检查点"（导出阶段优先使用它）：psnr | ssim | lpips
+    best_metric: str = "psnr"
     # ---- 2DGS 训练侧正则（参考 2D Gaussian Splatting, SIGGRAPH'24）----
     # 为什么需要（本项目的实测动机）：导出网格时我们从深度图反投影取点，
     # 而 3DGS 的"累计深度"是沿射线的**加权平均** —— 一个像素的深度被几十个
@@ -447,6 +473,34 @@ def two_dgs_regularizers(cfg, means, quats, scales, opacities, shs, kk, vm,
             out["normal"] = None
             out["normal_error"] = f"{type(exc).__name__}: {exc}"
     return out
+
+
+def lr_at(step_idx: int, peak: float, min_ratio: float,
+          warmup: int, total: int) -> float:
+    """线性预热 + 余弦退火的学习率（**模块级**，便于用解析值直接单测）。
+
+    为什么预热：Adam 早期只用很少的样本估计二阶矩，**初期步长极不稳定**；
+    四元数（旋转流形）与尺度（对数域）对步长尤其敏感，前几百步的震荡会把点云
+    "甩"到坏区域，之后很难回来。前 5%~10% 线性升温能显著稳定早期训练。
+    为什么余弦而非指数：余弦**中段衰减慢、末段加速**，契合"先探索、后固化精细结构"。
+
+    取值（可手算，测试就按这些端点断言）：
+        warmup=W, total=T, peak=P, min_ratio=r
+        step 0       -> P/W            （预热第一步，非 0）
+        step W-1     -> P              （预热末步到峰值）
+        step W       -> P              （预热结束仍为峰值）
+        step (W+T)/2 -> (P + P·r)/2    （余弦中点）
+        step T-1     -> ≈ P·r          （退火到下限）
+
+    ⚠️ 不能用 `torch.optim.lr_scheduler.CosineAnnealingLR`：密度控制会**替换参数对象**
+    并迁移优化器状态，调度器持有的引用会失效（本项目在 ExponentialLR 上已踩过，03/G31）。
+    """
+    min_lr = peak * float(min_ratio)
+    if warmup > 0 and step_idx < warmup:
+        return peak * (step_idx + 1) / warmup
+    prog = (step_idx - warmup) / max(total - warmup, 1)
+    prog = min(max(prog, 0.0), 1.0)
+    return min_lr + 0.5 * (peak - min_lr) * (1.0 + math.cos(math.pi * prog))
 
 
 def _quantile(values, q: float) -> float:
@@ -792,10 +846,27 @@ def train(cfg: TrainConfig, ctx) -> dict:
     # 最终 >0.02 的高斯只剩 0.2%。
     # Faster-GS 与 3DGS-MCMC 都用 0.025（见其 Trainer.py 的 LEARNING_RATE_OPACITIES），
     # 这里对齐。
-    _LR = {"means": 1.6e-4, "scales": 5e-3, "quats": 1e-3,
+    _LR = {"means": 1.6e-4, "scales": 5e-3,
+           # 四元数学习率：原为 1e-3。按用户方案降到 5e-4 ——
+           # Adam 的每步更新量约等于 lr（因为它按二阶矩归一化），而旋转是**流形**参数，
+           # 1e-3 偏大：椭球会在空间里反复乱转，连带让法线/朝向类统计量一直抖，
+           # 这也是"法线一致性正则不收敛"的一个可疑来源（见 03/G65）。
+           "quats": float(getattr(cfg, "lr_quats", 5e-4) or 5e-4),
            "opacities": float(getattr(cfg, "lr_opacities", 0.025) or 0.025),
            "shs": 2.5e-3}
-    _gamma = 0.01 ** (1 / max(cfg.iterations, 1))
+    _gamma = 0.01 ** (1 / max(cfg.iterations, 1))   # 旧策略（纯指数）保留，供 A/B 复现
+
+    # ---- 学习率调度：线性预热 + 余弦退火（用户方案第 1 项）----
+    # 曲线本体是模块级的 `lr_at()`（便于用解析端点单测）；
+    # 这里只把配置读成常量，避免闭包内重复读 cfg。
+    _WARM = int(getattr(cfg, "warmup_iters", 0) or 0)
+    _TOTAL = max(int(cfg.iterations), 1)
+    _MINR = float(getattr(cfg, "lr_min_ratio", 0.1) or 0.1)
+
+    def _lr_at(step_idx: int, peak: float) -> float:
+        return lr_at(step_idx, peak, _MINR, _WARM, _TOTAL)
+
+    _SCHED = str(getattr(cfg, "lr_schedule", "cosine") or "cosine").lower()
 
     def make_optimizers():
         """为**当前**的参数对象建优化器（只在开头调用一次）。
@@ -807,11 +878,21 @@ def train(cfg: TrainConfig, ctx) -> dict:
         return opts
 
     def schedule_lrs(step_idx: int) -> None:
-        """与 ExponentialLR(gamma) 等价：手动设置每个参数组的学习率。"""
-        factor = _gamma ** step_idx
+        """按 `lr_schedule` 设置各参数学习率。
+
+        * `cosine`（默认）—— 线性预热 + 余弦退火到峰值的 `lr_min_ratio`
+        * `exp`           —— 旧的纯指数衰减，保留以便复现历史结果与做 A/B
+        """
+        if _SCHED == "exp":
+            factor = _gamma ** step_idx
+            for k, opt in optimizers.items():
+                for group in opt.param_groups:
+                    group["lr"] = _LR[k] * factor
+            return
         for k, opt in optimizers.items():
+            lr = _lr_at(step_idx, _LR[k])
             for group in opt.param_groups:
-                group["lr"] = _LR[k] * factor
+                group["lr"] = lr
     optimizers = make_optimizers()
     sched = None  # 用 schedule_lrs 手动等价实现，避免替换参数后调度器失效
 
@@ -965,10 +1046,17 @@ def train(cfg: TrainConfig, ctx) -> dict:
     psnr_log: list[dict] = []
     t0 = time.time()
     ema_loss = None
+    # 感知损失状态：函数缓存 + "不可用就永久关闭"标志
+    # （不用"每步重试"：权重缺失/前向失败是**确定性**的，重试只会刷屏并浪费时间）
+    _lpips_fn = None
+    _lpips_disabled = False
     # 最佳检查点跟踪（导出阶段优先用它，见 stages/export.py:_find_ply）
+    # best_psnr 存的是"选择指标"的当前最优值（按 best_metric 可能是 -LPIPS），
+    # best_metrics_now 存该检查点的**完整**指标，供 metrics.json 记录（多指标评估）
     best_psnr = float("-inf")
     best_step = 0
     best_ply: Path | None = None
+    best_metrics_now: dict = {}
 
     for step in range(1, cfg.iterations + 1):
         if ctx.cancel_requested:
@@ -1077,6 +1165,39 @@ def train(cfg: TrainConfig, ctx) -> dict:
         if cfg.scale_reg > 0:
             # 尺度正则：抑制个别高斯长到过大（也是浮点的常见形态）
             loss = loss + float(cfg.scale_reg) * current_scales().mean()
+
+        # ---- 感知损失 LPIPS（用户方案第 3 项）----
+        # 动机：L1 是逐像素平均，SSIM 是局部结构；两者都偏"平滑"，
+        # 对纹理细节（石雕纹样、瓦当）不敏感，渲染容易发糊。
+        # LPIPS 用预训练 VGG 的深层特征衡量差异，对纹理/结构更敏感。
+        #
+        # 三个设计要点：
+        #   1) `lpips_every` 隔步计算（VGG 前向开销与显存都不小）；
+        #   2) 权重缺失时**只用 WARN 并永久关闭**，不给 0 悄悄退化 ——
+        #      "开着但没生效"这种静默退化本项目踩过（见 03/G65）；
+        #   3) 首次使用时构造网络，之后的 step 复用缓存。
+        if float(cfg.lambda_lpips) > 0 and not _lpips_disabled:
+            if _lpips_fn is None:
+                try:
+                    from .perceptual import get_lpips
+                    _lpips_fn = get_lpips(str(device))
+                    ctx.info(f"感知损失已启用：λ_lpips={float(cfg.lambda_lpips)} "
+                             f"每 {int(cfg.lpips_every)} 步计算一次")
+                except Exception as exc:  # noqa: BLE001
+                    _lpips_disabled = True
+                    ctx.warn(f"LPIPS 不可用，已**永久关闭**该损失项"
+                             f"（{type(exc).__name__}: {exc}）；"
+                             f"如需启用请先跑 scripts\\fetch_torch_weights.py")
+            if _lpips_fn is not None and (step % max(1, int(cfg.lpips_every)) == 0):
+                try:
+                    lp_val = _lpips_fn(render.clamp(0, 1), gt)
+                    loss = loss + float(cfg.lambda_lpips) * lp_val
+                    if step % 500 == 0:
+                        ctx.emit(f"step {step} LPIPS={float(lp_val):.4f} "
+                                 f"（λ={float(cfg.lambda_lpips)}）", level="debug")
+                except Exception as exc:  # noqa: BLE001
+                    _lpips_disabled = True
+                    ctx.warn(f"LPIPS 前向失败，已永久关闭该损失项：{exc}")
 
         # ---- 2DGS 正则（深度失真抑制 + 法线一致性）----
         # 见 TrainConfig 里 `lambda_depth_distortion` 的说明：3DGS 的累计深度是沿射线的
@@ -1235,22 +1356,48 @@ def train(cfg: TrainConfig, ctx) -> dict:
                 max_side=max_side,
                 # 只在最后一次评估时导出"渲染 vs 真值"对比图（诊断位姿约定用）
                 dump_dir=(cfg.out_dir / "diagnostics" / "render_vs_gt" if is_final else None),
+                # 多指标评估：最后一次评估才算 LPIPS（VGG 前向不便宜），
+                # 日志用的高频评估只算 PSNR/SSIM。
+                want_lpips=bool(getattr(cfg, "eval_metrics", True)) and is_final,
             )
-            psnr_log.append({"step": step, "psnr": round(eval_res, 3),
+            cur_psnr = float(eval_res.get("psnr", 0.0))
+            cur_ssim = float(eval_res.get("ssim", 0.0))
+            cur_lpips = eval_res.get("lpips")
+            psnr_log.append({"step": step, "psnr": round(cur_psnr, 3),
+                             "ssim": round(cur_ssim, 4),
+                             "lpips": (round(float(cur_lpips), 4)
+                                       if cur_lpips is not None else None),
                              "views": len(ev_idx_now), "final": is_final})
             tag = "（训练视图，非泛化指标）" if psnr_on_train else ""
             tag += "（全留出集）" if is_final and not psnr_on_train else ""
-            ctx.emit(f"step {step} 评估 PSNR={eval_res:.2f} dB "
+            extra = f" SSIM={cur_ssim:.4f}"
+            if cur_lpips is not None:
+                extra += f" LPIPS={float(cur_lpips):.4f}"
+            ctx.emit(f"step {step} 评估 PSNR={cur_psnr:.2f} dB{extra} "
                      f"[{len(ev_idx_now)} 视图]{tag}", level="info",
                      progress=step / cfg.iterations)
-            # 记录/保存"最佳检查点"：
-            # 3DGS 在小规模环绕拍摄上常出现"过训练"（后期加密导致拟合变差，
-            # 真实素材实测 step8000 的 26.45 dB 退化到 step15000 的 21.26 dB）。
-            # 所以评估时若刷新了最佳 PSNR，就顺手把模型存下来，
-            # 导出阶段会优先用它（见 stages/export.py:_find_ply）。
-            if eval_res is not None and eval_res > best_psnr + 1e-6:
-                best_psnr = float(eval_res)
+
+            # ---- 挑选"最佳检查点"（用户方案第 6 项）----
+            # 默认按 PSNR；可改为 ssim / lpips（后者越小越好）。
+            # 动机：PSNR 高但 SSIM/LPIPS 差的模型往往视觉上模糊，不适合作为导出依据。
+            bm = str(getattr(cfg, "best_metric", "psnr") or "psnr").lower()
+            if bm == "ssim":
+                cur_key = cur_ssim if cur_lpips is not None or True else cur_ssim
+                better = cur_ssim > best_psnr + 1e-9
+            elif bm in ("lpips", "lpips_inv") and cur_lpips is not None:
+                # lpips 越小越好 ⇒ 用负值比较，保持 best_psnr 变量语义为"越大越好"
+                cur_key = -float(cur_lpips)
+                better = cur_key > best_psnr + 1e-9
+            else:
+                cur_key = cur_psnr
+                better = cur_psnr > best_psnr + 1e-6
+            if better:
+                best_psnr = float(cur_key)
                 best_step = step
+                best_metrics_now = {"psnr": cur_psnr, "ssim": cur_ssim,
+                                    "lpips": (float(cur_lpips)
+                                              if cur_lpips is not None else None),
+                                    "selected_by": bm}
                 best_dir = gs_dir / f"iteration_{step}"
                 save_ply(
                     path=best_dir / "point_cloud.ply",
@@ -1358,6 +1505,10 @@ def train(cfg: TrainConfig, ctx) -> dict:
         "elapsed_min": round((time.time() - t0) / 60, 2),
         "final_loss": loss_log[-1]["loss"] if loss_log else None,
         "psnr": psnr_log[-1]["psnr"] if psnr_log else None,
+        # 多指标评估（用户方案第 6 项）：PSNR 高不等于视觉好，
+        # 同时记录 SSIM / LPIPS，便于判断"哪个检查点真的更好"。
+        "ssim": (psnr_log[-1].get("ssim") if psnr_log else None),
+        "lpips": (psnr_log[-1].get("lpips") if psnr_log else None),
         "psnr_curve": psnr_log,
         "loss_curve": loss_log[-200:],
         "ply": str(final_ply),
@@ -1365,6 +1516,9 @@ def train(cfg: TrainConfig, ctx) -> dict:
         "best_psnr": (round(best_psnr, 3) if best_psnr != float("-inf") else None),
         "best_step": best_step or None,
         "best_ply": (str(best_ply) if best_ply else str(final_ply)),
+        # 最佳检查点的完整指标 + 它是由哪个指标选出来的
+        "best_metrics": (best_metrics_now or None),
+        "best_metric_used": str(getattr(cfg, "best_metric", "psnr") or "psnr"),
     }
     (cfg.out_dir / "metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
     msg = (f"训练完成：{metrics['gaussians']} 个高斯，用时 {metrics['elapsed_min']} 分钟"
@@ -1519,23 +1673,40 @@ def _swap_param(name: str, new_tensor, params: dict, optimizers: dict, optimizer
 
 
 def evaluate(rasterization, means, quats, scales, opacities, shs, imgs, masks, ks, viewmats,
-             eval_idx, sh_degree, background, device, max_side, dump_dir=None):
-    """在评估视图上算 PSNR（dB），可选把"渲染 vs 真值"并排图写到 dump_dir。
+             eval_idx, sh_degree, background, device, max_side, dump_dir=None,
+             want_lpips: bool = False):
+    """在评估视图上算 **PSNR / SSIM /（可选）LPIPS**，返回 dict。
+
+    为什么返回多指标（用户方案第 6 项）：**PSNR 高不等于视觉好**。
+    PSNR 是逐像素 MSE 的对数，对"整体偏一点但纹理全糊"的渲染很宽容；
+    而这类模型导出的网格/贴图观感明显更差。所以同时记录 SSIM 与 LPIPS，
+    并允许用它们挑选"最佳检查点"（`TrainConfig.best_metric`）。
 
     dump_dir 的用途：位姿约定（cam_to_world 的轴翻转）一旦写错，
     渲染在数值上仍可能有非零 PSNR，只看 PSNR 难以判断。
-    把两者并排存成 PNG 后可以直接肉眼确认几何是否对齐
-    ——比"盯着 loss 曲线猜"可靠得多。
+    把两者并排存成 PNG 后可以直接肉眼确认几何是否对齐。
 
     踩坑：调用方曾用位置参数按错误顺序传入（opacities 落到 scales 上、
     background 落到 masks 上），因为各张量形状恰好兼容，**不会报错**，
-    只会让 PSNR 恒为 0。所以这里改为关键字调用，并把顺序写清楚。
+    只会让 PSNR 恒为 0。所以这里一律关键字调用，并把顺序写清楚。
+
+    返回：{"psnr": float, "ssim": float, "lpips": float|None, "views": int}
     """
     import torch
 
     if not eval_idx:
-        return 0.0
-    psnrs = []
+        return {"psnr": 0.0, "ssim": 0.0, "lpips": None, "views": 0}
+    psnrs: list[float] = []
+    ssims: list[float] = []
+    lpipss: list[float] = []
+    lp = None
+    if want_lpips:
+        try:
+            from .perceptual import get_lpips
+            lp = get_lpips(str(device))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[evaluate] LPIPS 不可用，已跳过（{type(exc).__name__}: {exc}）")
+            lp = None
     with torch.no_grad():
         for i in eval_idx:
             gt = imgs[i].to(device)
@@ -1558,9 +1729,24 @@ def evaluate(rasterization, means, quats, scales, opacities, shs, imgs, masks, k
             render = colors[0] + background * (1 - alphas[0])
             mse = torch.mean((render - gt) ** 2).clamp_min(1e-10)
             psnrs.append(float(10.0 * torch.log10(1.0 / mse)))
+            try:
+                s = ssim_simple(render.permute(2, 0, 1)[None], gt.permute(2, 0, 1)[None])
+                ssims.append(float(s))
+            except Exception:  # noqa: BLE001
+                pass
+            if lp is not None:
+                try:
+                    lpipss.append(float(lp(render.clamp(0, 1), gt)))
+                except Exception:  # noqa: BLE001
+                    lp = None
             if dump_dir is not None:
                 _dump_compare(dump_dir, i, render, gt)
-    return sum(psnrs) / len(psnrs)
+    return {
+        "psnr": sum(psnrs) / len(psnrs),
+        "ssim": (sum(ssims) / len(ssims)) if ssims else 0.0,
+        "lpips": (sum(lpipss) / len(lpipss)) if lpipss else None,
+        "views": len(psnrs),
+    }
 
 
 def _dump_compare(dump_dir, view_idx: int, render, gt) -> None:
