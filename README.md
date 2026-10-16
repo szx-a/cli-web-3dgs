@@ -37,7 +37,7 @@
 
 | 指标 | 数值 |
 |---|---|
-| 网格提取路线 | 深度反投影（75 视角 @640px）→ 泊松 depth=9 → Taubin 平滑 → QEM |
+| 网格提取路线 | 深度反投影（75 视角 @640px）→ 泊松 depth=**8** → Taubin 平滑 → QEM<br/>（原记 depth=9；实测 8 的相邻面法线翻转率低 10 倍，见下方参数表与 `docs/03` G82） |
 | 反投影点云 / 下采样后 | 2,579,017 → 2,311,406 点 |
 | 最终面数 | 385,170（QEM 目标 40 万） |
 | **轮廓 IoU**（对比高斯渲染轮廓） | **0.66** |
@@ -200,16 +200,21 @@ scripts\gsflow_gpu.cmd run --job-id <job> --stages export --force export --set e
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `export.mesh_method` | `poisson` | `poisson`（深度反投影 + 泊松，推荐）/ `tsdf`（TSDF 融合） |
+| `export.mesh_method` | `2dgs` | `2dgs`（深度反投影 + 多视角一致性投票，法线最干净）/ `poisson` / `tsdf` |
 | `export.mesh_width` | 640 | 渲深度用的分辨率（越大越慢、越细） |
 | `export.mesh_max_views` | 80 | 参与融合的视角上限 |
-| `export.mesh_poisson_depth` | 9 | 泊松八叉树深度。8 快 / 9 均衡 / 10 更细更慢 |
-| `export.mesh_density_quantile` | **0.0** | 密度裁剪分位。**这是最敏感的参数**：`0.03` 会把轮廓 IoU 从 0.68 砍到 0.32（连通真实表面一起裁了） |
-| `export.mesh_crop_quantile` | 0.90 | 自动聚焦到主体（按不透明度加权包围盒的分位） |
+| `export.mesh_poisson_depth` | **8** | 泊松八叉树深度。**更深不等于更好**：同模型只改它，相邻面法线翻转率 dd-0 = 1.7%(8) / 17.8%(9) / **43.5%(10)**，dd-15 = 2.1%(8) / 22.4%(9)，面数与 IoU 几乎不变 |
+| `export.mesh_density_quantile` | 0.001 | 密度裁剪分位。**极敏感**：`0.03` 会把轮廓 IoU 从 0.68 砍到 0.32（连通真实表面一起裁了） |
+| `export.mesh_crop_quantile` | 0.95 | 自动聚焦到主体。`1.0`（不聚焦）会让翻转率从 22% 升到 **44%** |
+| `export.mesh_trim_sigma` | 2.5 | 按"到输入点距离"裁掉泊松桥接面。`1.0` 能把翻转降到 3.2% 但只剩 1.6 万面（裁太狠） |
+| `export.mesh_consistency_min_views` | 2 | 多视角一致性投票门槛。`3` 把翻转降到 12.6%，但 **IoU 掉 0.060**（靠删面换来的） |
+| `export.mesh_presimplify_ratio` | 10.0 | 预简化比例（先降规模再平滑） |
 | `export.mesh_target_triangles` | 400000 | QEM 简化目标面数（0=不简化） |
 | `export.mesh_smooth_iters` | 5 | Taubin 平滑迭代（比拉普拉斯好：不收缩体积） |
-| `export.mesh_texture` | false | 是否烘焙贴图 |
+| `export.mesh_texture` | false | 是否烘焙贴图（>8 万面时 xatlas 超线性变慢） |
 | `export.mesh_texture_size` | 2048 | 贴图边长 |
+| `train.lambda_lpips` | 0 | 感知损失权重（自己实现的 VGG16 LPIPS，见 `docs/05` §5.3）。**默认关闭**：3 次重复实测三指标均不显著，且方差约 3 倍 |
+| `train.lambda_depth_distortion` | 0 | 深度失真正则（2DGS 的 λd）。**权重必须按本项目损失口径实测校准**，不能照抄论文的 1000：λd=1.5 是唯一稳超噪声底的改进（+0.199 dB），见 `docs/03` G82 |
 
 > 网格流程（对应社区标准做法）：渲深度 → 按不透明度/深度一致性过滤 →
 > **反投影成紧贴表面的稠密点云** → 体素下采样均匀化 → 泊松重建 →
