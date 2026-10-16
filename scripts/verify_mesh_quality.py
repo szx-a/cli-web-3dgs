@@ -170,8 +170,12 @@ def main() -> int:
     scales_real = torch.as_tensor(gauss["scales"], dtype=torch.float32, device="cuda")
     quats = torch.as_tensor(gauss["quats"], dtype=torch.float32, device="cuda")
     opac = torch.as_tensor(gauss["opacity"], dtype=torch.float32, device="cuda").reshape(-1)
-    rgb = torch.as_tensor(gauss["rgb"], dtype=torch.float32, device="cuda") / 255.0
-    shs = ((rgb - 0.5) / 0.28209479177387814).reshape(n, 1, 3)
+    # 用**完整 SH**（含高阶）。旧版从 rgb 造 DC-only 并配 sh_degree=0，
+    # 实测低估约 1.9 dB，且抹掉视角相关外观（见 src/gsflow/gsdata/shio.py）。
+    # 注意 `scales` 是**真实尺度**（_read_ply 已指数化），不要再 exp。
+    shs = torch.as_tensor(gauss["shs"], dtype=torch.float32, device="cuda")
+    _sh_deg = int(gauss.get("sh_degree", 0) or 0)
+    print(f"渲染用 SH 阶数 = {_sh_deg}")
 
     size = args.size
     step = max(1, len(poses) // args.views)
@@ -195,7 +199,8 @@ def main() -> int:
                 viewmats=torch.linalg.inv(torch.as_tensor(c2w, dtype=torch.float32,
                                                           device="cuda"))[None],
                 Ks=torch.as_tensor(Ks, dtype=torch.float32, device="cuda")[None],
-                width=size, height=size, sh_degree=0, packed=False, render_mode="RGB+ED",
+                width=size, height=size, sh_degree=_sh_deg, packed=False,
+                render_mode="RGB+ED",
             )
         img = cols[0].cpu().numpy()
         A = (alphas[0].cpu().numpy().reshape(size, size) > 0.5)

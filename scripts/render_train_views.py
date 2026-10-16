@@ -77,18 +77,15 @@ def main() -> int:
     c2ws = torch.from_numpy(data["c2ws"]).float()
     viewmats = torch.linalg.inv(c2ws)
 
-    d = PlyData.read(str(ply)).elements[0].data
+    # ⚠️ 必须用**完整 SH** 读取与渲染（含 45 个 f_rest_*）。
+    # 旧版本只读 f_dc_* 并以 sh_degree=0 渲染 ⇒ 实测**低估 1.91 dB**，
+    # 而且抹掉了视角相关外观（详见 src/gsflow/gsdata/shio.py 的说明）。
+    # 读取统一走 shio，避免"同一决定写多遍、然后一起写错"。
+    from gsflow.gsdata.shio import read_gaussians_full
+
     device = torch.device("cuda")
-    means = torch.tensor(np.stack([d["x"], d["y"], d["z"]], 1), dtype=torch.float32, device=device)
-    sc = np.stack([d["scale_0"], d["scale_1"], d["scale_2"]], 1)
-    scales = torch.tensor(np.exp(sc), dtype=torch.float32, device=device)
-    q = np.stack([d["rot_0"], d["rot_1"], d["rot_2"], d["rot_3"]], 1)
-    quats = torch.tensor(q, dtype=torch.float32, device=device)
-    quats = quats / (quats.norm(dim=-1, keepdim=True) + 1e-8)
-    op = 1.0 / (1.0 + np.exp(-np.asarray(d["opacity"], dtype=np.float64)))
-    opacities = torch.tensor(op, dtype=torch.float32, device=device)
-    sh = np.stack([np.asarray(d[f"f_dc_{k}"], dtype=np.float64) for k in range(3)], 1)
-    shs = torch.tensor(sh, dtype=torch.float32, device=device).unsqueeze(1)  # [N,1,3]
+    G = read_gaussians_full(ply)
+    print(f"高斯基色读取：SH 阶数 {G['sh_degree']}，高斯 {G['n']} 个")
 
     out_dir = job / "04_train" / "diagnostics"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -98,10 +95,14 @@ def main() -> int:
         H, W = gt.shape[:2]
         with torch.no_grad():
             colors, alphas, _ = rasterization(
-                means=means, quats=quats, scales=scales, opacities=opacities,
-                colors=shs, viewmats=viewmats[vi][None].to(device),
+                means=torch.as_tensor(G["xyz"], device=device),
+                quats=torch.as_tensor(G["quats"], device=device),
+                scales=torch.as_tensor(G["scales"], device=device),
+                opacities=torch.as_tensor(G["opacity"], device=device).reshape(-1).clamp(0, 1),
+                colors=torch.as_tensor(G["shs"], device=device),
+                viewmats=viewmats[vi][None].to(device),
                 Ks=ks[vi][None].to(device), width=W, height=H,
-                sh_degree=0, near_plane=0.01, far_plane=1e10,
+                sh_degree=int(G["sh_degree"]), near_plane=0.01, far_plane=1e10,
                 packed=False, render_mode="RGB",
             )
         render = colors[0].clamp(0, 1)

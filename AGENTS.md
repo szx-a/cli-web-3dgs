@@ -53,3 +53,4 @@ env\venv\Scripts\python.exe -m pytest tests -q -p no:cacheprovider
 - 阶段之间只通过磁盘产物 + `job.json` 通信，支持跳过/续跑/单阶段重跑。
 - 新增外部工具要走 `tools\locate.py` 的适配器；新增分割后端实现 `segment\base.py:Segmenter`；
   新增训练后端实现 `trainers\base.py` 的协议。
+  
