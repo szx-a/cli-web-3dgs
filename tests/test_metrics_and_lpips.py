@@ -44,6 +44,30 @@ def test_best_metric_keys_present_and_consistent() -> None:
             f"{k} 两处默认值不一致：{DEFAULTS['train'][k]!r} vs {td[k]!r}"
 
 
+def test_lpips_loss_exists_but_defaults_off() -> None:
+    """感知损失必须**存在**（否则无法做同数据对照），但默认关闭。
+
+    为什么不允许把它删掉（这条测试的由来）：
+    我曾据一轮对照把 LPIPS 判为"有害"并删掉代码。后来发现那轮测量用的是
+    `sh_degree=0` 渲染 —— 丢掉了 45 个高阶 SH 分量，实测低估 1.91 dB，
+    而且恰好抹掉了**视角相关**外观，也就是感知损失要改善的那部分。
+    ⇒ 用看不见优化目标的尺子去判断优化有没有用，必然得到假阴性。
+
+    所以：代码留着（可随时重做对照），默认值不许悄悄打开。
+    """
+    from gsflow.config import DEFAULTS
+    from gsflow.trainers.gsplat_trainer import TrainConfig
+
+    td = {f.name: f.default for f in fields(TrainConfig)}
+    assert "lambda_lpips" in td, (
+        "感知损失开关被删掉了。删除会让这个方法无法再被验证；"
+        "如果确实要删，请在 docs/03 说明为什么不再需要它，并更新这条测试"
+    )
+    assert float(td["lambda_lpips"]) == 0.0, \
+        "lambda_lpips 默认必须是 0：开启前需要新的同数据对照证据（噪声底约 0.09 dB）"
+    assert float(DEFAULTS["train"]["lambda_lpips"]) == 0.0
+
+
 def test_best_metric_defaults_to_psnr_and_is_a_known_choice() -> None:
     from gsflow.config import DEFAULTS
 

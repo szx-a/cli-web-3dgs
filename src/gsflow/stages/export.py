@@ -24,6 +24,23 @@ from ..pipeline.base import Artifact, Stage, StageResult
 from ..pipeline.context import StageContext
 
 SH_C0 = 0.28209479177387814
+
+
+def _sh_tensors(gauss: dict, device: str = "cuda"):
+    """从 `_read_ply` 的结果取出 (完整 SH 张量, sh_degree)。
+
+    单独抽成函数是为了**只在一处**决定"用 DC 还是用全 SH" ——
+    这个决定曾在 4 个渲染点各写一遍，于是全部退化成了 `sh_degree=0`
+    （丢高阶 SH ⇒ 实测低估 1.91 dB，见 `_read_ply` 的说明）。
+    缺 `shs` 字段时回退为仅 DC（老 PLY / 非 3DGS 来源）。
+    """
+    import torch
+
+    if gauss.get("shs") is not None:
+        shs = torch.as_tensor(gauss["shs"], dtype=torch.float32, device=device)
+        return shs, int(gauss.get("sh_degree", 0) or 0)
+    rgb = torch.as_tensor(gauss["rgb"], dtype=torch.float32, device=device) / 255.0
+    return ((rgb - 0.5) / SH_C0).reshape(-1, 1, 3), 0
 GLB_MAGIC = 0x46546C67
 JSON_CHUNK = 0x4E4F534A
 BIN_CHUNK = 0x004E4942
@@ -391,47 +408,28 @@ class ExportStage(Stage):
 
     @staticmethod
     def _read_ply(ply: Path, max_points: int = 0) -> dict:
-        """读取 3DGS PLY，把 SH DC 分量解成 RGB；可选按不透明度截断。"""
-        from plyfile import PlyData
+        """读取 3DGS PLY（**委托给 `gsflow.gsdata.shio.read_gaussians_full`**）。
 
-        data = PlyData.read(str(ply))
-        v = data["vertex"]
-        names = set(v.data.dtype.names or ())
-        xyz = np.stack([np.asarray(v["x"]), np.asarray(v["y"]), np.asarray(v["z"])], axis=1).astype(np.float32)
+        **重要修正（用户指出的"实现被简化"）**：
+        旧版只解 `f_dc_*` 成 RGB 并**丢掉全部高阶 SH**。但训练用 `sh_degree=3`
+        ⇒ PLY 里有 45 个 `f_rest_*`。丢掉它们意味着：
+          * 预览图 / 网格顶点色**不是模型的真实外观**（缺视角相关的色彩变化）；
+          * 用 `sh_degree=0` 渲染来评估，实测**低估 1.91 dB**
+            （同模型：全 SH 22.10 dB vs 仅 DC 20.20 dB），
+            而且对"改善视角相关细节"的优化手段（感知损失等）**天然不敏感**
+            —— 这会直接制造**假阴性**（把有效的优化判成无效）。
 
-        if {"f_dc_0", "f_dc_1", "f_dc_2"} <= names:
-            dc = np.stack([np.asarray(v["f_dc_0"]), np.asarray(v["f_dc_1"]), np.asarray(v["f_dc_2"])], axis=1)
-            rgb = np.clip(dc * SH_C0 + 0.5, 0.0, 1.0) * 255.0
-        elif {"red", "green", "blue"} <= names:
-            rgb = np.stack([np.asarray(v["red"]), np.asarray(v["green"]), np.asarray(v["blue"])], axis=1).astype(np.float32)
-        else:
-            rgb = np.full_like(xyz, 128.0)
+        返回值：
+          * `rgb`        —— DC 解出的视角无关基色（GLB/OBJ 顶点色用）
+          * `shs`        —— **完整** SH [N, (deg+1)², 3]，供 gsplat 真实渲染
+          * `sh_degree`  —— 由 `f_rest_*` 数量反推（45 ⇒ 3）
 
-        if "opacity" in names:
-            op = 1.0 / (1.0 + np.exp(-np.asarray(v["opacity"]).astype(np.float32)))
-        else:
-            op = np.ones(len(xyz), dtype=np.float32)
+        实现只在 `gsdata/shio.py` 一处 —— 本会话已因"同一决定写 4 遍"而丢过高阶 SH，
+        所以这里不再自己解析，直接委托，避免再次分叉。
+        """
+        from ..gsdata.shio import read_gaussians_full
 
-        if {"scale_0", "scale_1", "scale_2"} <= names:
-            scales = np.exp(np.stack([np.asarray(v["scale_0"]), np.asarray(v["scale_1"]),
-                                      np.asarray(v["scale_2"])], axis=1).astype(np.float32))
-        else:
-            scales = np.full_like(xyz, 0.01)
-
-        if {"rot_0", "rot_1", "rot_2", "rot_3"} <= names:
-            quats = np.stack([np.asarray(v["rot_0"]), np.asarray(v["rot_1"]),
-                              np.asarray(v["rot_2"]), np.asarray(v["rot_3"])], axis=1).astype(np.float32)
-        else:
-            quats = np.tile(np.array([1, 0, 0, 0], dtype=np.float32), (len(xyz), 1))
-
-        order = np.argsort(-op)
-        if max_points and len(order) > max_points:
-            order = order[:max_points]
-        return {
-            "xyz": xyz[order], "rgb": rgb[order], "opacity": op[order],
-            "scales": scales[order], "quats": quats[order],
-        }
-
+        return read_gaussians_full(ply, max_points=max_points)
     # ------------------------------------------------------------------ 网格
     def _export_mesh(self, ctx: StageContext, ply: Path, out_dir: Path) -> list[dict]:
         """用 TSDF 融合从训练好的 3DGS 提取三角网格（`.obj` + 可选 `.ply`）。
@@ -544,14 +542,18 @@ class ExportStage(Stage):
             quats_t = torch.as_tensor(gauss["quats"], dtype=torch.float32, device="cuda")
             opac = torch.as_tensor(gauss["opacity"], dtype=torch.float32, device="cuda").reshape(-1)
             rgb = torch.as_tensor(gauss["rgb"], dtype=torch.float32, device="cuda") / 255.0
-            shs = ((rgb - 0.5) / 0.28209479177387814).reshape(n, 1, 3)
+            # 用**完整 SH**（含高阶）渲染：只用 DC 会低估约 1.9 dB（见 _read_ply 注释），
+            # 而深度反投影/预览都应以模型真实外观为准。
+            shs, sh_deg = _sh_tensors(gauss, device="cuda")
+            ctx.info(f"渲染用 SH 阶数 = {sh_deg}"
+                     + ("（含高阶，与训练一致）" if sh_deg > 0 else "（仅 DC）"))
 
             ctx.info(f"① 渲染深度：{min(len(c2ws), int(ctx.cfg('mesh_max_views', 80) or 80))}"
                      f"/{len(c2ws)} 个视角 @ {width}px ...")
             rendered, used_idx = render_depths(
                 means=xyz, quats=quats_t, scales_real=scales_real,
                 opacities=opac.clamp(0, 1), shs=shs,
-                c2ws=c2ws, ks=ks, width=width, height=width, sh_degree=0,
+                c2ws=c2ws, ks=ks, width=width, height=width, sh_degree=sh_deg,
                 src_wh=src_wh, max_views=int(ctx.cfg("mesh_max_views", 80) or 80),
             )
 
@@ -765,15 +767,15 @@ class ExportStage(Stage):
         scales_real = torch.as_tensor(gauss["scales"], dtype=torch.float32, device="cuda")
         quats = torch.as_tensor(gauss["quats"], dtype=torch.float32, device="cuda")
         opac = torch.as_tensor(gauss["opacity"], dtype=torch.float32, device="cuda").reshape(-1)
-        rgb = torch.as_tensor(gauss["rgb"], dtype=torch.float32, device="cuda") / 255.0
-        shs = ((rgb - 0.5) / 0.28209479177387814).reshape(n, 1, 3)
+        shs, sh_deg = _sh_tensors(gauss, device="cuda")
 
-        ctx.info(f"渲染深度：{min(max_views, len(c2ws))}/{len(c2ws)} 个视角 @ {width}px ...")
+        ctx.info(f"渲染深度：{min(max_views, len(c2ws))}/{len(c2ws)} 个视角 @ {width}px "
+                 f"（SH 阶数 {sh_deg}）...")
         rendered, used_idx = render_depths(
             means=xyz, quats=quats, scales_real=scales_real,
             opacities=opac.clamp(0, 1), shs=shs,
             c2ws=c2ws, ks=ks,
-            width=width, height=height, sh_degree=0,
+            width=width, height=height, sh_degree=sh_deg,
             src_wh=src_wh, max_views=max_views,
         )
 
@@ -1355,6 +1357,8 @@ class ExportStage(Stage):
             scales_real = torch.as_tensor(gauss["scales"], dtype=torch.float32, device="cuda")
             quats = torch.as_tensor(gauss["quats"], dtype=torch.float32, device="cuda")
             rgb = torch.as_tensor(gauss["rgb"], dtype=torch.float32, device="cuda") / 255.0
+            # 预览也必须用**完整 SH** 渲染，否则预览图不是模型真实外观
+            shs_full, sh_deg = _sh_tensors(gauss, device="cuda")
 
             opac0 = torch.as_tensor(gauss["opacity"], dtype=torch.float32, device="cuda").reshape(-1)
             # 只保留"看得见"的高斯：低不透明度的浮点数会把取景撑大、把画面渲成一片背景色。
@@ -1366,15 +1370,18 @@ class ExportStage(Stage):
             quats = quats[keep]
             opac = opac0[keep]
             rgb = rgb[keep]
+            shs_full = shs_full[keep]
             n = int(xyz.shape[0])
-            ctx.info(f"预览渲染使用 {n} 个可见高斯（不透明度 > 0.02）")
+            ctx.info(f"预览渲染使用 {n} 个可见高斯（不透明度 > 0.02），SH 阶数 {sh_deg}")
 
             # 首选：直接用**训练时的真实相机位姿**渲染。
             # 自己估的"环绕相机"很容易取景失当（实测把画面渲成一片背景色），
             # 而训练相机的视角天然合理，也正好能反映"模型在训练视图上看到什么"。
             poses = self._training_cameras(ctx, out_dir)
             if poses:
-                return self._render_from_poses(ctx, xyz, scales_real, quats, opac, rgb, poses, out_dir, count)
+                return self._render_from_poses(ctx, xyz, scales_real, quats, opac, rgb,
+                                               poses, out_dir, count,
+                                               shs=shs_full, sh_degree=sh_deg)
 
             center = xyz.mean(dim=0)
             spread = torch.linalg.norm(xyz - center, dim=1) + scales_real.max(dim=1).values
@@ -1382,7 +1389,7 @@ class ExportStage(Stage):
             H = W = 512
             fov = 1.0
             focal = 0.5 * W / np.tan(0.5 * fov)
-            shs = ((rgb - 0.5) / 0.28209479177387814).reshape(n, 1, 3)
+            shs = shs_full
 
             angles = [("front", 0.0, 0.15), ("side", 90.0, 0.15),
                       ("top", 0.0, 1.35), ("iso", 45.0, 0.55)]
@@ -1414,7 +1421,8 @@ class ExportStage(Stage):
                         means=xyz, quats=quats, scales=scales_real,
                         opacities=opac.clamp(0, 1), colors=shs,
                         viewmats=viewmat[None], Ks=K[None],
-                        width=W, height=H, sh_degree=0, packed=False, render_mode="RGB",
+                        width=W, height=H, sh_degree=int(sh_deg), packed=False,
+                        render_mode="RGB",
                     )
                     img = colors[0] + (1 - alphas[0])
                 arr = (img.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
@@ -1482,17 +1490,22 @@ class ExportStage(Stage):
         return poses
 
     def _render_from_poses(self, ctx: StageContext, xyz, scales_real, quats, opac, rgb,
-                           poses, out_dir: Path, count: int) -> list[dict]:
+                           poses, out_dir: Path, count: int,
+                           shs=None, sh_degree: int = 0) -> list[dict]:
         """用给定的真实相机位姿渲染预览（gt 图若存在则并排拼上，便于对照）。
 
         注意 scales_real 是**真实尺度**（_read_ply 已指数化），不要再 exp。
+        `shs` 若传入则为**完整 SH**（含高阶），预览才是模型真实外观；
+        未传入时回退为仅 DC（老 PLY）。
         """
         import torch
         from gsplat import rasterization
         from PIL import Image
 
         n = int(xyz.shape[0])
-        shs = ((rgb - 0.5) / 0.28209479177387814).reshape(n, 1, 3)
+        if shs is None:
+            shs = ((rgb - 0.5) / 0.28209479177387814).reshape(n, 1, 3)
+            sh_degree = 0
         names = ["front", "side", "top", "iso"]
         out: list[dict] = []
         for k, (c2w, K, cw, ch, img_name) in enumerate(poses[:count]):
@@ -1510,7 +1523,8 @@ class ExportStage(Stage):
                     opacities=opac.clamp(0, 1), colors=shs,
                     viewmats=torch.as_tensor(viewmat, device="cuda")[None],
                     Ks=torch.as_tensor(Ks, device="cuda")[None],
-                    width=W, height=H, sh_degree=0, packed=False, render_mode="RGB",
+                    width=W, height=H, sh_degree=int(sh_degree), packed=False,
+                    render_mode="RGB",
                 )
                 img = colors[0] + (1 - alphas[0])
             arr = (img.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)

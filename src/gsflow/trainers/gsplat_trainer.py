@@ -47,6 +47,11 @@ class TrainConfig:
     # （`tests/test_defaults_consistency.py` 会钉住这条。）
     cap_max: int = 600_000
     ssim_weight: float = 0.2
+    # 是否使用**原始 3DGS 的单边 eps** 写法。默认 False（修正写法）。
+    # 修正原因：本素材背景 42%~85% 是纯黑，单边 eps 会把常数图的 SSIM 拉到 ~0.9（应=1.0），
+    # 实测系统性拉低 0.047（占 SSIM 项的 14%）且**随背景占比漂移**。
+    # 保留开关仅用于受控对照（证明修正确实有效）。
+    ssim_legacy_eps: bool = False
     densify_from: int = 500
     # 密度控制窗口的**上界**。这是本项目在真实数据上最敏感的一个参数。
     #
@@ -191,10 +196,12 @@ class TrainConfig:
     # 保持 1e-3；若日后换参数化（如压平高斯）应重新验证。
     lr_quats: float = 1e-3
     # ---- 感知损失 LPIPS（用户方案第 3 项）----
-    # L1 + SSIM 容易导致渲染偏平滑/纹理发糊；LPIPS 用预训练 VGG 特征约束纹理。
-    # 默认 0（关闭）—— 打开前后必须有**同数据对照**才改默认值。
+    # ⚠️ 噪声底提醒：同配置重复训练时 PSNR 散布约 **0.09 dB**（实测 rep-1/2/3）。
+    #    小于该量级的差异**不能**作为"有效/无效"的依据。
+    # 历史：我曾据一轮对照把它判为有害并删掉代码，而那轮用的是 `sh_degree=0` 渲染
+    # （丢高阶 SH ⇒ 低估 1.91 dB，且恰好抹掉感知损失要改善的视角相关细节）⇒ 假阴性。
     lambda_lpips: float = 0.0
-    # 每 N 步算一次 LPIPS（论文/社区常用做法）：VGG 前向开销与显存都不小。
+    # 每 N 步计算一次（VGG 前向开销与显存都不小）
     lpips_every: int = 4
     # ---- 多指标评估（用户方案第 6 项）----
     # 在 metrics.json 里同时记录 PSNR / SSIM / LPIPS，并额外保存 best_ssim / best_lpips
@@ -521,8 +528,29 @@ def _quantile(values, q: float) -> float:
     return float(torch.sort(v).values[k])
 
 
-def ssim_simple(img1, img2):
-    """可微 SSIM（11x11 高斯窗），避免依赖额外包。"""
+def ssim_simple(img1, img2, legacy_eps: bool = False):
+    """可微 SSIM（11x11 高斯窗）。
+
+    ⚠️ 这里的**分母写法与原始 3DGS 不同**，是刻意修正过的，不要"照官方改回去"：
+
+    原版 3DGS（`utils/image_utils.py::_ssim`）与本项目旧版都是**单边 eps 在分母**：
+        ssim = (2μ1μ2 + c1)(2σ12 + c2) / ((μ1²+μ2²+c1)(σ1²+σ2²+c2) + 1e-8)
+    对**常数图**（μ=σ=0，例如纯黑背景）这个式子给出
+        c1·c2 / (c1·c2 + 1e-8) = 1e-8 / 2e-8 = **0.5**（单通道，三通道平均≈0.9）
+    而两张全黑图的 SSIM **必须等于 1.0**。
+
+    原版 3DGS 不修它是因为其场景（Mip-NeRF 360 / Tanks&Temples）几乎没有大面积纯色区；
+    **本项目是抠像后黑底素材，实测背景占 42%~85% 的像素是近黑**，
+    于是每张图的 SSIM 被系统性拉低（实测 -0.047，占 SSIM 项的 14%），
+    而且**偏差随背景占比漂移**（前景占比 12%~55%）——
+    等于在损失里注入一个"与质量无关、随视角变化"的常数项，
+    与 G70 修掉的 loss 尺度漂移是同一类病。
+
+    现在改为与 skimage / pytorch_msssim 一致的写法（eps 只作数值安全网、不进分子），
+    保证：相同图 → 1.0，全黑对全黑 → 1.0。
+    验证：`scripts/compare_ssim.py`（对 skimage 逐点比对）与
+    `scripts/probe_ssim_bias.py`（在真实训练数据上量化偏差）。
+    """
     import torch
     import torch.nn.functional as F
 
@@ -541,9 +569,15 @@ def ssim_simple(img1, img2):
     sigma2_sq = F.conv2d(img2 * img2, window, padding=window_size // 2, groups=img2.shape[1]) - mu2_sq
     sigma12 = F.conv2d(img1 * img2, window, padding=window_size // 2, groups=img1.shape[1]) - mu1_mu2
     c1, c2 = 0.01 ** 2, 0.03 ** 2
-    ssim_map = ((2 * mu1_mu2 + c1) * (2 * sigma12 + c2)) / (
-        (mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2) + 1e-8
-    )
+    if legacy_eps:
+        # 复现**原始 3DGS** 的单边 eps 写法（含常数图偏置），仅供受控对照使用。
+        # 见本函数 docstring：它在纯黑背景上把 SSIM 拉到 ~0.9（应=1.0）。
+        return (((2 * mu1_mu2 + c1) * (2 * sigma12 + c2)) / (
+            (mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2) + 1e-8)).mean()
+    # 对称写法：eps 只防止 0/0，不改变"相同图 = 1"这一性质
+    num = (2 * mu1_mu2 + c1) * (2 * sigma12 + c2)
+    den = (mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2)
+    ssim_map = num / den.clamp_min(1e-12)
     return ssim_map.mean()
 
 
@@ -1047,7 +1081,7 @@ def train(cfg: TrainConfig, ctx) -> dict:
     t0 = time.time()
     ema_loss = None
     # 感知损失状态：函数缓存 + "不可用就永久关闭"标志
-    # （不用"每步重试"：权重缺失/前向失败是**确定性**的，重试只会刷屏并浪费时间）
+    # （权重缺失/前向失败是**确定性**的，不需要每步重试）
     _lpips_fn = None
     _lpips_disabled = False
     # 最佳检查点跟踪（导出阶段优先用它，见 stages/export.py:_find_ply）
@@ -1149,7 +1183,8 @@ def train(cfg: TrainConfig, ctx) -> dict:
                 gt = torch.where(m[..., None], gt, background.to(gt.dtype))
         l1 = l1.mean()
 
-        ssim_val = ssim_simple(render.permute(2, 0, 1)[None], gt.permute(2, 0, 1)[None])
+        ssim_val = ssim_simple(render.permute(2, 0, 1)[None], gt.permute(2, 0, 1)[None],
+                               legacy_eps=bool(getattr(cfg, "ssim_legacy_eps", False)))
         loss = (1.0 - cfg.ssim_weight) * l1 + cfg.ssim_weight * (1.0 - ssim_val)
 
         # ---- 正则项（参考 Faster-GS / 3DGS-MCMC 的做法）----
@@ -1167,16 +1202,16 @@ def train(cfg: TrainConfig, ctx) -> dict:
             loss = loss + float(cfg.scale_reg) * current_scales().mean()
 
         # ---- 感知损失 LPIPS（用户方案第 3 项）----
-        # 动机：L1 是逐像素平均，SSIM 是局部结构；两者都偏"平滑"，
-        # 对纹理细节（石雕纹样、瓦当）不敏感，渲染容易发糊。
-        # LPIPS 用预训练 VGG 的深层特征衡量差异，对纹理/结构更敏感。
+        # 动机：L1 是逐像素平均、SSIM 是局部结构，两者都偏"平滑"，对纹理细节
+        # （石雕纹样、瓦当）不敏感，渲染容易发糊。LPIPS 用预训练 VGG 的深层特征度量差异。
         #
-        # 三个设计要点：
-        #   1) `lpips_every` 隔步计算（VGG 前向开销与显存都不小）；
-        #   2) 权重缺失时**只用 WARN 并永久关闭**，不给 0 悄悄退化 ——
-        #      "开着但没生效"这种静默退化本项目踩过（见 03/G65）；
-        #   3) 首次使用时构造网络，之后的 step 复用缓存。
-        if float(cfg.lambda_lpips) > 0 and not _lpips_disabled:
+        # ⚠️ 历史教训（不要凭一轮实验就否定它）：我曾据一次对照把它判为"有害"并**删掉代码**，
+        # 那一轮测量用的是 `sh_degree=0` 渲染（丢掉高阶 SH ⇒ 低估 1.91 dB），
+        # 而 `sh_degree=0` 抹掉的正是**视角相关**外观 —— 感知损失要改善的恰恰是这部分。
+        # 也就是说：**当时那把尺子看不见优化目标**，结论是假阴性。
+        # 因此现在保留开关（默认 0），并附上噪声底：同配置 PSNR 散布约 0.09 dB，
+        # 小于它的差异不能作为结论。
+        if float(getattr(cfg, "lambda_lpips", 0.0) or 0.0) > 0 and not _lpips_disabled:
             if _lpips_fn is None:
                 try:
                     from .perceptual import get_lpips
