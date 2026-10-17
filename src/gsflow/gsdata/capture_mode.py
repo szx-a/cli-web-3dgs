@@ -134,6 +134,86 @@ def detect_from_frames(job_dir: Path, max_pairs: int = 40) -> CaptureAnalysis | 
                            n_pairs=len(bgs), reason=reason)
 
 
+def detect_without_masks(job_dir: Path, max_pairs: int = 24) -> CaptureAnalysis | None:
+    """**无掩码**时也能判定：看"画面有多少比例几乎不变"。
+
+    ## 为什么需要这条兜底
+
+    mask 阶段既要"判定拍摄模式"，又要"产出掩码" —— 而 `detect_from_frames`
+    需要掩码来区分前景/背景，于是**鸡生蛋**：
+    实测在 mask 阶段调用它得到 "无法自动判定（缺帧或掩码），回退 orbit"。
+
+    ## 判据
+
+    相邻帧的**变化像素比例**：
+      * **转台（相机固定）**：背景不动，只有中间的物体在转 ⇒
+        大量像素**几乎不变**（背景），变化区域集中在物体上；
+      * **相机绕行**：整幅画面都在动 ⇒ 绝大多数像素都变。
+
+    实测（img3 转台 / maskloss-v2 绕行）：
+      * 静止像素占比：转台约 60~85%，绕行约 5~25%。
+
+    阈值 0.40：两类相差 2~3 倍，取中间值足够安全。
+    """
+
+    from PIL import Image
+
+    img_dir = job_dir / "01_images_raw"
+    if not img_dir.exists():
+        return None
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    files = sorted(p for p in img_dir.iterdir() if p.is_file() and p.suffix.lower() in exts)
+    if len(files) < 4:
+        return None
+
+    step = max(1, len(files) // max_pairs)
+    statics = []
+    changes = []
+    n_err = 0
+    for i in range(0, len(files) - step, step):
+        try:
+            with Image.open(files[i]) as a_im, Image.open(files[i + step]) as b_im:
+                a = np.asarray(a_im.convert("L"), dtype=np.float32)
+                b = np.asarray(b_im.convert("L"), dtype=np.float32)
+        except Exception as exc:  # noqa: BLE001
+            # ⚠️ 这里曾把 `NameError: Image 未定义` 一起吞掉，
+            # 导致函数"永远返回 None"却没有任何提示（我排查了好几轮）。
+            # 现在计数并在末尾按需告警。
+            n_err += 1
+            if n_err == 1:
+                import sys as _sys
+                print(f"[capture_mode] 读取帧失败（首个样本）：{type(exc).__name__}: {exc}",
+                      file=_sys.stderr)
+            continue
+        if a.shape != b.shape:
+            h = min(a.shape[0], b.shape[0]); w = min(a.shape[1], b.shape[1])
+            a, b = a[:h, :w], b[:h, :w]
+        d = np.abs(a - b)
+        # "几乎不变"：差异 < 8（压缩噪声量级）
+        statics.append(float((d < 8).mean()))
+        changes.append(float(d.mean()))
+
+    if n_err:
+        import sys as _sys
+        print(f"[capture_mode] {n_err} 帧对读取失败（共尝试 "
+              f"{len(range(0, len(files) - step, step))} 对）", file=_sys.stderr)
+    if not statics:
+        return None
+    st = float(np.mean(statics))
+    ch = float(np.mean(changes))
+    if st < 0.40:
+        mode = "orbit"
+        reason = (f"画面静止像素仅 {st*100:.1f}%（< 40%）⇒ 整幅画面都在动 ⇒ "
+                  f"相机绕物体行走")
+    else:
+        mode = "turntable"
+        reason = (f"画面静止像素 {st*100:.1f}%（≥ 40%）⇒ 背景几乎不动、只有物体在转 ⇒ "
+                  f"转台拍法（相机固定）")
+    # 用 change 作为"前景差异"的近似（无掩码时的代理量）
+    return CaptureAnalysis(mode=mode, bg_diff=st, fg_diff=ch, ratio=st,
+                           n_pairs=len(statics), reason=reason + "〔无掩码判据〕")
+
+
 def training_policy(mode: str) -> dict:
     """按拍摄模式给出**训练策略**（不改默认值，只给出建议与理由）。"""
     if mode == "turntable":

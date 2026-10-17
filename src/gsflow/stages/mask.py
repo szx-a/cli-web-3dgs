@@ -36,6 +36,38 @@ class MaskStage(Stage):
         Artifact("02_images_clean", "清理后的图片"),
     )
 
+    def _resolve_capture_mode(self, ctx: StageContext) -> tuple[str, str]:
+        """解析 `capture.mode`，返回 (实际模式, 说明)。
+
+        `auto` 时用背景帧间差异自动判定；判定前需要有抽帧产物
+        （`01_images_raw`），若还没有就回退 orbit 并说明原因。
+        """
+        from ..gsdata.capture_mode import detect_from_frames, detect_without_masks
+        from ..gsdata.capture_mode_params import resolve_capture_mode
+
+        chosen = str(ctx.params.get("capture.mode", "auto") or "auto").strip().lower()
+        detected = None
+        try:
+            # ⚠️ 两个检测函数都接受**作业根目录**（内部拼 `01_images_raw`），
+            # 不是 `01_images_raw` 本身。我第一版传了后者，
+            # 于是内部拼成 `01_images_raw/01_images_raw` ⇒ 不存在 ⇒ 永远回退 orbit。
+            # 同一个错误我在测试脚本里也犯了一次，排查花了两轮。
+            if (ctx.job_dir / "01_images_raw").exists():
+                # 优先用掩码判据（更准）；拿不到掩码时用"画面静止比例"兜底。
+                # 为什么需要兜底：本阶段本身就是**产出掩码**的地方，
+                # 首次运行时还没有掩码，否则会出现"缺掩码 ⇒ 无法判定 ⇒ 回退 orbit"
+                # 的死循环（实测过）。
+                analysis = detect_from_frames(ctx.job_dir, max_pairs=30)
+                if analysis is None:
+                    analysis = detect_without_masks(ctx.job_dir, max_pairs=24)
+                if analysis is not None:
+                    detected = analysis.mode
+                    ctx.info(f"拍摄模式自动判定：{analysis.reason}")
+        except Exception as exc:  # noqa: BLE001
+            ctx.warn(f"拍摄模式自动判定失败（{type(exc).__name__}: {exc}），按未判定处理")
+        mode, note = resolve_capture_mode(chosen, detected)
+        return mode, note
+
     def run(self, ctx: StageContext) -> StageResult:
         src_dir = ctx.job_dir / "01_images_raw"
         images = sorted(p for p in src_dir.iterdir() if p.suffix.lower() in IMAGE_EXT)
@@ -49,6 +81,22 @@ class MaskStage(Stage):
 
         backend_name = str(ctx.cfg("backend", "fastsam"))
         mode = str(ctx.cfg("mode", "black"))
+        # ---- 拍摄模式（capture.mode）在这里**落地** ----
+        # 为什么要在此处解析：`capture.mode` 若不参与任何阶段，就只是"配置了但没执行"。
+        # 两种拍法的实质差别是"要不要保留背景"：
+        #   turntable（物体转、相机固定）⇒ 必须保留背景，否则重建只能靠物体自身旋转解释像素，
+        #     把物体转当成相机转 ⇒ 光照/遮挡不自洽（实测：保留背景后 PSNR 20.74→28.78）。
+        #   orbit（相机绕行）⇒ 抠背景 + 黑底合成为安全。
+        # `auto` 用 `gsdata/capture_mode.detect_from_frames` 按背景帧间差异自动判定
+        # （实测两类素材比值 0.015 vs 0.489，相差 34 倍）。
+        cap_mode, cap_note = self._resolve_capture_mode(ctx)
+        if cap_mode == "turntable" and mode != "keep":
+            ctx.info(f"拍摄模式=turntable ⇒ 自动改用 mask.mode=keep（原为 {mode}）：{cap_note}")
+            mode = "keep"
+        elif cap_mode == "orbit" and mode == "keep":
+            ctx.warn(f"拍摄模式=orbit 但显式指定了 mask.mode=keep；"
+                     f"相机在绕行时保留背景会引入游离高斯，建议用 black")
+        ctx.info(f"拍摄模式 = {cap_mode}（{cap_note}）")
         # 分割失败时的策略：keep=原图直通（下游仍可用）| skip=丢弃该帧
         on_failure = str(ctx.cfg("on_failure", "keep")).lower()
         if on_failure not in ("keep", "skip"):
@@ -179,7 +227,22 @@ class MaskStage(Stage):
             "params": {"dilate_px": dilate, "feather_px": feather_px,
                        "min_area_ratio": min_area_ratio, "keep_largest": keep_largest,
                        "on_failure": on_failure},
+            # **实际生效**的清理模式与拍摄模式。
+            # 为什么要显式记录：`capture.mode=turntable` 会把 `mask.mode` 自动改成 keep，
+            # 但 `job.json` 的 `settings_snapshot` 记录的是**用户请求**（black），
+            # 于是"快照"与"实际行为"不一致 —— 排查时曾因此误判 keep 没生效。
+            # 这里把解析后的真实值落到阶段输出，作为**唯一可信的行为记录**。
+            "mask_mode_effective": mode,
+            "capture_mode_effective": cap_mode,
+            "capture_mode_note": cap_note,
         }
+        # 再写一份独立文件，便于脚本不解析 manifest 就能读到
+        (mask_dir / "capture_mode.json").write_text(json.dumps({
+            "capture_mode": cap_mode,
+            "capture_mode_note": cap_note,
+            "mask_mode_effective": mode,
+            "mask_mode_requested": str(ctx.cfg("mode", "black")),
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
         (mask_dir / "manifest.json").write_text(json.dumps({"summary": summary, "items": manifest},
                                                           ensure_ascii=False, indent=2), encoding="utf-8")
 
