@@ -815,6 +815,18 @@ class ExportStage(Stage):
                     info = {**info, "drop_unseen": dinfo}
                 except Exception as exc:  # noqa: BLE001
                     ctx.warn(f"删除不可见面失败（{type(exc).__name__}: {exc}），继续导出")
+            # ---- 最后把法线统一朝外（**必须在简化/删除面之后**）----
+            #
+            # 踩过的坑：我最初把定向放在烘焙前（`_finish_mesh` 内部），
+            # 但那是在 QEM 简化**之后**又删过面 —— 两者都会打乱面绕序，
+            # 于是导出网格的"朝外比例"只有 **85.1%**（验收时为 FAIL）。
+            # 实测：在同一份网格上补一次定向能到 100%（翻转 7,270 个面）。
+            # 放在这里可以把"导出网格"与"烘焙输入"一起受益。
+            try:
+                mesh = _orient_normals_outward(mesh)
+                ctx.info("网格后处理：法线已统一朝外")
+            except Exception as exc:  # noqa: BLE001
+                ctx.warn(f"法线定向失败（{type(exc).__name__}: {exc}）")
             return self._finish_mesh(ctx, mesh, info, out_dir, cams=cams)
 
         # ---------------- 路线二：TSDF 融合 ----------------
@@ -953,6 +965,23 @@ class ExportStage(Stage):
         if len(mesh.triangles) == 0:
             ctx.warn("网格后处理后为空，放弃导出")
             return []
+
+        # ---- 法线统一朝外（必须在**任何写盘之前**）----
+        #
+        # 踩过的坑（两次）：
+        #   1) 最初只在"烘焙前"定向 ⇒ 而写 OBJ/PLY/GLB 发生在它**之前**，
+        #      于是导出文件的朝外比例仍是 85.4%（验收 FAIL）；
+        #   2) 定向后再跑 QEM 简化/删面会打乱部分绕序。
+        # 现在：后处理（简化/删面/最大连通块）**全部做完**，再定向，
+        # 然后才写文件 —— 保证"落盘的东西"就是定向后的。
+        # 实测：同网格补一次定向 85.1% → **100%**（翻转 7,270 面）。
+        try:
+            before = mesh
+            mesh = _orient_normals_outward(mesh)
+            if mesh is not before:
+                ctx.info("法线统一朝外（写盘前）")
+        except Exception as exc:  # noqa: BLE001
+            ctx.warn(f"法线定向失败（{type(exc).__name__}: {exc}）")
 
         out: list[dict] = []
         obj_path = out_dir / "model_mesh.obj"
