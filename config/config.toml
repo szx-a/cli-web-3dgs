@@ -16,6 +16,7 @@ mode = "fps"
 fps = 2.0
 count = 120
 long_side = 1920
+crop = ""
 blur_threshold = 0.0
 max_frames = 0
 

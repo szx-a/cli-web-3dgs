@@ -84,6 +84,11 @@ class FramesStage(Stage):
             raise StageError(self.name, f"目录中没有图片：{src}", "确认扩展名是 jpg/png 等常见格式")
 
         long_side = int(ctx.cfg("long_side", 0) or 0)
+        # 可选裁剪 `x,y,w,h`（在缩放之前裁）—— 见 `_resize_to` 的说明。
+        # 物体在画面里很小时，裁掉空白等于把有效分辨率提高数倍，比调参更直接。
+        crop = str(ctx.cfg("crop", "") or "").strip()
+        if crop:
+            ctx.info(f"按 crop={crop} 裁掉空白（x,y,w,h）")
         if out_dir.exists():
             for p in out_dir.iterdir():
                 if p.is_file():
@@ -91,8 +96,8 @@ class FramesStage(Stage):
         copied = 0
         for i, f in enumerate(files):
             dst = out_dir / f"{i:05d}{f.suffix.lower()}"
-            if long_side > 0:
-                self._resize_to(f, dst, long_side)
+            if long_side > 0 or crop:
+                self._resize_to(f, dst, long_side, crop)
             else:
                 shutil.copy2(f, dst)
             copied += 1
@@ -120,6 +125,19 @@ class FramesStage(Stage):
         count = int(ctx.cfg("count", 120) or 120)
 
         vf = []
+        # 可选裁剪（视频路径用 ffmpeg 的 crop 滤镜）。crop 必须在 scale **之前**，
+        # 否则裁剪坐标是相对缩放后尺寸的，会全裁歪。
+        crop_v = str(ctx.cfg("crop", "") or "").strip()
+        if crop_v:
+            try:
+                cx, cy, cw, ch = [int(v) for v in crop_v.split(",")]
+                # 保证偶数尺寸（H.264 要求），且不越界
+                cw, ch = cw - (cw % 2), ch - (ch % 2)
+                if cw > 1 and ch > 1:
+                    vf.append(f"crop={cw}:{ch}:{cx}:{cy}")
+                    ctx.info(f"按 crop={cx},{cy},{cw},{ch} 裁掉空白（在缩放之前）")
+            except (ValueError, TypeError):
+                ctx.warn(f"crop 参数格式不对（应为 x,y,w,h），忽略：{crop_v!r}")
         if mode == "count":
             if duration <= 0:
                 raise StageError(self.name, "无法读取视频时长，无法按张数抽帧", "改用 mode=fps 抽帧")
@@ -205,15 +223,34 @@ class FramesStage(Stage):
             return 0.0
 
     @staticmethod
-    def _resize_to(src: Path, dst: Path, long_side: int) -> None:
+    def _resize_to(src: Path, dst: Path, long_side: int, crop: str = "") -> None:
+        """缩放（只缩不放），可选先按 `crop = x,y,w,h` 裁剪。
+
+        **为什么需要裁剪**：物体在画面里很小时，网络容量与高斯预算大量浪费在空白上。
+        实测 IMG3（576×1280）：牌坊只占 **8.5%** 像素、联合包围盒仅 16.7%；
+        按包围盒裁到 489×316 后前景占比升到 **79.6%（9.4 倍）**，
+        等效上等于把训练分辨率提高数倍 —— 这比调任何损失/正则都直接。
+        （用 `scripts/measure_foreground_bbox.py` 求联合包围盒，它保证任何一帧都不被裁掉。）
+        """
         try:
             from PIL import Image
         except ImportError as exc:  # pragma: no cover
             raise StageError("frames", "缺少 Pillow，无法缩放", "pip install pillow") from exc
         with Image.open(src) as im:
+            if crop:
+                try:
+                    cx, cy, cw, ch = [int(v) for v in str(crop).split(",")]
+                    W0, H0 = im.size
+                    cx = max(0, min(cx, W0 - 1))
+                    cy = max(0, min(cy, H0 - 1))
+                    cw = max(1, min(cw, W0 - cx))
+                    ch = max(1, min(ch, H0 - cy))
+                    im = im.crop((cx, cy, cx + cw, cy + ch))
+                except (ValueError, TypeError):
+                    pass          # 解析失败就不裁（保持原行为）
             w, h = im.size
-            if max(w, h) <= long_side:
-                im.save(dst)
+            if long_side <= 0 or max(w, h) <= long_side:
+                im.convert("RGB").save(dst, quality=95)
                 return
             scale = long_side / max(w, h)
             im = im.convert("RGB").resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
