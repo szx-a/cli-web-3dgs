@@ -692,10 +692,25 @@ def load_colmap_data(data_dir: Path, downscale: int = 1, white_background: bool 
     cam_by_id = rec.cameras
     images = sorted(rec.images, key=lambda im: im.name)
 
+    # 自动裁剪的偏移：`gsdata/auto_crop.py` 把图与掩码都裁过之后会写 `crop.json`，
+    # 这里把**内参主点**相应平移（焦距不变）。裁剪对相机几何的唯一影响就是主点。
+    # 若没有 crop.json 则 (0,0)，行为与之前完全一致。
+    try:
+        from ..gsdata.auto_crop import read_crop_shift
+
+        _crop = read_crop_shift(data_dir) or (0.0, 0.0)
+    except Exception:  # noqa: BLE001
+        _crop = (0.0, 0.0)
+    crop_dx, crop_dy = float(_crop[0]), float(_crop[1])
+
     c2ws, ks, names, widths, heights = [], [], [], [], []
     for im in images:
         cam = cam_by_id[im.camera_id]
         k = cam.intrinsics()
+        if crop_dx or crop_dy:
+            # 裁剪是"左上角移到 (dx,dy)" ⇒ 同一像素的新坐标比旧坐标小 dx,dy
+            k[0, 2] -= crop_dx
+            k[1, 2] -= crop_dy
         if downscale > 1:
             k[0, 0] /= downscale
             k[1, 1] /= downscale

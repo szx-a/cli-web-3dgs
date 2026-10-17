@@ -645,6 +645,14 @@ async function runMeshExport(dryRun) {
  *   textured 带贴图网格（model_mesh_textured.glb）—— 最终"实感"产物
  */
 const MODE_DEF = [
+  // 高斯泼溅放**第一位**：这是模型的真实形态。
+  // 它读 3DGS PLY 的**全部 59 维**（位置3+尺度3+旋转4+不透明度1+SH48），
+  // 用专用泼溅渲染器画"朝向各异的椭球 + alpha 合成 + 视角相关 SH 着色"，
+  // 效果与 preview_*.png（gsplat 渲染）一致。
+  // 点云模式只有 6 维（xyz+rgb）⇒ 必然稀疏、无起伏、颜色扁平 ——
+  // 这就是此前"查看器里的模型比对照图差很多"的根本原因。
+  { key: 'splat',    title: '高斯泼溅',    desc: '真实高斯（59 维，含 SH 视角着色）',
+    prefers: ['gauss3d', 'splat'] },
   { key: 'points',   title: '点云',        desc: '3DGS 原始形态，最忠实',
     prefers: ['glb_points', 'ply', 'spz'] },
   { key: 'mesh',     title: '网格',        desc: '三角面 + 顶点色，看几何',
@@ -653,7 +661,7 @@ const MODE_DEF = [
     prefers: ['glb_textured'] },
 ];
 let MODELS = null;          // 当前作业的 /api/models 结果
-let ACTIVE_MODE = 'points';
+let ACTIVE_MODE = 'splat';  // 默认显示真实高斯（若产物里没有则自动回退）
 let VIEWER_READY = false;
 
 function initModelsPage() {
@@ -752,7 +760,15 @@ async function loadModelFile(f) {
   $('m-overlay').classList.remove('hide');
   $('m-overlay').textContent = '载入 ' + f.name + ' …';
   try {
-    const info = await window.GsViewer.load(f.url, f.name.toLowerCase().endsWith('.ply') ? 'ply' : 'glb');
+    // ⚠️ 不能只看文件名后缀判断格式：`gauss3d` 条目的显示名是
+    // "point_cloud.ply（完整 59 维）"，`endsWith('.ply')` 为 false，
+    // 会被误当成 glb 去解析（然后报含糊的错）。
+    // 优先用后端给的 `kind`；它是权威来源。
+    const low = String(f.name || '').toLowerCase();
+    const kind = f.kind === 'gauss3d' ? 'ply'
+      : ((low.endsWith('.splat') || f.kind === 'splat') ? 'splat'
+        : ((low.endsWith('.ply') || f.url.toLowerCase().includes('.ply')) ? 'ply' : 'glb'));
+    const info = await window.GsViewer.load(f.url, kind);
     showModelInfo(f.name, info);
   } catch (e) {
     // 失败必须显示出来 —— 之前只把 overlay 留着，用户看到的就是一片黑
@@ -766,6 +782,15 @@ function showModelInfo(name, info) {
   $('m-overlay').classList.add('hide');
   const parts = [`${info.vertices} 顶点`];
   if (info.triangles) parts.push(`${info.triangles} 面`);
+  if (info.gaussians) {
+    // 说明渲染形态与信息维度 —— 用户据此知道"看到的是不是真实高斯"
+    parts.push(`${info.gaussians} 高斯`);
+    if (info.mode === 'gauss3d') {
+      parts.push(`泼溅渲染（SH ${info.shDegree ?? 0} 阶${info.hasSH ? '，视角着色' : ''}）`);
+    } else if (info.mode === 'splat') {
+      parts.push('泼溅渲染（无 SH，`.splat` 仅 11 维）');
+    }
+  }
   if (info.textured) parts.push('带贴图');
   else if (info.colors) parts.push('顶点色');
   if (info.normals) parts.push('法线');
@@ -789,9 +814,9 @@ function initLocalFilePicker() {
     if (!f) return;
     const low = f.name.toLowerCase();
     const info = $('m-file-info');
-    if (!low.endsWith('.ply') && !low.endsWith('.glb')) {
+    if (!low.endsWith('.ply') && !low.endsWith('.glb') && !low.endsWith('.splat')) {
       // 界面层就挡掉不支持的格式，不要让查看器抛含糊错误
-      if (info) info.textContent = '不支持该格式（仅 .ply 与 .glb）：' + f.name;
+      if (info) info.textContent = '不支持该格式（仅 .ply / .glb / .splat）：' + f.name;
       return;
     }
     if (info) {
@@ -801,7 +826,7 @@ function initLocalFilePicker() {
     $('m-overlay').textContent = '读取 ' + f.name + ' …';
     try {
       const buf = await f.arrayBuffer();
-      const kind = low.endsWith('.ply') ? 'ply' : 'glb';
+      const kind = low.endsWith('.splat') ? 'splat' : (low.endsWith('.ply') ? 'ply' : 'glb');
       const r = await window.GsViewer.loadBuffer(buf, f.name, kind);
       showModelInfo(f.name, r);
       if (info) {

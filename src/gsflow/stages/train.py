@@ -115,6 +115,30 @@ class TrainStage(Stage):
         # 2) 把掩码同步到去畸变图像名下，供掩码内损失使用
         self._sync_masks(ctx, data_dir, info_file)
 
+        # 2.5) **自动裁剪**：把"裁掉空白"从手动步骤变成默认行为
+        #
+        # 为什么必须做：`img3-crop` 的 28.78 dB 依赖我**手动**量出并传入
+        # `frames.crop = 46,646,490,316`；**新鲜跑一遍只有 20.74 dB**
+        # （物体仅占画面 8.5%，容量浪费在空白上）。好结果不能依赖人工干预。
+        #
+        # 位置选在这里是因为：`data/images` 已去畸变、`data/masks` 已同步，
+        # 两者**严格对齐**，可以直接求掩码并集包围盒。裁剪量记在 `data/crop.json`，
+        # 由 `load_colmap_data` 加载时平移内参主点（焦距不变）—— 不重写 COLMAP 二进制。
+        if bool(ctx.cfg("auto_crop", True)):
+            try:
+                from ..gsdata.auto_crop import auto_crop_training_data
+
+                cinfo = auto_crop_training_data(
+                    data_dir,
+                    threshold=float(ctx.cfg("auto_crop_threshold", 0.75) or 0.75),
+                    log=ctx.info)
+                if cinfo.get("applied"):
+                    ctx.info(f"自动裁剪已生效：{cinfo['orig_w']}x{cinfo['orig_h']} → "
+                             f"{cinfo['w']}x{cinfo['h']}"
+                             f"（前景 {cinfo['fg_frac_before']*100:.1f}%）")
+            except Exception as exc:  # noqa: BLE001
+                ctx.warn(f"自动裁剪失败（{type(exc).__name__}: {exc}），按原尺寸训练")
+
         # 3) 训练（带 OOM 降级重试）
         backend = pick_trainer(backend_name, ctx)
         ok, why = backend.available(ctx)

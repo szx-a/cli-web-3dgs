@@ -286,6 +286,50 @@ def create_app():
         )
 
     # ------------------------------------------------------------------ 产物
+    @app.get("/api/gauss/{job_id}")
+    def gauss(job_id: str):
+        """直接返回训练产物的**完整 3DGS PLY**（59 维/高斯，含 SH 48）。
+
+        为什么不走 `/api/artifacts`：那个路由固定映射到 `05_export`，
+        而完整高斯在 `04_train/point_cloud/iteration_*/point_cloud.ply`。
+        复制一份到 `05_export` 会多占 28MB 且容易与训练产物不同步，
+        所以这里按 job 直接定位并流式返回。
+
+        ⚠️ 路径必须限制在 job 目录内（防目录穿越）。
+        """
+        from fastapi.responses import FileResponse
+
+        root = (Path(str(load_settings().get("project.workspace_dir"))) / job_id).resolve()
+        if not root.is_dir():
+            raise HTTPException(status_code=404, detail=f"作业不存在：{job_id}")
+        ply: Path | None = None
+        mp = root / "04_train" / "metrics.json"
+        if mp.exists():
+            try:
+                m = json.loads(mp.read_text(encoding="utf-8"))
+                best = str(m.get("best_ply") or "")
+                if best:
+                    bp = Path(best)
+                    if not bp.is_absolute():
+                        bp = root / bp
+                    bp = bp.resolve()
+                    # 防目录穿越：解析后的路径必须在 job 目录之内
+                    if bp.is_file() and str(bp).startswith(str(root)):
+                        ply = bp
+            except Exception:  # noqa: BLE001
+                ply = None
+        if ply is None:
+            cands = sorted((root / "04_train" / "point_cloud").glob("*/point_cloud.ply"))
+            if cands:
+                c = cands[-1].resolve()
+                if str(c).startswith(str(root)):
+                    ply = c
+        if ply is None:
+            raise HTTPException(status_code=404,
+                                detail="找不到训练产物 point_cloud.ply（先完成 train 阶段）")
+        return FileResponse(str(ply), media_type="application/octet-stream",
+                            filename="point_cloud.ply")
+
     @app.get("/api/artifacts/{job_id}/{path:path}")
     def artifact(job_id: str, path: str):
         # ---- 路径归一化（防御性，修 404 的第二道保险）----
@@ -334,8 +378,42 @@ def create_app():
         """
         root = Path(str(load_settings().get("project.workspace_dir"))) / job_id
         out = root / "05_export"
-        modes: dict[str, list[dict[str, Any]]] = {"points": [], "mesh": [], "textured": []}
+        modes: dict[str, list[dict[str, Any]]] = {"splat": [], "points": [], "mesh": [],
+                                                  "textured": []}
         info: dict[str, Any] = {"job_id": job_id, "manifest": False, "complete": False}
+
+        # ---- 完整 3DGS PLY（59 维/高斯，含 SH 48）⇒ 泼溅渲染的真实形态 ----
+        #
+        # 为什么单独提供：`05_export` 里的 glb/ply 点云只有 6 维（xyz+rgb），
+        # 用它渲染必然"稀疏、扁平"，用户会以为模型质量差。
+        # 训练产物 `04_train/point_cloud/iteration_*/point_cloud.ply` 才是全集
+        # （位置3 + 尺度3 + 旋转4 + 不透明度1 + SH 48 = 59）。
+        # 直接给这个文件的 URL（不经 05_export，免去 28MB 复制）。
+        try:
+            metrics_p = root / "04_train" / "metrics.json"
+            gauss_url = ""
+            if metrics_p.exists():
+                _m = json.loads(metrics_p.read_text(encoding="utf-8"))
+                best = str(_m.get("best_ply") or "")
+                if best:
+                    bp = Path(best)
+                    if not bp.is_absolute():
+                        bp = root / bp
+                    if bp.exists():
+                        gauss_url = f"/api/gauss/{job_id}"
+            else:
+                cands = sorted((root / "04_train" / "point_cloud").glob("*/point_cloud.ply"))
+                if cands:
+                    gauss_url = f"/api/gauss/{job_id}"
+            if gauss_url:
+                modes["splat"].append({
+                    "kind": "gauss3d", "name": "point_cloud.ply（完整 59 维）",
+                    "url": gauss_url, "size_mb": None,
+                    "desc": "真实高斯：位置+尺度+旋转+不透明度+SH(48)，"
+                            "按视线方向做 SH 着色",
+                })
+        except Exception:  # noqa: BLE001
+            pass
 
         man_p = out / "manifest.json"
         arts: list[dict[str, Any]] = []
@@ -393,7 +471,16 @@ def create_app():
             kind = str(a.get("kind") or "")
             desc = str(a.get("desc") or "")
             low = name.lower()
-            if low.endswith(".glb") and "mesh" in low and "textured" in low:
+            # ---- 高斯泼溅（`.splat`）：**优先显示**，因为它才是模型的真实形态 ----
+            #
+            # 背景：用户反馈"GUI 查看器里的模型比 preview_front.png 差很多"。
+            # 根因是查看器此前只能解析点云/网格 —— 每个高斯被压成 x,y,z,r,g,b，
+            # 丢了 3×3 协方差（尺度+旋转）、不透明度、SH ⇒ 必然是稀疏点阵。
+            # `.splat` 保留这些属性，查看器用专用泼溅渲染器画朝向各异的椭球 + alpha 合成。
+            if low.endswith(".splat"):
+                _add("splat", "splat", name,
+                     desc or "高斯泼溅 .splat（真实高斯形态：椭球 + alpha 合成）")
+            elif low.endswith(".glb") and "mesh" in low and "textured" in low:
                 _add("textured", "glb_textured", name, desc or "带贴图网格 glTF")
             elif low.endswith(".glb") and "mesh" in low:
                 _add("mesh", "glb_mesh", name, desc or "三角网格 glTF（顶点色）")

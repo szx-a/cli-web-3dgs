@@ -214,6 +214,7 @@ scripts\gsflow_gpu.cmd run --job-id <job> --stages export --force export --set e
 | `export.mesh_smooth_iters` | 5 | Taubin 平滑迭代（比拉普拉斯好：不收缩体积） |
 | `export.mesh_texture` | false | 是否烘焙贴图（>8 万面时 xatlas 超线性变慢） |
 | `export.mesh_texture_size` | 2048 | 贴图边长 |
+| `export.formats` | glb_points, mesh, viewer_html, **splat** | 导出格式。`splat` 为高斯泼溅文件（32 字节/高斯，11 维：位置+尺度+旋转+不透明度）。**查看器还会直接读训练的 3DGS PLY（59 维，含 SH 48）做视角相关着色**，与 `preview_*.png` 一致；glTF 点云只有 6 维、必然稀疏扁平（见 `docs/03` G108）|
 | `export.mesh_texture_reject_black` | true | 拒绝采到**纯黑背景**的像素（`mask.mode=black` 的训练图背景是 0）。实测 `final-v1` 黑色 texel **35.99% → 2.30%**。阈值是 `6/255`（注意图像在烘焙里是 **0~1 尺度**，写成 `> 6` 会永远为假 —— 我踩过，见 `docs/03` G104）|
 | `export.mask_dir` | （自动） | 纹理烘焙用的**前景掩码**目录。留空=自动查找：本作业 `02_masks` → 同级作业（**必须通过内容校验**）。同级里有 40+ 个作业文件名一致但其实是不同数据集，只按文件名会选错，**错掩码比没掩码更糟**（见 `docs/03` G107）|
 | `train.rasterize_mode` | classic | 光栅化模式：`classic` / `antialiased`（Mip-Splatting 低通滤波）。**实测 `antialiased` 在训练/评估同分辨率时明显更差**（28.79 → 27.72，−1.07 dB），故默认 classic |

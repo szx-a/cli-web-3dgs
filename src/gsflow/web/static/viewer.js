@@ -330,6 +330,66 @@ function parsePly(buf) {
   for (let i = 0; i < vcount; i++) {
     position[i*3] = rx(i); position[i*3+1] = ry(i); position[i*3+2] = rz(i);
   }
+  // ---- 3DGS 完整模型（59 维/高斯，**不丢信息维度**）----
+  //
+  // 完整的 3DGS PLY 每个高斯有：位置 3 + 尺度 3 + 旋转 4 + 不透明度 1 + **SH 48**
+  // （3 个 DC + 45 个高阶，degree=3）。检测到 `f_dc_0` 就按完整高斯解析，
+  // 交给泼溅渲染器做"椭球 + alpha + **视角相关 SH 着色**"，
+  // 于是查看器看到的是与训练/预览图（gsplat 渲染）**同一个模型**。
+  //
+  // 相比之下：`.splat`（32 字节/高斯）只有 11 维、丢掉 SH ⇒ 颜色与视角无关；
+  // glTF 点云只有 6 维（xyz+rgb）⇒ 连椭球形状和透明度都没有。
+  if (offs.f_dc_0 !== undefined) {
+    const gx = get('x'), gy = get('y'), gz = get('z');
+    const s0 = get('scale_0'), s1 = get('scale_1'), s2 = get('scale_2');
+    const r0 = get('rot_0'), r1 = get('rot_1'), r2 = get('rot_2'), r3 = get('rot_3');
+    const og = get('opacity') || get('alpha');
+    const dc = [get('f_dc_0'), get('f_dc_1'), get('f_dc_2')];
+    if (!s0 || !r0 || !og || !dc[0]) {
+      throw new Error('PLY 有 f_dc_* 但缺少 scale_*/rot_*/opacity，无法按 3DGS 解析');
+    }
+    const pos = new Float32Array(vcount * 3);
+    const scale = new Float32Array(vcount * 3);
+    const quat = new Float32Array(vcount * 4);
+    const opacity = new Float32Array(vcount);
+    const shDC = new Float32Array(vcount * 3);
+    for (let i = 0; i < vcount; i++) {
+      pos[i * 3] = gx(i); pos[i * 3 + 1] = gy(i); pos[i * 3 + 2] = gz(i);
+      scale[i * 3] = s0(i); scale[i * 3 + 1] = s1(i); scale[i * 3 + 2] = s2(i);
+      quat[i * 4] = r0(i); quat[i * 4 + 1] = r1(i);
+      quat[i * 4 + 2] = r2(i); quat[i * 4 + 3] = r3(i);
+      opacity[i] = og(i);
+      shDC[i * 3] = dc[0](i); shDC[i * 3 + 1] = dc[1](i); shDC[i * 3 + 2] = dc[2](i);
+    }
+    // 高阶 SH：f_rest_0..N-1，通道主序（先 R 的 15 个基，再 G，再 B）
+    let shRest = null, shDegree = 0;
+    const rest0 = get('f_rest_0');
+    if (rest0) {
+      // 反推通道数：总属性数 / 3
+      let nRest = 0;
+      while (get('f_rest_' + nRest)) nRest++;
+      const perCh = nRest / 3;
+      if (!Number.isInteger(perCh)) {
+        throw new Error(`f_rest 数量 ${nRest} 不是 3 的倍数，无法按通道拆分`);
+      }
+      // 基总数 = perCh + 1（+1 是 DC）；degree 由 (deg+1)² 反推
+      const bases = perCh + 1;
+      const side = Math.round(Math.sqrt(bases));
+      if (side * side !== bases) {
+        throw new Error(`f_rest 每通道 ${perCh} 个，反推的基总数 ${bases} 不是完全平方数`);
+      }
+      shDegree = side - 1;
+      shRest = new Float32Array(vcount * nRest);
+      for (let k = 0; k < nRest; k++) {
+        const rd = get('f_rest_' + k);
+        for (let i = 0; i < vcount; i++) shRest[i * nRest + k] = rd(i);
+      }
+    }
+    return { mode: -1, position: pos, color: null, uv: null, normal: null,
+             indices: null, textureUrl: null,
+             gauss3d: { pos, scale, quat, opacity, shDC, shRest, shDegree } };
+  }
+
   // 法线（网格 PLY 通常带 nx/ny/nz）：有就用于平滑光照
   let normal = null;
   const nxg = get('nx'), nyg = get('ny'), nzg = get('nz');
@@ -631,7 +691,13 @@ function makeMesh(R, model, wireframe) {  const { gl } = R;
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, L, gl.STATIC_DRAW);
     lineIndexCount = L.length;
   }
-  // 包围盒 -> 自动取景
+  // 取景：**中位数中心 + 95 分位距离**（稳健），而不是包围盒
+  //
+  // ⚠️ 为什么不用包围盒：训练出的点云/高斯常有**远处离群点**。
+  // 实测 img3-crop：包围盒半径 **4.76**，而 95% 的点都在距中位数中心 **0.84** 内
+  // —— 只有 **0.61% 的离群点**就把半径撑大了 **5.65 倍**。
+  // 用包围盒取景会让相机拉太远，物体在画面里变成一小块，
+  // 用户会以为"查看器里的模型比 preview 差很多"，其实只是取景错了。
   let mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
   for (let i = 0; i < model.position.length; i += 3) {
     for (let k = 0; k < 3; k++) {
@@ -640,11 +706,41 @@ function makeMesh(R, model, wireframe) {  const { gl } = R;
       if (v > mx[k]) mx[k] = v;
     }
   }
-  const center = [(mn[0]+mx[0])/2, (mn[1]+mx[1])/2, (mn[2]+mx[2])/2];
-  const radius = Math.max(1e-6, 0.5 * Math.hypot(mx[0]-mn[0], mx[1]-mn[1], mx[2]-mn[2]));
+  const bboxCenter = [(mn[0]+mx[0])/2, (mn[1]+mx[1])/2, (mn[2]+mx[2])/2];
+  const bboxRadius = Math.max(1e-6, 0.5 * Math.hypot(mx[0]-mn[0], mx[1]-mn[1], mx[2]-mn[2]));
+
+  // 稳健中心/半径（点数太多时抽样，保证打开大模型不卡）
+  const nPts = model.position.length / 3;
+  const stride = Math.max(1, Math.floor(nPts / 20000));
+  const subN = Math.ceil(nPts / stride);
+  const px = new Float64Array(subN), py = new Float64Array(subN), pz = new Float64Array(subN);
+  let w = 0;
+  for (let i = 0; i < nPts; i += stride) {
+    px[w] = model.position[i * 3];
+    py[w] = model.position[i * 3 + 1];
+    pz[w] = model.position[i * 3 + 2];
+    w++;
+  }
+  const medOf = (arr, len) => {
+    const a = Array.prototype.slice.call(arr, 0, len).sort((u, v) => u - v);
+    const k = len >> 1;
+    return len % 2 ? a[k] : 0.5 * (a[k - 1] + a[k]);
+  };
+  let center = bboxCenter, radius = bboxRadius, robust = false;
+  if (w >= 16) {
+    const mc = [medOf(px, w), medOf(py, w), medOf(pz, w)];
+    const ds = new Float64Array(w);
+    for (let i = 0; i < w; i++) ds[i] = Math.hypot(px[i]-mc[0], py[i]-mc[1], pz[i]-mc[2]);
+    ds.sort();
+    const q95 = ds[Math.min(w - 1, Math.floor(0.95 * (w - 1)))];
+    if (q95 > 1e-6) {
+      center = mc; radius = q95; robust = true;
+    }
+  }
   return { vbuf, cbuf, ubuf, nbuf, ibuf, lineIbuf, indexCount, lineIndexCount, idxType,
            count: model.position.length / 3, mode: model.mode,
-           center, radius, wireframe,
+           center, radius, bboxCenter, bboxRadius, robust,
+           wireframe,
            useCol: !!model.color, useUV: !!model.uv, useNrm: !!model.normal,
            texture: null };
 }
@@ -805,6 +901,15 @@ window.GsViewer = (function () {
     const view = m4viewFromQuat(qcam, eye, target);
     const proj = m4perspective(Math.PI / 4, aspect, dist * 1e-3, dist * 100);
     const mvp = m4mul(proj, view);
+
+    // ---- 高斯泼溅路径 ----
+    // 若加载的是 `.splat`，走**泼溅渲染**（每个高斯画成朝向各异的椭球 + alpha 合成），
+    // 而不是把高斯当点画。这是"查看器看起来比 preview_front.png 差很多"的根治办法：
+    // 之前每个高斯只剩 x,y,z,r,g,b，丢了协方差/不透明度/视角相关颜色。
+    if (obj && obj.splat) {
+      obj.splat.draw(view, proj, canvas.width, canvas.height, eye, qcam);
+      return;
+    }
 
     gl.useProgram(R.prog);
     gl.uniformMatrix4fv(R.U.uMVP, false, mvp);
@@ -1043,6 +1148,40 @@ window.GsViewer = (function () {
                         + ' 字节）');
       }
       if (onStatus) onStatus('解析中…');
+      const isSplat = (kind === 'splat' || low.endsWith('.splat'));
+
+      // ---- 高斯泼溅：交给专用的泼溅渲染器 ----
+      // 为什么单独一条路：泼溅需要 WebGL 实例化 + 逐帧深度桶排序 + 预乘 alpha 混合，
+      // 与"网格/点云"的绘制管线完全不同。混在一条管线上只会两边都做不好。
+      if (isSplat) {
+        if (!window.GsSplatRenderer) {
+          throw new Error('缺少 splat 渲染器（splat.js 未加载）');
+        }
+        if (obj) {
+          const g = R.gl;
+          [obj.vbuf, obj.cbuf, obj.ubuf, obj.nbuf, obj.ibuf, obj.lineIbuf]
+            .forEach((b) => { if (b) g.deleteBuffer(b); });
+          if (obj.texture) g.deleteTexture(obj.texture);
+          obj = null;
+        }
+        let sp;
+        try {
+          sp = window.GsSplatRenderer.create(R.gl, buf);
+        } catch (e) {
+          throw new Error('泼溅初始化失败：' + e.message);
+        }
+        // reset() 依赖 center / radius 取景，泼溅对象也要给（由高斯中心包围盒算出）
+        const cen = sp.bounds.center, rad = sp.bounds.radius;
+        obj = { mode: -1, splat: sp, count: sp.count, indexCount: 0,
+                center: cen, radius: rad,
+                useCol: true, useNrm: false, texture: null };
+        this.reset();
+        draw();
+        return { vertices: sp.count, triangles: 0, mode: 'splat',
+                 textured: false, colors: true, normals: false,
+                 gaussians: sp.count };
+      }
+
       let model;
       try {
         if (kind === 'glb' || low.endsWith('.glb')) {
@@ -1050,14 +1189,43 @@ window.GsViewer = (function () {
         } else if (kind === 'ply' || low.endsWith('.ply')) {
           model = parsePly(buf);
         } else {
-          // ⚠️ 只支持 glb / ply 两种容器。OBJ / SPZ 等**必须在界面层就过滤掉** ——
+          // ⚠️ 只支持 glb / ply / splat 三种容器。OBJ / SPZ 等**必须在界面层就过滤掉** ——
           // 否则这里会走进 GLB 解析分支、抛一个含糊的错误，用户只看到"黑"。
-          throw new Error('查看器不支持该格式（仅 GLB 与 PLY）：'
+          throw new Error('查看器不支持该格式（仅 GLB / PLY / SPLAT）：'
                           + (label.split('/').pop() || label));
         }
       } catch (e) {
         throw new Error('解析失败：' + e.message);
       }
+
+      // ---- 3DGS PLY：**完整信息维度**（59 维/高斯，含 SH 48）⇒ 走泼溅渲染 ----
+      if (model && model.gauss3d) {
+        if (!window.GsSplatRenderer) throw new Error('缺少 splat 渲染器（splat.js 未加载）');
+        if (obj) {
+          const g = R.gl;
+          [obj.vbuf, obj.cbuf, obj.ubuf, obj.nbuf, obj.ibuf, obj.lineIbuf]
+            .forEach((b) => { if (b) g.deleteBuffer(b); });
+          if (obj.texture) g.deleteTexture(obj.texture);
+          obj = null;
+        }
+        let sp3;
+        try {
+          sp3 = window.GsSplatRenderer.createFromGauss3D(R.gl, model.gauss3d);
+        } catch (e) {
+          throw new Error('泼溅初始化失败：' + e.message);
+        }
+        obj = { mode: -1, splat: sp3, count: sp3.count, indexCount: 0,
+                center: sp3.bounds.center, radius: sp3.bounds.radius,
+                useCol: true, useNrm: false, texture: null };
+        this.reset();
+        draw();
+        return { vertices: sp3.count, triangles: 0, mode: 'gauss3d',
+                 textured: false, colors: true, normals: false,
+                 gaussians: sp3.count,
+                 shDegree: model.gauss3d.shDegree,
+                 hasSH: !!model.gauss3d.shRest };
+      }
+
       if (!model || !model.position || model.position.length < 3) {
         throw new Error('解析后没有任何顶点（文件可能只含空网格）');
       }

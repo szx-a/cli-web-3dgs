@@ -329,7 +329,36 @@ class ExportStage(Stage):
                              "desc": "点云式 glTF，通用查看器可直接打开"})
             ctx.success(f"已导出 {glb_path.name}（{produced[-1]['size_mb']} MB）")
 
-        if "spz" in formats or "splat" in formats:
+        # ---- `.splat`（32 字节/高斯）：让查看器能渲染**真正的高斯** ----
+        #
+        # 用户反馈"GUI 查看器里的模型比 preview_front.png 差很多"。查清原因：
+        # 查看器只解析 glTF POINTS / PLY 点云，每个高斯被压成 `x,y,z,r,g,b`
+        # ⇒ **丢了 3×3 协方差（尺度+旋转）、不透明度、SH** ⇒ 必然是稀疏点阵。
+        # 这不是渲染质量问题，是**渲染的东西不对**。
+        # `.splat` 保留位置+尺度+不透明度+旋转，查看器就能画朝向各异的椭球并做 alpha 合成。
+        # 不依赖外部包（`spz` 包未安装时 `_write_spz` 会静默返回 None）。
+        if "splat" in formats:
+            try:
+                from ..gsdata.splat_io import gaussians_to_splat
+
+                payload = gaussians_to_splat(gauss)
+                if payload:
+                    sp = out_dir / "model.splat"
+                    sp.write_bytes(payload)
+                    produced.append({"kind": "splat", "path": sp.name,
+                                     "size_mb": round(sp.stat().st_size / 1024 / 1024, 2),
+                                     "gaussians": int(gauss.get("n") or 0),
+                                     "bytes_per_gaussian": 32,
+                                     "desc": "高斯泼溅 .splat（32 字节/高斯，查看器据此渲染椭球+alpha）"})
+                    ctx.success(f"已导出 {sp.name}"
+                                f"（{len(payload)/1024/1024:.1f} MB，"
+                                f"{int(gauss.get('n') or 0):,} 个高斯）")
+                else:
+                    ctx.warn("splat 导出：高斯为空，跳过")
+            except Exception as exc:  # noqa: BLE001
+                ctx.warn(f"splat 导出失败（不影响其它产物）：{type(exc).__name__}: {exc}")
+
+        if "spz" in formats:
             try:
                 spz_path = self._write_spz(out_dir / "model.spz", gauss)
                 if spz_path:
@@ -337,6 +366,8 @@ class ExportStage(Stage):
                                      "size_mb": round(spz_path.stat().st_size / 1024 / 1024, 2),
                                      "desc": "SPZ 压缩格式（three.js / SuperSplat 生态）"})
                     ctx.success(f"已导出 {spz_path.name}")
+                else:
+                    ctx.warn("SPZ 导出需要 `spz` python 包（未安装，改用 formats=splat 即可）")
             except Exception as exc:
                 ctx.warn(f"SPZ 导出失败（不影响其它产物）：{exc}")
 

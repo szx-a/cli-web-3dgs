@@ -79,16 +79,27 @@ function mkGlStub() {
     useProgram: () => {},
     // 故意让"不存在的 uniform"返回 null，模拟真实驱动行为
     getUniformLocation: (p, n) => {
-      const known = ['uMVP','uPointSize','uUseCol','uUseTex','uRound','uGray','uLight','uTex','uUseNrm'];
+      // 网格着色器的 uniform（已知）+ **泼溅着色器**的 uniform。
+      // 泼溅程序用 uView/uProj/uFocal/uViewport，必须也在白名单里，
+      // 否则探针会把它们当成"返回 null 的 uniform"误报（它们其实合法）。
+      const known = ['uMVP','uPointSize','uUseCol','uUseTex','uRound','uGray','uLight','uTex','uUseNrm',
+                     'uView','uProj','uFocal','uViewport'];
       const loc = known.includes(n) ? { n } : null;
       if (!loc) uniformNulls.push(n);
       return loc;
     },
     getAttribLocation: (p, n) => {
-      const map = { aPos: 0, aCol: 1, aUV: 2, aNrm: 3 };
+      const map = { aPos: 0, aCol: 1, aUV: 2, aNrm: 3,
+                    aCorner: 4, aCenter: 5, aCovA: 6, aCovB: 7, aColor: 8 };
       return n in map ? map[n] : -1;
     },
     createBuffer: () => ({ id: 'buf' + (++obj) }),
+    // 泼溅渲染器每帧会更新颜色/索引（SH 着色 + 深度排序）——原 stub 缺这一个，
+    // 缺它就报 "gl.bufferSubData is not a function"。
+    // ⚠️ 只补**真正缺失**的方法：重复定义会覆盖后续带追踪的版本，
+    //    导致 gl.__traced 丢失、探针误报"错误溯源未安装"（我踩过）。
+    bufferSubData: (target, off, data) =>
+      calls.push(['bufferSubData', target, data && data.length]),
     bindBuffer: (t, b) => calls.push(['bindBuffer', t, b && b.id]),
     bufferData: (t, d) => calls.push(['bufferData', t, d && d.byteLength]),
     enableVertexAttribArray: (i) => {
@@ -108,13 +119,16 @@ function mkGlStub() {
     viewport: (x, y, w, h) => calls.push(['viewport', x, y, w, h]),
     uniformMatrix4fv: (l, tr, m) => {
       calls.push(['uniformMatrix4fv', l && l.n]);
-      if (l && l.n === 'uMVP' && m) {
+      // 网格/点云路径用 uMVP；**泼溅路径**用 uView + uProj（两个矩阵）。
+      // 都要采样：否则跑 3DGS PLY 时 mvpFinite 为空，探针会以
+      // "万向锁采样 0 次" 为由退出码 1（误判）。
+      if (l && (l.n === 'uMVP' || l.n === 'uView' || l.n === 'uProj') && m) {
         const vals = Array.from(m);
         const finite = vals.every(Number.isFinite);
         mvpFinite.push(finite);
         if (!quiet) {
           const nonzero = vals.filter((v) => v !== 0).length;
-          console.log('  [uMVP] 有限=' + finite + ' 非零元素=' + nonzero + '/16');
+          console.log(`  [${l.n}] 有限=${finite} 非零元素=${nonzero}/16`);
         }
       }
     },
@@ -142,8 +156,28 @@ function mkGlStub() {
         setErr(0x0502, 'drawElements(LINES, ' + c + ') 索引数不是偶数');
       }
     },
-    getExtension: (name) => (name === 'OES_element_index_uint' && glHasUintIndex
-      ? { name } : null),
+    getExtension: (name) => {
+      if (name === 'OES_element_index_uint' && glHasUintIndex) return { name };
+      // 高斯泼溅渲染器需要实例化绘制（WebGL1 走 ANGLE_instanced_arrays）。
+      // 不给这个扩展，`splat.js` 会直接抛"不支持"，于是探测不到泼溅路径。
+      // 这里补一个最小实现，并把实例化调用记录下来供断言。
+      if (name === 'ANGLE_instanced_arrays') {
+        return {
+          name,
+          vertexAttribDivisorANGLE: (loc, d) => calls.push(['vertexAttribDivisor', loc, d]),
+          drawElementsInstancedANGLE: (m, c, t, o, n) => {
+            calls.push(['drawElementsInstanced', m, c, n]);
+            if (m === 1 && c % 2 !== 0) {
+              setErr(0x0502, '实例化 drawElements(LINES) 索引数不是偶数');
+            }
+          },
+          drawArraysInstancedANGLE: (m, f, c, n) => {
+            calls.push(['drawArraysInstanced', m, f, c, n]);
+          },
+        };
+      }
+      return null;
+    },
     getError: () => { const e = errState; errState = 0; return e; },
     getParameter: (pname) => {
       // 合法 pname 集合（含字符串类 VENDOR/RENDERER/VERSION）
@@ -183,7 +217,13 @@ function mkTarget(store) {
 }
 const canvas = Object.assign(mkTarget(listeners.canvas), {
   clientWidth: 800, clientHeight: 600, width: 800, height: 600,
-  getContext: () => mkGlStub(),
+  // ⚠️ 必须**缓存**同一个 GL 对象：原来写成 `() => mkGlStub()`，
+  // 每次调用都新建一个 ⇒ 探针在外层补的方法（uniform2f 等）补到了另一个对象上，
+  // 查看器手里的还是缺方法的旧对象，泼溅渲染照样报 "gl.uniform2f is not a function"。
+  getContext: (() => {
+    let cached = null;
+    return () => { if (!cached) cached = mkGlStub(); return cached; };
+  })(),
 });
 const windowStub = Object.assign(mkTarget(listeners.window), { devicePixelRatio: 1 });
 const documentStub = { getElementById: () => canvas };
@@ -220,6 +260,18 @@ globalThis.URL = { createObjectURL: () => 'blob:stub' };
 globalThis.Image = class { set src(_) { if (this.onerror) this.onerror(new Error('no image')); } };
 
 // ---- 加载真实 viewer.js ----
+// 先加载 splat.js：viewer.js 在遇到 3DGS PLY / .splat 时会调用
+// `window.GsSplatRenderer`，没加载就抛"缺少 splat 渲染器"，探测不到泼溅路径。
+try {
+  const splatSrc = fs.readFileSync(
+    path.join('src', 'gsflow', 'web', 'static', 'splat.js'), 'utf8');
+  new Function('window', splatSrc)(windowStub);
+  console.log('加载 splat.js: ' + (windowStub.GsSplatRenderer ? 'OK' : '**未挂载**'));
+} catch (e) {
+  console.log('**加载 splat.js 抛出**: ' + e.message);
+  process.exit(1);
+}
+
 const src = fs.readFileSync(path.join('src', 'gsflow', 'web', 'static', 'viewer.js'), 'utf8');
 const mod = { exports: {} };
 try {
@@ -241,6 +293,22 @@ let statusLog = [];
 try {
   V.init(canvas, (s) => { statusLog.push(s); console.log('  [status] ' + s); });
   console.log('init() OK');
+  // ---- 补齐泼溅渲染器需要的 GL 接口（**必须在第一次 load 之前**）----
+  // 这些方法原 stub 没有（uniform2f / getUniformLocation 等），缺了会在
+  // `splat.js::draw` 里抛 "gl.uniform2f is not a function"。
+  // 只在缺失时补，绝不覆盖已有的（带错误追踪的）版本 —— 否则探针会误报
+  // "错误溯源未安装"（我第一版写进对象字面量，重复定义就把它盖掉了）。
+  {
+    const g = canvas.getContext('webgl');
+    const extra = ['uniform2f', 'uniform3f', 'getUniformLocation', 'getAttribLocation',
+                   'uniformMatrix4fv', 'bufferSubData', 'deleteBuffer', 'deleteTexture',
+                   'blendFunc', 'depthMask', 'cullFace', 'depthFunc'];
+    const added = [];
+    for (const n of extra) {
+      if (typeof g[n] !== 'function') { g[n] = () => {}; added.push(n); }
+    }
+    if (added.length) console.log('  补齐 stub 接口: ' + added.join(', '));
+  }
 } catch (e) {
   console.log('**init() 抛出**: ' + e.message + '\n' + e.stack);
   process.exit(1);
@@ -342,6 +410,20 @@ try {
 console.log('\n--- init() 后严格自检 ---');
 {
   const gl = canvas.getContext('webgl');
+  // 泼溅渲染器会用到几个原 stub 没有的接口（uniform2f / getUniformLocation 等）。
+  // 用**运行时补齐**而不是写进对象字面量：只在缺失时补，绝不覆盖已有的（带追踪的）版本
+  // —— 之前我把它们写进字面量，重复定义覆盖了追踪版，探针就误报"错误溯源未安装"。
+  const extra = ['uniform2f', 'uniform3f', 'getUniformLocation', 'getAttribLocation',
+                 'uniformMatrix4fv', 'bufferSubData', 'deleteBuffer', 'deleteTexture',
+                 'blendFunc', 'depthMask', 'cullFace', 'depthFunc'];
+  const added = [];
+  for (const n of extra) {
+    if (typeof gl[n] !== 'function') {
+      gl[n] = () => {};
+      added.push(n);
+    }
+  }
+  if (added.length) console.log('  补齐 stub 接口: ' + added.join(', '));
   const must = ['getParameter', 'getError', 'enable', 'clear', 'viewport',
                 'drawElements', 'drawArrays', 'vertexAttribPointer',
                 'enableVertexAttribArray', 'disableVertexAttribArray',

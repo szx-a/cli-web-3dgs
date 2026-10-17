@@ -398,10 +398,25 @@ def test_ply_mesh_is_parsed_as_solid_not_point_cloud() -> None:
         f"网格 PLY 没有用 drawElements(TRIANGLES) 绘制：\n{out}"
     assert "PLY 面索引越界" not in out, out
 
-    # 对照组：点云 PLY 仍应是 POINTS（不能把点云误判成网格）
+    # 对照组：3DGS 点云 PLY 必须走**泼溅渲染**（而不是被画成稀疏点阵）
+    #
+    # ⚠️ 期望值变更说明（重要）：
+    # 原来这里断言 `mode:0`（POINTS），因为那时查看器只能把 PLY 画成点云。
+    # 但用户反馈"GUI 里的模型比 preview_*.png 差很多"，根因正是：
+    # 3DGS PLY 有 **59 维/高斯**（位置3+尺度3+旋转4+不透明度1+SH48），
+    # 而点云渲染只用了 6 维 ⇒ 必然稀疏、无起伏、颜色扁平。
+    # 现在 `parsePly` 检测到 `f_dc_0` 就按完整 3DGS 解析并交给泼溅渲染器
+    # （椭球 + alpha 合成 + 视角相关 SH 着色），所以期望变成 `gauss3d`。
+    # 判据也随之更严格：不但不能是网格，还必须**不是** POINTS 点云。
     if pts is not None:
         r2 = _run_probe(pts)
         out2 = (r2.stdout or "") + (r2.stderr or "")
-        assert '"mode":0' in out2.replace(" ", ""), \
-            f"点云 PLY 应保持 POINTS：\n{out2}"
-        assert '["drawArrays",0' in out2.replace(" ", ""), out2
+        flat2 = out2.replace(" ", "").lower()
+        assert '"mode":"gauss3d"' in flat2, \
+            f"3DGS 点云 PLY 应走泼溅渲染（mode=gauss3d），实际：\n{out2}"
+        assert '"hassh":true' in flat2, \
+            f"应报告读到 SH（完整 59 维），实际：\n{out2}"
+        assert '"shdegree":3' in flat2, f"SH 阶应为 3：\n{out2}"
+        # 关键：**不能**退化成点云绘制
+        assert '["drawarrays",0' not in flat2, \
+            f"3DGS 点云不应再用 drawArrays(POINTS) 绘制：\n{out2}"

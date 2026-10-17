@@ -145,6 +145,15 @@ DEFAULTS: dict[str, Any] = {
         # 0 = 关闭"分位自适应阈值"，用固定绝对阈值（与 trainer 默认一致）。
         # 实测分位自适应会导致无界增长，已回退。
         "densify_quantile": 0.0,
+        # ---- 自动裁剪（默认开）：裁掉画面空白，把容量花在物体上 ----
+        # 实测 IMG3（576×1280 竖屏）：物体只占 **8.5%** 像素，联合包围盒仅 16.7%。
+        # 不裁剪 ⇒ PSNR 20.74 dB；裁到 489×316（前景 79.6%）⇒ **28.78 dB（+8.04）**。
+        # 之前这条路径依赖**手动**量包围盒并传 `frames.crop`，新鲜跑一遍吃不到这个收益。
+        # 现在 train 阶段在去畸变+掩码同步之后自动求掩码并集包围盒并裁剪，
+        # 裁剪量记在 `data/crop.json`，加载时只平移内参主点（焦距不变）。
+        "auto_crop": True,
+        # 前景联合包围盒面积 / 原图面积 小于该值才裁（否则说明本来就够满）
+        "auto_crop_threshold": 0.75,
         # ---- 两项**社区标准质量杠杆**（此前都没用上）----
         # 光栅化模式（Mip-Splatting 思路）：
         #   "classic"（默认）—— 3DGS 原版。
@@ -328,7 +337,7 @@ DEFAULTS: dict[str, Any] = {
         #   viewer_html 单文件离线查看器
         #   spz / splat 需额外依赖；obj 为点云 OBJ
         # 默认给出用户要求的三种查看产物：点云(ply/glb) + 网格 + （可选）带贴图网格
-        "formats": ["glb_points", "mesh", "viewer_html"],
+        "formats": ["glb_points", "mesh", "viewer_html", "splat"],
         "glb_max_points": 800000,
         "glb_shrink": 1.0,
         "viewer_cdn": "",         # 留空则用本地静态查看器
