@@ -61,6 +61,9 @@ def main() -> int:
     ap.add_argument("--baseline", action="store_true",
                     help="基线作业模式：只验证产物与结构，不套 PSNR/SSIM 质量阈值"
                          "（基线数据/预算与目标作业不同，无可比性）")
+    ap.add_argument("--check-train-config", action="store_true",
+                    help="额外校验训练策略**真的**生效（无致密化判据退回）。"
+                         "做优化对比时必须打开；历史作业会在这里失败（属正常）")
     args = ap.parse_args()
 
     from gsflow.paths import apply_runtime_env
@@ -121,6 +124,32 @@ def main() -> int:
             chk("TEXCOORD_0" in (pr.get("attrs") or []), f"{label} 有 TEXCOORD_0")
             chk(len(s.get("images") or []) >= 1, f"{label} 内嵌贴图",
                 str([i.get("mime") for i in s.get("images") or []]))
+
+    # ---------- 1.5 训练策略是否**真的**生效（可选，默认关闭）----------
+    #
+    # 为什么默认关闭：这一项检验的是"模型是**怎么**产出的"，而不是"产物好不好"。
+    # 历史作业（在 G109 那个 bug 修好之前训练的）会在这里失败 —— 那是对的，
+    # 但它不该让一个**可用**的产物被判为不可交付。
+    # 做**优化对比**时必须打开（`--check-train-config`），否则会把
+    # "配置写着 grad2d、实际跑 grad3d" 的结果当成 grad2d 的效果
+    # （这正是我上一轮差点犯的错：img3-crop 的 28.78 dB 其实是 grad3d 跑的）。
+    if args.check_train_config:
+        print("\n② 训练策略生效性")
+        try:
+            rc = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "check_train_used_config.py"),
+                 "--job", args.job],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                cwd=str(ROOT))
+            out = ((rc.stdout or "") + (rc.stderr or "")).strip()
+            # ⚠️ 变量名不能叫 `ok`：外层 `chk()` 用 `(ok if cond else fail).append(...)`，
+            # `ok` 是个**列表**；我在这里用 `ok = ...` 把它重绑成 bool，
+            # 结果 chk 里报 `'bool' object has no attribute 'append'`。
+            cfg_ok = rc.returncode == 0
+            chk(cfg_ok, "配置与实际训练行为一致（无致密化判据退回）",
+                "" if cfg_ok else out[-500:])
+        except Exception as exc:  # noqa: BLE001
+            chk(False, "训练策略生效性", f"{type(exc).__name__}: {exc}")
 
     # ---------- 2. 高斯质量 ----------
     print("\n③ 高斯质量（训练指标）")
@@ -201,6 +230,35 @@ def main() -> int:
         # `.splat` 是可选格式；但没有它时**必须**有 /api/gauss 可用（完整 PLY 路径）
         chk(True, "`.splat` 未导出（可选）——完整 PLY 路径仍可用于泼溅",
             "如需离线分发请把 splat 加入 export.formats")
+
+    # ---- 5c. 查看器**真的**走到泼溅路径（不是只看着色器静态合法）----
+    #
+    # 着色器语法合法 ≠ 查看器能用。真正的链路是：
+    #   解析 3DGS PLY（59 维）→ 建立 GL 资源 → 每帧排序 + SH 着色 → 出图
+    # 这里的无头探针会加载**真实 viewer.js/splat.js**，用 stub GL 跑一遍，
+    # 要求 `load()` 返回 `mode=gauss3d`、`hasSH=true`、`shDegree=3`。
+    # 任何一环断掉（脚本缺失、解析没认出 f_dc_*、泼溅初始化抛错）都会在这里暴露。
+    ply3d = None
+    for cand in sorted((exp.parent / "04_train" / "point_cloud").glob("*/point_cloud.ply")):
+        ply3d = cand
+    if ply3d is not None:
+        try:
+            rp = subprocess.run(
+                ["node", str(ROOT / "scripts" / "probe_viewer_runtime.mjs"), str(ply3d)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                cwd=str(ROOT))
+            out = (rp.stdout or "") + (rp.stderr or "")
+            flat = out.replace(" ", "").lower()
+            ok_path = ('"mode":"gauss3d"' in flat and '"hassh":true' in flat
+                       and '"shdegree":3' in flat)
+            chk(ok_path, "查看器无头探针走通泼溅路径（59 维 + SH 3 阶）",
+                "" if ok_path else out[-400:])
+        except FileNotFoundError:
+            chk(False, "查看器无头探针", "找不到 node（无法验证泼溅链路）")
+        except Exception as exc:  # noqa: BLE001
+            chk(False, "查看器无头探针", f"{type(exc).__name__}: {exc}")
+    else:
+        chk(False, "查看器无头探针", "没有训练产物 point_cloud.ply")
 
     # ---------- 4. 网格质量 ----------
     print("\n⑥ 网格质量")

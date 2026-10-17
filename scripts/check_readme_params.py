@@ -94,6 +94,15 @@ def selftest() -> int:
 
 
 def main() -> int:
+    # `--readme PATH`：允许指向一份**改过的** README 做负向测试。
+    # 为什么需要：沙箱不允许在 `env\` 下随意建目录，测试没法复制整个 scripts 树；
+    # 有了这个参数，测试只需把改过的 README 写到允许的临时目录即可。
+    readme_path = ROOT / "README.md"
+    if "--readme" in sys.argv:
+        i = sys.argv.index("--readme")
+        if i + 1 < len(sys.argv):
+            readme_path = Path(sys.argv[i + 1])
+
     from gsflow.config import DEFAULTS
 
     print("=== 检查器自检（已知答案）===")
@@ -102,7 +111,7 @@ def main() -> int:
         print(f"\n**检查器自身有问题（{bad_self} 项）⇒ 下面的结论不可信**")
         return 2
 
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme = readme_path.read_text(encoding="utf-8")
     print("\n=== README 参数表 vs 代码默认值 ===")
     bad = missing = 0
     for sec, key in KEYS:
@@ -119,7 +128,57 @@ def main() -> int:
               f"{'OK' if ok else '**不符**'}")
     print(f"\n结论: {bad} 项不符、{missing} 项缺失"
           + ("  ⇒ 需要更新 README" if (bad or missing) else "  ⇒ 一致"))
-    return 0 if (bad == 0 and missing == 0) else 1
+
+    # ---- 反向检查：**关键配置项必须写进 README 参数表** ----
+    #
+    # ⚠️ 原来只做单向（README 的行 → DEFAULTS），于是"新增配置项但不写文档"
+    # 永远不会被发现 —— 我这轮加了 `train.auto_crop_in_train`，
+    # README 里根本没有，检查器照样报"0 项缺失"。这正是文档漂移的入口。
+    #
+    # 但把**全部** DEFAULTS 键都硬性要求写进 README 也不现实（有近百个
+    # 内部/调试项）。所以分层：
+    #   * MUST_DOC：**影响最终质量或用户必须知道**的键 ⇒ 缺了直接失败；
+    #   * 其余：只提示，不失败。
+    MUST_DOC = {
+        ("train", "rasterize_mode"),
+        ("train", "densify_criterion"),
+        ("train", "densify_grad2d_threshold"),
+        ("train", "absgrad"),
+        ("train", "auto_crop"),
+        ("train", "auto_crop_in_train"),
+        ("frames", "auto_crop"),
+        ("frames", "crop"),
+        ("mask", "mode"),
+        ("capture", "mode"),
+        ("export", "formats"),
+        ("export", "mesh_drop_unseen"),
+        ("export", "mesh_min_views"),
+        ("export", "mesh_texture_reject_black"),
+    }
+    missing_must: list[tuple[str, str, object]] = []
+    advisory: list[tuple[str, str, object]] = []
+    for sec, kv in DEFAULTS.items():
+        if not isinstance(kv, dict):
+            continue
+        for key, val in kv.items():
+            if cell(readme, sec, key) is not None:
+                continue
+            if (sec, key) in MUST_DOC:
+                missing_must.append((sec, key, val))
+            else:
+                advisory.append((sec, key, val))
+
+    if missing_must:
+        print(f"\n=== 关键配置项**没有**写进 README 参数表（{len(missing_must)} 个）===")
+        for sec, key, val in missing_must:
+            print(f"  {sec}.{key:<28} 默认值={norm(val)}")
+        print("  ⇒ 这些直接影响最终质量或用户必须知道，必须补进 README")
+    else:
+        print("\n=== 关键配置项全部已写进 README ===")
+    if advisory:
+        print(f"（另有 {len(advisory)} 个次要/内部配置项未写进 README，仅提示）")
+
+    return 0 if (bad == 0 and missing == 0 and not missing_must) else 1
 
 
 if __name__ == "__main__":

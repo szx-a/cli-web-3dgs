@@ -1489,7 +1489,10 @@ def train(cfg: TrainConfig, ctx) -> dict:
         if step == 1:
             ga = means.grad
             gn = float(ga.abs().sum()) if ga is not None else -1.0
-            alpha_sum = float(alphas[0].sum())
+            # ⚠️ 必须 `.detach()`：alphas 仍挂在反向图上，直接 float() 会每步
+            # 打一条 UserWarning（"Converting a tensor with requires_grad=True
+            # to a scalar may lead to unexpected behavior"），日志被噪音淹没。
+            alpha_sum = float(alphas[0].detach().sum())
             ctx.info(f"训练探针（step 1）：alpha 和={alpha_sum:.1f} "
                      f"可见像素={int((alphas[0] > 0.01).sum())} means.grad.abs().sum()={gn:.3e}")
             if ga is None or gn == 0.0:

@@ -224,9 +224,14 @@ scripts\gsflow_gpu.cmd run --job-id <job> --stages export --force export --set e
 | `train.lambda_lpips` | 0 | 感知损失权重（自己实现的 VGG16 LPIPS，见 `docs/05` §5.3）。**默认关闭**：3 次重复实测三指标均不显著，且方差约 3 倍 |
 | `train.lambda_depth_distortion` | 0 | 深度失真正则（2DGS 的 λd）。**权重必须按本项目损失口径实测校准**，不能照抄论文的 1000。**注意**：单次测得 +0.199 dB，但 3 次重复后 **+0.026 dB、不显著**（见 `docs/03` G90-B）|
 | `train.opacity_cleanup` | none | **不透明度治理方案**（GUI 下拉框与 CLI `--opacity-cleanup` 共用同一份映射，见 `trainers/opacity_cleanup.py`）：`none`（默认最稳）/ `decay`（C·平滑衰减）/ `recovery`（A·恢复感知剪枝）/ `utilization`（B·利用率剪枝）/ `reset`（官方周期重置，实测最差）。实测见 `docs/03` G84 |
-| `train.densify_criterion` | grad2d | 致密化判据来源：`grad2d`（官方口径：屏幕空间梯度 / 可见次数）/ `grad3d`（旧：世界空间梯度）。**两者量纲差 45 倍、选中的高斯 IoU 仅 0.065**（`docs/03` G90-C）|
+| `train.densify_criterion` | grad2d | 致密化判据来源：`grad2d`（官方口径：屏幕空间梯度 / 可见次数）/ `grad3d`（旧：世界空间梯度）。**两者量纲差 45 倍、选中的高斯 IoU 仅 0.065**（`docs/03` G90-C）。⚠️ **两者的"哪个更好"目前没有受控对比** —— 此前记的"grad2d 更高斯/更好"已被证伪：那些作业的 grad2d 因 G109 的 bug **静默退回了 grad3d**（见 `docs/03` G113）。想复核请用 `scripts/ab_densify_rasterize.py`（带重复与 95% CI），并用 `scripts/check_train_used_config.py` 确认判据真的生效 |
 | `capture.mode` | auto | **拍摄模式**（GUI 下拉框与 CLI `--capture-mode` 共用同一份映射，见 `gsdata/capture_mode_params.py`）：`auto`（按背景帧间差异自动判定）/ `turntable`（物体转、相机固定 ⇒ **保留背景** `mask.mode=keep`）/ `orbit`（相机绕行 ⇒ 抠背景）。实测两类素材的比值相差 **34 倍**（`docs/03` G91）|
 | `mask.mode` | black | `black`（背景填黑）/ `inpaint`（纹理补全）/ **`keep`（保留原始背景 —— 转台拍摄必须用）** |
+| `train.densify_grad2d_threshold` | 2e-4 | `densify_criterion=grad2d` 时的阈值，**官方默认值**（`gsplat/strategy/default.py` 的 `grow_grad2d`）。只有 grad2d 口径下这个数值才有意义 —— grad3d 的梯度量纲不同，套用会几乎不加密（`docs/03` G90、G109）|
+| `frames.auto_crop` | true | **自动裁剪（必须在 COLMAP 之前做）**。判据是**帧间时间方差**：转台时物体在动、背景静止；相机绕行时全图都变 ⇒ 包围盒≈全图 ⇒ 自动不裁。不需要掩码或分割模型。实测 IMG3 物体只占 8.5% 像素，裁剪后前景 81% ⇒ PSNR 20.74 → **28.58 dB**（`docs/03` G112）|
+| `frames.crop` | （空） | 手动裁剪框 `x,y,w,h`（原图坐标）。填了就**优先于**自动裁剪 |
+| `train.auto_crop` | true | 兼容旧行为用的开关：是否允许 train 阶段在掩码同步后**再**求一次并集包围盒并裁剪（已裁过则跳过）|
+| `train.auto_crop_in_train` | false | **默认关闭**：在 train 阶段裁剪太晚 —— COLMAP 已经用全图建完整个场景（会把整个房间都重建出来，点云 bbox 13.7×1.6×8.5、离质心最远 10.63，而正确做法只有 5.7×1.0×5.4 / 4.51），初始化高斯散布全场景后 PSNR 只有 19.97 dB。裁图请在 `frames` 阶段（`frames.auto_crop`）做（`docs/03` G112）|
 
 > 网格流程（对应社区标准做法）：渲深度 → 按不透明度/深度一致性过滤 →
 > **反投影成紧贴表面的稠密点云** → 体素下采样均匀化 → 泊松重建 →
