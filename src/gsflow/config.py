@@ -166,6 +166,28 @@ DEFAULTS: dict[str, Any] = {
         #   其余不动（不像重置那样影响全部高斯）。0 = 关闭（默认）。
         "utilization_prune_interval": 0,
         "utilization_prune_quantile": 0.2,
+        # 剪枝**只在这个步数之前**发生（0 = 不额外限制）。
+        # ⚠️ 实测教训：第一版按 interval=400 周期性剪 20%，8000 步内剪了约 20 次，
+        #    0.8^20 ≈ 0.012 ⇒ 高斯 139,719 → **7,070**、PSNR → 21.04（比不剪低 2.1 dB）。
+        #    用户方案的原意是"**每次重置后**剪一次"；本项目不用重置，
+        #    于是它退化成"每 400 步都剪" —— **触发条件用错了，不是方案无效**。
+        #    现在配合大 interval（4000）+ `*_until` 把剪枝限制在少数几次。
+        "utilization_prune_until": 0,
+        # ---- 方案 A：恢复感知剪枝（recovery-aware pruning）----
+        # 判据是"**恢复速度**"：正常高斯在所有视角贡献为正，被衰减后很快被拉回；
+        # 浮空物只在少数视角有贡献，不透明度震荡、**恢复慢** ⇒ 剪掉最慢的那批。
+        # 用户原方案以"重置后 300 步"为窗口；本项目不用重置（实测 −0.59 dB），
+        # 改用方案 C 的平滑衰减做打压，判据与剪枝对象保持原意。
+        # 0 = 关闭（默认）。建议配合 opacity_decay 一起用。
+        "recovery_prune_interval": 0,
+        "recovery_prune_quantile": 0.2,
+        # 快照后等多少步再判断"恢复了多少"（用户方案给 300）
+        "recovery_window": 300,
+        # 同 utilization_prune_until：限制剪枝只在少数几步发生
+        "recovery_prune_until": 0,
+        # ---- 当前选用的"不透明度治理方案"名称：none / reset / utilization / recovery / decay ----
+        # 仅作**标记与界面显示**用；真正的行为由上面各开关决定（不做隐式开关联动）。
+        "opacity_cleanup": "none",
         # 掩码内损失生效的迭代占比：1.0 = 全程约束在掩码内。
         # （同样是曾与 trainer 不一致的一项：这里 0.25、trainer 1.0。）
         "mask_loss_until": 1.0,

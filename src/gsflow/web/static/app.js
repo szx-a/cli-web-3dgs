@@ -1,6 +1,19 @@
 /* gsflow GUI —— 无框架、无 CDN 依赖，离线可用。 */
 'use strict';
 
+// 不透明度治理方案的映射表（**由后端 /api/opacity_cleanup 填充**，不在前端硬编码）。
+// 这样 CLI 的 --opacity-cleanup 与 GUI 下拉框一定产出相同的参数集合。
+const OPACITY_MAP = {};
+async function loadOpacityMap() {
+  try {
+    const d = await api('/api/opacity_cleanup');
+    (d.choices || []).forEach((c) => { OPACITY_MAP[c.value] = c.params; });
+    console.debug('[opacity_cleanup] 已从后端载入映射：', Object.keys(OPACITY_MAP));
+  } catch (e) {
+    console.warn('[opacity_cleanup] 无法从后端载入映射，将只发送方案名：', e);
+  }
+}
+
 const $ = (id) => document.getElementById(id);
 const api = async (path, opts) => {
   const res = await fetch(path, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts || {}));
@@ -122,6 +135,29 @@ function collectParams() {
   put('export.mesh_density_quantile', $('p-mesh-densq').value);
   put('export.mesh_texture', $('p-mesh-texture').value);
   put('export.mesh_texture_size', $('p-mesh-texsize').value);
+  // 不透明度治理方案：映射**从后端取**（/api/opacity_cleanup），不在 JS 里重写。
+  // 原因：CLI 的 --opacity-cleanup 也走同一份 `trainers/opacity_cleanup.py`，
+  // 两边共用一处定义才不会漂移 —— 本项目因"同一决定写两遍"踩过多次坑
+  // （最严重的一次是 22 个脚本都用 sh_degree=0 渲染，白丢 1.91 dB）。
+  // 若接口还没返回（首屏），退回用 choice 本身作为标记，不猜具体参数。
+  const ocSel = $('p-train-opacityclean');
+  if (ocSel) {
+    const choice = ocSel.value || 'none';
+    const param = $('p-train-opacityparam');
+    const num = parseFloat(param && param.value ? param.value : '');
+    put('train.opacity_cleanup', choice);
+    const mapped = OPACITY_MAP[choice];
+    if (mapped) {
+      Object.entries(mapped).forEach(([k, v]) => {
+        // 只有"数值可调"的那些键才用界面上的数字覆盖
+        if (/quantile$|^train\.opacity_decay$/.test(k) && !Number.isNaN(num)) {
+          p[k] = String(num);
+        } else {
+          p[k] = v;
+        }
+      });
+    }
+  }
   // 高级参数：覆盖上面的同名键（放在最后 ⇒ 以用户显式输入为准）
   const adv = $('p-advanced') ? parseAdvancedParams($('p-advanced').value) : {};
   Object.assign(p, adv);
@@ -450,10 +486,15 @@ $('btn-reset-config').onclick = async () => { await api('/api/config/reset', { m
 ['in-path', 'in-title', 'in-jobid', 'in-force', 'p-mask-backend', 'p-mask-mode', 'p-mask-prompt',
   'p-frames-fps', 'p-frames-long', 'p-colmap-matcher', 'p-train-backend', 'p-train-iters',
   'p-train-res', 'p-train-cap', 'p-train-densify', 'p-train-maskloss',
+  'p-train-opacityclean', 'p-train-opacityparam',
   'p-export-formats', 'p-mesh-method', 'p-mesh-depth', 'p-mesh-tris', 'p-mesh-smooth',
   'p-mesh-width', 'p-mesh-views', 'p-mesh-densq', 'p-mesh-texture', 'p-mesh-texsize',
   'p-advanced',
 ].forEach((id) => { const el = $(id); if (el) el.addEventListener('input', updateCliPreview); });
+// <select> 的变化用 change 事件（input 在部分浏览器上对 select 不触发）
+['p-train-opacityclean'].forEach((id) => {
+  const el = $(id); if (el) el.addEventListener('change', updateCliPreview);
+});
 
 /* ------------------------------------------------------ 模型查看（独立功能页） */
 /* ============================================================ 网格导出页 */
@@ -815,6 +856,7 @@ if ($('btn-m-rotmode')) {
 (async function boot() {
   await health();
   await loadStages();
+  await loadOpacityMap();   // 必须在 loadConfig 之前：表单要用到映射
   await refreshJobs();
   await loadConfig();
   await loadCreds();

@@ -136,6 +136,25 @@ def create_app():
         return registry.describe()
 
     # ------------------------------------------------------------------ 配置
+    @app.get("/api/opacity_cleanup")
+    def opacity_cleanup_options() -> dict[str, Any]:
+        """列出"不透明度治理方案"的选项与各自生成的参数。
+
+        为什么要有这个接口：CLI 的 `--opacity-cleanup` 与 GUI 的下拉框必须产出
+        **完全相同**的参数集合，否则两端会漂移（本项目已多次因"同一决定写两遍"
+        而出错，最严重的一次是 22 个脚本都用 sh_degree=0 渲染）。
+        所以映射只在 `trainers/opacity_cleanup.py` 一处定义，
+        前端通过本接口取，不在 JS 里重写。
+        """
+        from ..trainers.opacity_cleanup import CHOICES, opacity_cleanup_params
+
+        return {
+            "choices": [
+                {"value": c, "params": opacity_cleanup_params(c)}
+                for c in CHOICES
+            ],
+        }
+
     @app.get("/api/config")
     def get_config() -> dict[str, Any]:
         return {"config": load_settings().data, "config_path": str(paths.CONFIG_DIR / "config.toml")}

@@ -119,6 +119,23 @@
             <input id="p-train-maskloss" type="number" step="0.05" min="0" max="1" value="1.0">
           </label>
         </div>
+        <div class="row">
+          <label class="grow">不透明度治理方案（opacity_cleanup）
+            <select id="p-train-opacityclean">
+              <option value="none">不启用（默认，最稳）</option>
+              <option value="decay">C · 梯度感知衰减（每 N 步乘系数，平滑淡出）</option>
+              <option value="recovery">A · 恢复感知剪枝（剪掉恢复最慢的 20%）</option>
+              <option value="utilization">B · 利用率剪枝（按 tiles_per_gauss 剪未被需要的）</option>
+              <option value="reset">官方 · 周期重置（实测最差，仅用于对照）</option>
+            </select>
+          </label>
+          <label class="grow">剪枝/衰减分位或系数
+            <input id="p-train-opacityparam" type="number" step="0.001" value="0.2"
+                   title="decay 方案填衰减系数（如 0.999）；剪枝方案填分位（如 0.2）">
+          </label>
+        </div>
+        <p class="hint" id="opacityclean-hint">选择后会在下方「等价 CLI」里生成对应参数；
+          默认 <b>none</b>。实测（同数据 8000 迭代）：官方重置会让 PSNR 掉 0.59 dB，其余方案见 docs/03 G84。</p>
         <p class="hint">8GB 显存建议：150~250 张图 / 长边 1400~1600 / 迭代 15000~30000。
           实测：<b>densify_until=4000</b> 比官方默认 15000 更省（高斯少 68%）
           且不会过训练退化。注意 <b>resolution 只会缩小、不会放大</b>：

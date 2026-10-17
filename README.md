@@ -38,6 +38,7 @@
 | 指标 | 数值 |
 |---|---|
 | 网格提取路线 | 深度反投影（75 视角 @640px）→ 泊松 depth=**8** → Taubin 平滑 → QEM<br/>（原记 depth=9；实测 8 的相邻面法线翻转率低 10 倍，见下方参数表与 `docs/03` G82） |
+| 交付产物（`final-v1` 实测） | 点云 ply / 实体模型 ply / 点云 glb（POINTS）/ 网格 glb（TRIANGLES）/ 带纹理 glb（TEXCOORD_0 + 2048² PNG），5/5 齐全 |
 | 反投影点云 / 下采样后 | 2,579,017 → 2,311,406 点 |
 | 最终面数 | 385,170（QEM 目标 40 万） |
 | **轮廓 IoU**（对比高斯渲染轮廓） | **0.66** |
@@ -215,6 +216,7 @@ scripts\gsflow_gpu.cmd run --job-id <job> --stages export --force export --set e
 | `export.mesh_texture_size` | 2048 | 贴图边长 |
 | `train.lambda_lpips` | 0 | 感知损失权重（自己实现的 VGG16 LPIPS，见 `docs/05` §5.3）。**默认关闭**：3 次重复实测三指标均不显著，且方差约 3 倍 |
 | `train.lambda_depth_distortion` | 0 | 深度失真正则（2DGS 的 λd）。**权重必须按本项目损失口径实测校准**，不能照抄论文的 1000：λd=1.5 是唯一稳超噪声底的改进（+0.199 dB），见 `docs/03` G82 |
+| `train.opacity_cleanup` | none | **不透明度治理方案**（GUI 下拉框与 CLI `--opacity-cleanup` 共用同一份映射，见 `trainers/opacity_cleanup.py`）：`none`（默认最稳）/ `decay`（C·平滑衰减）/ `recovery`（A·恢复感知剪枝）/ `utilization`（B·利用率剪枝）/ `reset`（官方周期重置，实测最差）。实测见 `docs/03` G84 |
 
 > 网格流程（对应社区标准做法）：渲深度 → 按不透明度/深度一致性过滤 →
 > **反投影成紧贴表面的稠密点云** → 体素下采样均匀化 → 泊松重建 →

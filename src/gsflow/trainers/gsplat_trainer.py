@@ -150,7 +150,30 @@ class TrainConfig:
     # 方案 A/B 的实现位置见 `utilization_prune_*`：按"利用率"（梯度贡献）剪枝，
     # 只剪真正没用的，不动其他高斯。
     utilization_prune_interval: int = 0
+    # 剪枝**只在这个步数之前**发生（0 = 同时约束在 iterations 内）。
+    # ⚠️ 实测教训：第一版按 interval=400 周期性剪 20%，8000 步内剪了约 20 次，
+    #    `0.8^20 ≈ 0.012` ⇒ 高斯 139,719 → **7,070**、PSNR → 21.04。
+    #    用户方案的原意是"**每次重置后**剪一次"，本项目不用重置，
+    #    于是它变成了"每 400 步都剪" —— 触发条件用错了。
+    #    现在用 `*_until` 把剪枝限制在**少数几次**（配合大 interval）。
+    utilization_prune_until: int = 0
     utilization_prune_quantile: float = 0.2
+    # ---- 方案 A：恢复感知剪枝（recovery-aware pruning）----
+    # 用户方案原意："每次重置后的 300 步，对不透明度**恢复最慢**的 20% 剪枝"。
+    # 原理：正常高斯在所有视角贡献为正，被压下去后**恢复快**；
+    #       而浮空物（伪影）只在少数视角贡献，不透明度震荡、**恢复慢**。
+    #
+    # 本项目的调整（**不启用重置**，因为重置实测 −0.59 dB）：用方案 C 的**平滑衰减**
+    # 代替重置作为"打压"，然后看谁**没恢复回来**：
+    #   1) 在衰减周期上拍一张不透明度的"快照"（被打压前）；
+    #   2) 再等 `recovery_window` 步，比较当前不透明度与快照之比；
+    #   3) 比值（恢复率）最低的 `recovery_prune_quantile` 剪掉。
+    # 这样保留了方案 A 的核心判据（**恢复速度**），又不依赖被否掉的重置。
+    recovery_prune_interval: int = 0
+    recovery_prune_quantile: float = 0.2
+    recovery_window: int = 300
+    # 同 utilization_prune_until：限制剪枝只在少数几步发生
+    recovery_prune_until: int = 0
     # 重置时压到的目标不透明度；<=0 表示用 prune_opacity*2.0（官方行为）
     reset_opacity: float = 0.0
     # 重置后暂停精修的步数（0=不暂停）。建议设为训练图片数。
@@ -956,6 +979,8 @@ def train(cfg: TrainConfig, ctx) -> dict:
     # 直接写 `util_acc = ...` 会让它变成 `densify_and_prune` 的**局部变量**
     # （实测 UnboundLocalError），因为嵌套函数里的赋值总是创建局部名。
     util_state: dict = {"acc": util_acc}
+    # 方案 A 的状态：衰减前的快照（步骤 -> 不透明度张量），用于算"恢复率"
+    recov_state: dict = {"snap": None, "snap_step": -1}
 
     # ---- 可选：直接复用官方 `gsplat.DefaultStrategy` ----
     # 这是"移植官方机制"的正确形态：整套复用（含 ops.py 的
@@ -1334,20 +1359,25 @@ def train(cfg: TrainConfig, ctx) -> dict:
                 grad_norm_cache = means.grad.norm(dim=-1).detach().clone()
                 ctx.warn("未取到 means2d 梯度，密度控制退回 3D 梯度（阈值需另行标定）")
 
-        # 利用率统计（方案 B）：累积 |∂L/∂opacity|。
-        # 语义：一个高斯若长期对渲染颜色没有影响，它的不透明度梯度就长期接近 0
-        # ⇒ 它不"被需要"。与"一刀切重置"的区别是**只删确实无贡献的**。
-        # 注意必须在 zero_grad 之前读，否则拿不到。
-        if util_state["acc"] is not None and opac.grad is not None:
-            with torch.no_grad():
-                g = opac.grad.detach().abs().reshape(-1)
-                # ⚠️ 形状同步必须放在**这里**（反向之后、累加之前）。
-                # 曾放在 `densify_and_prune` 末尾：致密化窗口内每 100 步都增删高斯
-                # ⇒ 累加器每步刚攒起来就被清零 ⇒ 阈值恒为 0 ⇒ 剪枝永不生效
-                # （实测"配置生效了但功能从不执行"）。
-                if util_state["acc"].numel() != g.numel():
-                    util_state["acc"] = torch.zeros_like(g)
-                util_state["acc"] += g
+        # ---- 利用率统计（方案 B）：用 gsplat 的 `tiles_per_gauss`，不是梯度 ----
+        #
+        # ⚠️ 我曾经用 `|∂L/∂opacity|` 当"利用率"，结果把 **95% 的高斯剪掉**、
+        #    PSNR 崩到 21.86。原因：**梯度小 ≠ 没用**，而通常表示"**已经拟合好了**"。
+        #    于是我把已经学好的高斯剪掉、留下还在被纠正的 —— 方向反了。
+        #
+        # 正确语义：**这个高斯到底有没有被哪个像素需要**。
+        # gsplat 的 `meta["tiles_per_gauss"]`（形状 [n_cam, N]）就是它在本视角与
+        # 多少个屏幕 tile 相交 —— 正是官方密度控制用的 `count`(grad2d/count) 的对应物，
+        # 而且**免费**（渲染时已算好，不需要额外 pass）。
+        # 一个长期 tiles=0 的高斯不会被任何像素采样到 ⇒ 它确实没用。
+        if util_state["acc"] is not None and isinstance(meta, dict):
+            tpg = meta.get("tiles_per_gauss")
+            if tpg is not None:
+                with torch.no_grad():
+                    t = tpg.reshape(-1).float()
+                    if util_state["acc"].numel() != t.numel():
+                        util_state["acc"] = torch.zeros_like(t)
+                    util_state["acc"] += t
 
         # 探针：确认渲染确实覆盖了像素、且位置参数拿到梯度。
         # 曾经出现 alpha 和 = 0 / means.grad = 0（相机位姿翻转写错，高斯全在相机背后）。
@@ -1543,8 +1573,10 @@ def train(cfg: TrainConfig, ctx) -> dict:
             # 它的不透明度梯度就长期接近 0 ⇒ 它不"被需要"。
             # 与"随机/一刀切重置"的区别在于：**只删掉确实无贡献的**。
             _uint = int(getattr(cfg, "utilization_prune_interval", 0) or 0)
+            _uuntil = int(getattr(cfg, "utilization_prune_until", 0) or 0)
             _acc = util_state["acc"]
-            if _uint > 0 and _acc is not None and step % _uint == 0 and step > _uint:
+            if (_uint > 0 and _acc is not None and step % _uint == 0 and step > _uint
+                    and (_uuntil <= 0 or step <= _uuntil)):
                 _q = float(getattr(cfg, "utilization_prune_quantile", 0.2) or 0.2)
                 n_now = int(params["means"].shape[0])
                 # ⚠️ 长度对齐：致密化**就在本步之前**可能增删高斯，而累加器是反向时按
@@ -1557,6 +1589,10 @@ def train(cfg: TrainConfig, ctx) -> dict:
                 if m >= 64:
                     thresh = _quantile(_acc[:m], _q)
                     keep_m = _acc[:m] > thresh
+                    _nz = int((_acc[:m] > 0).sum())
+                    print(f"[利用率剪枝] step {step} 高斯 {n_now} 统计 {int(_acc.numel())} "
+                          f"对齐 {m}：非零 {_nz} 阈值={thresh:.3f} "
+                          f"保留={int(keep_m.sum())}/{m}", flush=True)
                     # 保护：至少留 50%，避免把有效结构剪掉
                     if int(keep_m.sum()) >= max(16, int(0.5 * m)):
                         # 只对前缀做判定；致密化**新增**的那部分高斯无法判断
@@ -1586,6 +1622,46 @@ def train(cfg: TrainConfig, ctx) -> dict:
                         _sh_needs_refresh = True
                 elif util_state["acc"].numel() != n_now:
                     util_state["acc"] = torch.zeros(n_now, device=device)
+
+            # ---- 方案 A：恢复感知剪枝（recovery-aware pruning）----
+            # 判据是"**恢复速度**"，不是"梯度大小"也不是"tile 数"：
+            #   正常高斯的贡献在所有视角都是正的 ⇒ 被衰减后**很快被拉回来**；
+            #   浮空物只在少数视角有贡献 ⇒ 不透明度震荡、**恢复慢**。
+            # 用户原方案以"重置"为打压手段；本项目不用重置（−0.59 dB），
+            # 所以改用方案 C 的**平滑衰减**作为打压，判据与剪枝对象完全保持原意。
+            _rint = int(getattr(cfg, "recovery_prune_interval", 0) or 0)
+            _runtil = int(getattr(cfg, "recovery_prune_until", 0) or 0)
+            if _rint > 0 and (_runtil <= 0 or step <= _runtil):
+                _snap = recov_state["snap"]
+                # ① 该拍快照了吗？（在衰减之前拍，之后才能看"恢复了多少"）
+                if step % _rint == 0 or _snap is None:
+                    with torch.no_grad():
+                        recov_state["snap"] = torch.sigmoid(opac.data).detach().clone()
+                        recov_state["snap_step"] = step
+                # ② 快照后已过 recovery_window 步 ⇒ 算恢复率并剪最慢的那批
+                elif (step - recov_state["snap_step"] >= int(cfg.recovery_window)
+                      and _snap is not None and _snap.numel() == int(opac.data.numel())):
+                    with torch.no_grad():
+                        now_o = torch.sigmoid(opac.data)
+                        # 恢复率 = 当前 / 快照（快照为 0 的用极小值避免除零）
+                        ratio = now_o / _snap.clamp_min(1e-6)
+                        q = float(getattr(cfg, "recovery_prune_quantile", 0.2) or 0.2)
+                        thr = _quantile(ratio, q)
+                        keep_r = ratio > thr
+                        n_before = int(opac.data.numel())
+                        n_nonzero = int((_snap > 1e-6).sum())
+                        print(f"[恢复感知剪枝] step {step} 快照@step "
+                              f"{recov_state['snap_step']}：有效率 {n_nonzero}/{n_before} "
+                              f"阈值={thr:.3f} 保留={int(keep_r.sum())}", flush=True)
+                        if int(keep_r.sum()) >= max(16, int(0.5 * n_before)):
+                            _apply_keep(params, optimizers, keep_r.to(device))
+                            refresh_params()
+                            grad_norm_cache = None
+                            util_state["acc"] = torch.zeros(
+                                int(params["means"].shape[0]), device=device)
+                            _sh_needs_refresh = True
+                    recov_state["snap"] = None
+                    recov_state["snap_step"] = -1
 
         # ================= 不透明度重置（必须在保存/评估之后）=================
         # ⚠️ 顺序红线（踩过，且会污染所有下游产物）：

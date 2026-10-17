@@ -63,6 +63,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--force", default="", help="强制重跑的阶段，逗号分隔（忽略已有产物）")
     sp.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                     help="点路径覆盖配置，可重复，如 --set train.iterations=7000")
+    # ---- 不透明度治理方案（与 GUI 的下拉框**同一套映射**）----
+    # 为什么要一个专用开关而不是让用户自己填 5 组参数：
+    #   内部有 reset / decay / utilization / recovery 各自的开关与系数，
+    #   手填既难懂又容易漏（本会话出现过"配置生效了但功能从不执行"的静默失效）。
+    # GUI 与本参数共享 `opacity_cleanup_params()` 的映射，保证两端同构。
+    sp.add_argument("--opacity-cleanup", default="",
+                    choices=["", "none", "reset", "decay", "utilization", "recovery"],
+                    help="训练时的不透明度治理方案（与 GUI 下拉框等价）："
+                         "none/reset/decay/utilization/recovery")
+    sp.add_argument("--opacity-param", type=float, default=None,
+                    help="该方案的数值：decay 用衰减系数(如 0.999)，剪枝用分位(如 0.2)")
     sp.add_argument("--dry-run", action="store_true", help="只打印将执行的阶段，不真正跑")
     sp.add_argument("--no-halt", action="store_true", help="某阶段失败后继续执行后续阶段")
     sp.add_argument("--quiet", action="store_true", help="只输出 warn 及以上事件")
@@ -151,6 +162,19 @@ def cmd_run(args) -> int:
 
     paths.ensure_dirs()
     sets = _parse_sets(args.set)
+    # 不透明度治理方案：与 GUI 下拉框**同一套映射**（见 opacity_cleanup_params），
+    # 保证"界面能选的，命令行也能选"，反之亦然（架构红线：两端同构）。
+    oc = getattr(args, "opacity_cleanup", "") or ""
+    if oc:
+        from .trainers.opacity_cleanup import opacity_cleanup_params
+        oc_sets = opacity_cleanup_params(oc, getattr(args, "opacity_param", None))
+        # 显式 --set 优先于方案预设（用户手写的更具体）
+        for k, v in oc_sets.items():
+            sets.setdefault(k, v)
+        print(f"不透明度治理方案 = {oc}"
+              + (f"（数值 {args.opacity_param}）" if args.opacity_param is not None else ""))
+        for k, v in oc_sets.items():
+            print(f"  {k} = {v}")
     settings = load_settings(sets)
     spec = JobSpec(
         input_path=args.video or args.images or "",
