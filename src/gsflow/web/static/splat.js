@@ -316,6 +316,11 @@ window.GsSplatRenderer = (function () {
   function createFrom(gl, data) {
     const ext = gl.getExtension('ANGLE_instanced_arrays');
     if (!ext) throw new Error('浏览器不支持 ANGLE_instanced_arrays，无法渲染泼溅');
+    // ⚠️ **WebGL1 用 32 位索引必须先启用这个扩展**，否则 drawElements 返回
+    // INVALID_OPERATION 并**静默不画** —— 表现就是"一片黑、控制台没有异常"。
+    // 这正是我这轮踩的坑：着色器修好了、扩展也都在，但画面仍然全黑。
+    const extU32 = gl.getExtension('OES_element_index_uint');
+    const useIndexed = !!extU32 && data.count <= 0xFFFFFFFF;
     const n = data.count;
 
     const prog = gl.createProgram();
@@ -337,13 +342,18 @@ window.GsSplatRenderer = (function () {
       uViewport: gl.getUniformLocation(prog, 'uViewport'),
     };
 
-    // 四边形角点：TRIANGLE_STRIP 的 4 个顶点，±2σ 覆盖
-    const quad = new Float32Array([-2, -2, 2, -2, -2, 2, 2, 2]);
+    // 四边形角点。
+    // 有 32 位索引时用 4 点 TRIANGLE_STRIP + 索引间接寻址（快路径）；
+    // 没有该扩展时改用 **6 点 TRIANGLES + 重排顶点缓冲**（无需任何索引扩展）。
+    const quad = useIndexed
+      ? new Float32Array([-2, -2, 2, -2, -2, 2, 2, 2])
+      : new Float32Array([-2, -2, 2, -2, -2, 2,
+                          -2, 2, 2, -2, 2, 2]);
     const qbuf = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, qbuf);
     gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
 
-    // 顺序索引（每帧按深度重排后上传）
+    // 顺序索引（每帧按深度重排后上传）—— 只在 useIndexed 时使用
     const idx = new Uint32Array(n);
     for (let i = 0; i < n; i++) idx[i] = i;
     const ibuf = gl.createBuffer();
@@ -353,13 +363,21 @@ window.GsSplatRenderer = (function () {
     // 把 center/cov/color 预先按"索引顺序"重排的缓冲（重排用 CPU 侧数组）
     const cbuf = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, cbuf);
-    gl.bufferData(gl.ARRAY_BUFFER, data.center, gl.STATIC_DRAW);
+    gl.bufferData(gl.ARRAY_BUFFER, data.center, gl.DYNAMIC_DRAW);
     const covAbuf = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, covAbuf);
-    gl.bufferData(gl.ARRAY_BUFFER, data.cov, gl.STATIC_DRAW);
+    gl.bufferData(gl.ARRAY_BUFFER, data.cov, gl.DYNAMIC_DRAW);
     const colbuf = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, colbuf);
     gl.bufferData(gl.ARRAY_BUFFER, data.color, gl.DYNAMIC_DRAW);
+
+    // 无索引路径用的重排缓冲（按深度顺序复制一份）
+    let sortedCenter = null, sortedCov = null, sortedColor = null;
+    if (!useIndexed) {
+      sortedCenter = new Float32Array(data.center.length);
+      sortedCov = new Float32Array(data.cov.length);
+      sortedColor = new Float32Array(data.color.length);
+    }
 
     // 桶排序辅助
     const BUCKETS = 2048;
@@ -393,7 +411,32 @@ window.GsSplatRenderer = (function () {
         idx[counts[b]++] = i;
       }
       gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibuf);
-      gl.bufferSubData(gl.ELEMENT_ARRAY_BUFFER, 0, idx);
+      if (useIndexed) {
+        gl.bufferSubData(gl.ELEMENT_ARRAY_BUFFER, 0, idx);
+      } else {
+        // 无 32 位索引扩展：按排序结果**重排顶点数据**，用 drawArrays 绘制。
+        // 没有间接寻址也能保证由远到近的绘制顺序（alpha 合成正确）。
+        for (let k = 0; k < n; k++) {
+          const src = idx[k];
+          const d3 = k * 3, s3 = src * 3;
+          sortedCenter[d3] = data.center[s3];
+          sortedCenter[d3 + 1] = data.center[s3 + 1];
+          sortedCenter[d3 + 2] = data.center[s3 + 2];
+          const d4 = k * 4, s4 = src * 4;
+          sortedColor[d4] = data.color[s4];
+          sortedColor[d4 + 1] = data.color[s4 + 1];
+          sortedColor[d4 + 2] = data.color[s4 + 2];
+          sortedColor[d4 + 3] = data.color[s4 + 3];
+          const d6 = k * 6, s6 = src * 6;
+          for (let j = 0; j < 6; j++) sortedCov[d6 + j] = data.cov[s6 + j];
+        }
+        gl.bindBuffer(gl.ARRAY_BUFFER, cbuf);
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, sortedCenter);
+        gl.bindBuffer(gl.ARRAY_BUFFER, covAbuf);
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, sortedCov);
+        gl.bindBuffer(gl.ARRAY_BUFFER, colbuf);
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, sortedColor);
+      }
     }
 
     function bindAttrib(buffer, loc, size, stride, offset) {
@@ -454,12 +497,51 @@ window.GsSplatRenderer = (function () {
       bindAttrib(covAbuf, aCovB, 3, 6, 3);
       bindAttrib(colbuf, aColor, 4, 4, 0);
 
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibuf);
-      ext.drawElementsInstancedANGLE(gl.TRIANGLE_STRIP, 4, gl.UNSIGNED_INT, 0, n);
+      if (useIndexed) {
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibuf);
+        // ⚠️ 只有启用了 `OES_element_index_uint` 才允许走这条路（见 createFrom）
+        ext.drawElementsInstancedANGLE(gl.TRIANGLE_STRIP, 4, gl.UNSIGNED_INT, 0, n);
+      } else {
+        // 无索引路径：6 顶点/实例（两个三角形），不需要任何索引扩展
+        ext.drawArraysInstancedANGLE(gl.TRIANGLES, 0, 6, n);
+      }
 
       gl.depthMask(true);
       gl.enable(gl.DEPTH_TEST);
       gl.disable(gl.BLEND);
+    }
+
+    /**
+     * 画完后抽查像素：返回 `{ blank, drawn }`。
+     *
+     * 为什么需要：泼溅失败**不一定抛异常** —— 索引扩展缺失、着色器逻辑把
+     * 几何投到屏幕外，都会得到"一片黑但控制台干净"。用户只能看到黑屏，
+     * 完全无从判断。这里主动 readPixels 一小块，把"黑屏"变成一个**可报告的事实**。
+     */
+    function probePixels(width, height) {
+      try {
+        const N = 12;
+        const buf = new Uint8Array(N * N * 4);
+        const coords = [];
+        for (let y = 0; y < N; y++) {
+          for (let x = 0; x < N; x++) {
+            coords.push([Math.floor((x + 0.5) * width / N),
+                         Math.floor((y + 0.5) * height / N)]);
+          }
+        }
+        let lit = 0;
+        // 一次性读整个小块再取样会更省调用，但 readPixels 不支持稀疏取样，
+        // 所以按 12x12 网格逐点读（144 次，仅在自检时执行一次）。
+        for (const [px, py] of coords) {
+          gl.readPixels(px, py, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+          const r = buf[0], g = buf[1], b = buf[2];
+          // 背景色是深蓝灰（0.02,0.03,0.045）≈ (5,8,11)
+          if (r > 24 || g > 24 || b > 24) lit++;
+        }
+        return { blank: lit === 0, drawn: lit, sampled: coords.length };
+      } catch (e) {
+        return { blank: null, error: String(e && e.message || e) };
+      }
     }
 
     return {
@@ -467,6 +549,8 @@ window.GsSplatRenderer = (function () {
       maxScale: data.maxScale,
       bounds: data.bounds,
       draw,
+      probePixels,
+      indexed: useIndexed,
       program: prog,
     };
   }

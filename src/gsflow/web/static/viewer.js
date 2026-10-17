@@ -1176,9 +1176,11 @@ window.GsViewer = (function () {
                   useCol: true, useNrm: false, texture: null };
           this.reset();
           draw();
+          // 画完抽查像素：把"黑屏"变成可报告的事实（索引扩展缺失等情况不会抛异常）
+          const px = sp.probePixels ? sp.probePixels(canvas.width, canvas.height) : null;
           return { vertices: sp.count, triangles: 0, mode: 'splat',
                    textured: false, colors: true, normals: false,
-                   gaussians: sp.count };
+                   gaussians: sp.count, pixels: px, indexed: sp.indexed };
         } catch (e) {
           const data = window.GsSplatRenderer.parseSplat(buf);
           const n = data.count;
@@ -1242,11 +1244,14 @@ window.GsViewer = (function () {
                   useCol: true, useNrm: false, texture: null };
           this.reset();
           draw();
+          const px3 = sp3.probePixels
+            ? sp3.probePixels(canvas.width, canvas.height) : null;
           return { vertices: sp3.count, triangles: 0, mode: 'gauss3d',
                    textured: false, colors: true, normals: false,
                    gaussians: sp3.count,
                    shDegree: model.gauss3d.shDegree,
-                   hasSH: !!model.gauss3d.shRest };
+                   hasSH: !!model.gauss3d.shRest,
+                   pixels: px3, indexed: sp3.indexed };
         } catch (e) {
           const g3 = model.gauss3d;
           const n = g3.pos.length / 3;

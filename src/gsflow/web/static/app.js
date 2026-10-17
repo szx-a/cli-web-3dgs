@@ -846,6 +846,18 @@ function showModelInfo(name, info) {
   if (info.textured) parts.push('带贴图');
   else if (info.colors) parts.push('顶点色');
   if (info.normals) parts.push('法线');
+  // ---- 黑屏自检：画完抽查像素，亮点为 0 就明确报出来 ----
+  //
+  // 泼溅失败**不一定抛异常**：32 位索引扩展缺失、几何被投到屏幕外，
+  // 都只会得到"一片黑 + 控制台干净"。用户报"还是黑屏"时，
+  // 没有这条信息就只能靠猜。这里把结果直接写进状态栏。
+  if (info.pixels && info.pixels.blank === true) {
+    parts.push('⚠ 绘制后画面全黑（' + (info.pixels.sampled || 0)
+      + ' 个采样点无一亮点）'
+      + (info.indexed === false ? '；索引扩展缺失，已走无索引路径' : ''));
+  } else if (info.pixels && info.pixels.blank === null && info.pixels.error) {
+    parts.push('像素自检不可用：' + info.pixels.error);
+  }
   $('m-status').textContent = name + ' · ' + parts.join(' · ');
 }
 

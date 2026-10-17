@@ -167,6 +167,16 @@ function mkGlStub() {
           vertexAttribDivisorANGLE: (loc, d) => calls.push(['vertexAttribDivisor', loc, d]),
           drawElementsInstancedANGLE: (m, c, t, o, n) => {
             calls.push(['drawElementsInstanced', m, c, n]);
+            // ⚠️ 真实 WebGL1 的关键约束：**没启用 `OES_element_index_uint` 就传
+            // UNSIGNED_INT 索引，会返回 INVALID_OPERATION 且什么也不画**
+            // —— 表现是"黑屏 + 控制台没有异常"。这正是本轮黑屏的原因。
+            // stub 必须同样报错，否则探针会放过这个 bug（之前就是如此：
+            // 探针只给了扩展、从不校验索引类型与扩展是否匹配）。
+            if (t === 0x1405 && !glHasUintIndex) {
+              setErr(0x0502,
+                'drawElementsInstanced 用了 UNSIGNED_INT 索引，但没有启用 '
+                + 'OES_element_index_uint（WebGL1 会静默不画 ⇒ 黑屏）');
+            }
             if (m === 1 && c % 2 !== 0) {
               setErr(0x0502, '实例化 drawElements(LINES) 索引数不是偶数');
             }
@@ -179,6 +189,14 @@ function mkGlStub() {
       return null;
     },
     getError: () => { const e = errState; errState = 0; return e; },
+    // 泼溅渲染器画完会 readPixels 抽查是否全黑。stub 返回**背景色**像素，
+    // 于是"全黑"能被如实检出（pipe 里没有真实合成结果可读）。
+    readPixels: (x, y, w, h, fmt, ty, buf) => {
+      for (let i = 0; i + 3 < buf.length; i += 4) {
+        buf[i] = 5; buf[i + 1] = 8; buf[i + 2] = 11; buf[i + 3] = 255;
+      }
+      return undefined;
+    },
     getParameter: (pname) => {
       // 合法 pname 集合（含字符串类 VENDOR/RENDERER/VERSION）
       const OKP = [GLV.VENDOR, GLV.RENDERER, GLV.VERSION, GLV.MAX_TEXTURE_SIZE,
