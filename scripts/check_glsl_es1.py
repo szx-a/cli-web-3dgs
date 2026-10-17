@@ -164,7 +164,7 @@ def check_shader(code: str, name: str, other: str | None = None) -> list[str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--file", default="src/gsflow/web/static/splat.js")
+    ap.add_argument("--file", default="src/gsflow/web/static/splat.legacy.js")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 

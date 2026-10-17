@@ -34,7 +34,7 @@ def test_index_script_tags_have_version_token() -> None:
     r = _client().get("/")
     assert r.status_code == 200
     html = r.text
-    for name in ("splat.js", "viewer.js", "app.js"):
+    for name in ("viewer.js", "app.js"):  # splat.js 已下线，见 test_splat_webgl_contract
         pat = re.compile(r'src="/static/' + re.escape(name) + r'\?v=(\d+)"')
         m = pat.search(html)
         assert m, f"{name} 的 script 标签缺少版本号（浏览器会缓存旧版）"
@@ -52,7 +52,7 @@ def test_selftest_endpoint_reports_static_and_gauss() -> None:
     assert r.status_code == 200
     d = r.json()
     assert "static" in d and "problems" in d
-    for name in ("index.html", "splat.js", "viewer.js", "app.js"):
+    for name in ("index.html", "viewer.js", "app.js", "refviewer.js"):
         assert d["static"][name]["exists"], f"{name} 缺失"
         assert d["static"][name]["bytes"] > 0
     assert d["ok"] is True, f"自检报了问题：{d.get('problems')}"

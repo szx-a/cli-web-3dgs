@@ -97,8 +97,19 @@ def test_app_js_routes_gaussians_to_reference_viewer() -> None:
     assert "/point_cloud.ply" in src, "没有用 .ply 后缀路由"
 
 
-def test_scene_info_up_is_computed_not_assumed() -> None:
-    """`up` 必须是从训练相机平面法向算出来的单位向量。"""
+def test_scene_info_up_comes_from_camera_axes() -> None:
+    """`up` 必须等于**逐相机 `-c2w[:,1]` 的归一化均值**。
+
+    为什么这条断言写得这么具体：我原来用"相机中心点云的最小方差轴"求上方向，
+    再按 `dot(n,[0,1,0])<0` 翻成 +Y。实测这个数据集的世界"上"是 **-Y**
+    （相机 Y 轴在图像里朝下），我那次翻转让**模型上下颠倒**
+    （用户："模型初始是倒的"）。
+
+    所以判据不能是"up 接近 +Y"（那是错的假设），而是"up 等于相机姿态给出的
+    地面法向"。这条不变量与数据集无关。
+    """
+    from gsflow.gsdata.colmap_io import read_model
+
     c = _client()
     jobs = [p.name for p in (ROOT / "workspace").iterdir()
             if (p / "04_train" / "point_cloud").is_dir()]
@@ -113,13 +124,31 @@ def test_scene_info_up_is_computed_not_assumed() -> None:
     up = np.asarray(d["up"], dtype=float)
     assert abs(float(np.linalg.norm(up)) - 1.0) < 1e-6, up
     assert d["radius"] > 0
-    if d.get("hasPoses"):
-        # 有相机位姿时必须真的算过；且牌坊这类素材上方向应接近 +Y
-        assert up[1] > 0.5, f"up 不合理（{up}）—— 可能退化成了默认值"
+
+    if not d.get("hasPoses"):
+        pytest.skip("该作业没有相机位姿")
+    # 用位姿算出"真值"再比对
+    cands = sorted({p.parent for p in
+                    (ROOT / "workspace" / job / "03_colmap" / "sparse")
+                    .rglob("cameras.bin")})
+    if not cands:
+        pytest.skip("没有 sparse 模型")
+    best = None
+    for p in cands:
+        rec = read_model(p)
+        if best is None or len(rec.images) > len(best.images):
+            best = rec
+    ups = np.array([-im.cam_to_world()[0][:3, 1] for im in best.images])
+    expect = ups.mean(axis=0)
+    expect /= np.linalg.norm(expect)
+    assert np.allclose(up, expect, atol=1e-5), (up, expect)
+    assert d.get("upSource") == "camera_axes", d.get("upSource")
     # 相机位置到中心的距离应等于 2.8×半径
     c0 = np.asarray(d["center"], dtype=float)
     cp = np.asarray(d["cameraPosition"], dtype=float)
     assert abs(float(np.linalg.norm(cp - c0)) - d["radius"] * 2.8) < 1e-3
+    # 相机应位于物体**沿 up 方向**的上方（不是下方）
+    assert float(np.dot(cp - c0, up)) > 0, "相机在物体下方 ⇒ 模型会倒着看"
 
 
 def test_ply_alias_route_has_extension() -> None:

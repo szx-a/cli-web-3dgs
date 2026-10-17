@@ -278,18 +278,11 @@ globalThis.URL = { createObjectURL: () => 'blob:stub' };
 globalThis.Image = class { set src(_) { if (this.onerror) this.onerror(new Error('no image')); } };
 
 // ---- 加载真实 viewer.js ----
-// 先加载 splat.js：viewer.js 在遇到 3DGS PLY / .splat 时会调用
-// `window.GsSplatRenderer`，没加载就抛"缺少 splat 渲染器"，探测不到泼溅路径。
-try {
-  const splatSrc = fs.readFileSync(
-    path.join('src', 'gsflow', 'web', 'static', 'splat.js'), 'utf8');
-  new Function('window', splatSrc)(windowStub);
-  console.log('加载 splat.js: ' + (windowStub.GsSplatRenderer ? 'OK' : '**未挂载**'));
-} catch (e) {
-  console.log('**加载 splat.js 抛出**: ' + e.message);
-  process.exit(1);
-}
-
+//
+// 说明：GUI 的**高斯**渲染已经交给 `refviewer.js`（社区参考实现
+// gaussian-splats-3d v0.4.7，见 docs/03 G116/G122）。这个 WebGL1 查看器
+// 现在只负责 glb / 普通 ply，遇到 `.splat` 或 3DGS PLY 会**明确报错**，
+// 所以这里不再加载我手写的 `splat.js`（已归档为 `splat.legacy.js`）。
 const src = fs.readFileSync(path.join('src', 'gsflow', 'web', 'static', 'viewer.js'), 'utf8');
 const mod = { exports: {} };
 try {

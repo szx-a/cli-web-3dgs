@@ -86,17 +86,6 @@ def test_checker_flags_varying_mismatch() -> None:
     assert any("没有声明" in p for p in probs2), probs2
 
 
-def test_viewer_has_splat_fallback() -> None:
-    """泼溅失败必须降级为点云（而不是抛异常黑屏），并把原因带给界面层。"""
-    src = (ROOT / "src" / "gsflow" / "web" / "static" / "viewer.js").read_text(
-        encoding="utf-8")
-    assert "degraded: true" in src, "降级路径应标记 degraded"
-    assert "degradeReason" in src, "降级应带出原因"
-    assert "已降级为点云" in src, "状态层应提示已降级"
-    # 两处（.splat 与 gauss3d）都要有降级
-    assert src.count("degraded: true") >= 2, "两个泼溅入口都应有降级路径"
-
-
 def test_app_shows_degraded_reason() -> None:
     """GUI 状态栏必须显示降级原因，否则用户会把降级误当成模型质量差。"""
     src = (ROOT / "src" / "gsflow" / "web" / "static" / "app.js").read_text(

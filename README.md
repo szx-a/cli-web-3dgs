@@ -206,7 +206,7 @@ scripts\gsflow_gpu.cmd run --job-id <job> --stages export --force export --set e
 | `export.mesh_max_views` | 80 | 参与融合的视角上限 |
 | `export.mesh_poisson_depth` | **8** | 泊松八叉树深度。**更深不等于更好**：同模型只改它，相邻面法线翻转率 dd-0 = 1.7%(8) / 17.8%(9) / **43.5%(10)**，dd-15 = 2.1%(8) / 22.4%(9)，面数与 IoU 几乎不变 |
 | `export.mesh_density_quantile` | 0.001 | 密度裁剪分位。**极敏感**：`0.03` 会把轮廓 IoU 从 0.68 砍到 0.32（连通真实表面一起裁了） |
-| `export.mesh_crop_quantile` | 0.95 | 自动聚焦到主体。`1.0`（不聚焦）会让翻转率从 22% 升到 **44%** |
+| `export.mesh_crop_quantile` | **1.0** | 网格聚焦的分位数裁剪。**`1.0` = 只用 `mesh_crop_opacity` 过滤、不按分位数裁**。⚠️ 曾默认 0.95，是一条真实事故：3DGS 把容量放在细节密集处，稀疏但真实的屋檐/翼角会被分位数优先裁掉 ⇒ 网格 bbox 只有高斯的 25%/22%/15%、表面积仅 1.72（修好后 18.10），导出的网格只是中央一块扭曲碎片。背景污染交给 `mesh_crop_opacity`（`docs/03` G119）|
 | `export.mesh_trim_sigma` | 2.5 | 按"到输入点距离"裁掉泊松桥接面。`1.0` 能把翻转降到 3.2% 但只剩 1.6 万面（裁太狠） |
 | `export.mesh_consistency_min_views` | 2 | 多视角一致性投票门槛。`3` 把翻转降到 12.6%，但 **IoU 掉 0.060**（靠删面换来的） |
 | `export.mesh_presimplify_ratio` | 10.0 | 预简化比例（先降规模再平滑） |

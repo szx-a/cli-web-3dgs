@@ -224,18 +224,35 @@ def _scene_extent(c2ws: np.ndarray, points: np.ndarray | None = None) -> tuple[n
 
 
 def auto_crop_bounds(points: np.ndarray, opacity: np.ndarray,
-                     op_thresh: float = 0.3, quantile: float = 0.98,
+                     op_thresh: float = 0.3, quantile: float = 1.0,
                      pad_ratio: float = 0.12) -> tuple[np.ndarray, np.ndarray, dict]:
     """自动圈出"主体"的包围盒，用于把 TSDF 聚焦到物体上。
 
-    为什么需要（实测）：COLMAP 会把桌面、书本、背景杂物也重建出来，
-    点云里还有大量低不透明度的漂浮高斯。直接用整体包围盒做 TSDF 会导致
+    ## 为什么需要
+
+    COLMAP 会把桌面、书本、背景杂物也重建出来，点云里还有大量低不透明度的
+    漂浮高斯。直接用**全部**点的包围盒做 TSDF 会导致
         * 场景"尺度"被放大数倍 -> 体素与截断距离全部失配；
         * 体积里绝大部分是空气，网格覆盖整个房间而不是物体。
-    实测某次：全部点对角 9.7，而中位数附近的主体只有 3.84。
 
-    做法：只取**不透明度高于阈值**的点（浮点/背景普遍偏低），
-    再按分位数去掉两端离群（默认保留到 98%），最后加一点余量。
+    所以先用**不透明度**过滤（漂浮/背景高斯普遍偏低），这一步是有效的。
+
+    ## ⚠️ 为什么**不再**按分位数裁（真实事故）
+
+    原来用 `quantile=0.95/0.98` 再裁一遍两端。实测 `img3-final`（牌坊）：
+
+        不透明度 > 0.3 的高斯：24,629 个，铺满 **5.83 × 2.16 × 2.85**
+        但它们的 95% 分位框只有 **1.67 × 1.05 × 0.49**
+        最终网格 bbox 只有高斯的 **25% / 22% / 15%**，体积占 **0.85%**
+
+    ⇒ 导出的网格只是中央一小块**扭曲碎片**（用户看到的就是"网络破碎"）。
+
+    **根因**：3DGS 会把容量放在**细节密集**处（门楼雕花），屋檐/翼角面积大但纹理平滑
+    ⇒ 分到的**高斯数量很少**。按"点的分位数"裁，永远会先把**稀疏但真实的结构**
+    裁掉 —— 这与我在查看器取景上犯的错是同一个（`docs/03` G113 之后又一次）。
+
+    ⇒ 默认 `quantile=1.0`：**只用不透明度过滤，不再按分位数裁**。
+    背景污染的主要来源（低不透明度漂浮点）已经被滤掉。
     """
     pts = np.asarray(points, dtype=np.float64)
     op = np.asarray(opacity, dtype=np.float64).reshape(-1)
@@ -248,9 +265,13 @@ def auto_crop_bounds(points: np.ndarray, opacity: np.ndarray,
     sel = pts[mask]
 
     q = float(quantile)
-    lo_q, hi_q = (1.0 - q) / 2.0, 1.0 - (1.0 - q) / 2.0
-    lo = np.quantile(sel, lo_q, axis=0)
-    hi = np.quantile(sel, hi_q, axis=0)
+    if q >= 1.0:
+        lo = sel.min(axis=0)
+        hi = sel.max(axis=0)
+    else:
+        lo_q, hi_q = (1.0 - q) / 2.0, 1.0 - (1.0 - q) / 2.0
+        lo = np.quantile(sel, lo_q, axis=0)
+        hi = np.quantile(sel, hi_q, axis=0)
     size = np.maximum(hi - lo, 1e-6)
     pad = size * float(pad_ratio)
     lo -= pad

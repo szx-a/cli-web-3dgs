@@ -668,11 +668,31 @@ let MODELS = null;          // 当前作业的 /api/models 结果
 let ACTIVE_MODE = 'preview'; // 默认显示最可靠的视图（没有则自动回退）
 let VIEWER_READY = false;
 
-function initModelsPage() {  // ⚠️ 先确认两个脚本都到位。缺 `splat.js` 时泼溅模式必然失败，
-  // 而症状只是"画面全黑"——用户从控制台很难看出是脚本没加载。
-  // 这里显式提示，并给出自救办法（强制刷新 / 查自检接口）。
+/**
+ * 懒创建 WebGL1 查看器（只服务 glb / 普通 ply）。
+ * 高斯与预览模式不碰它 —— 见 initModelsPage 里的说明。
+ */
+function ensureViewer() {
+  if (VIEWER_READY) return true;
+  if (!window.GsViewer) return false;
+  try {
+    window.GsViewer.init($('m-canvas'), (s) => { $('m-status').textContent = s || ''; });
+    VIEWER_READY = true;
+    return true;
+  } catch (e) {
+    $('m-overlay').classList.remove('hide');
+    $('m-overlay').textContent = '查看器初始化失败：' + e.message;
+    return false;
+  }
+}
+
+function initModelsPage() {
+  // 确认脚本到位：`viewer.js`（glb/普通 ply 的 WebGL1 查看器）与
+  // `refviewer.js`（高斯，社区参考实现）各管一半，缺哪个都会表现成"黑屏"，
+  // 而控制台里往往只剩一句 404，很难看出是脚本没加载。
+  // `refviewer.js` 是 type=module，可能比这个经典脚本晚就绪，所以不在这里硬性要求，
+  // 而是在真正要显示高斯时检查（见 loadModelFile）。
   const missing = [];
-  if (!window.GsSplatRenderer) missing.push('splat.js');
   if (!window.GsViewer) missing.push('viewer.js');
   if (missing.length) {
     $('m-overlay').classList.remove('hide');
@@ -684,15 +704,11 @@ function initModelsPage() {  // ⚠️ 先确认两个脚本都到位。缺 `spl
     $('m-status').textContent = '脚本缺失';
     return;
   }
-  if (!VIEWER_READY) {
-    try {
-      window.GsViewer.init($('m-canvas'), (s) => { $('m-status').textContent = s || ''; });
-      VIEWER_READY = true;
-    } catch (e) {
-      $('m-overlay').textContent = '查看器初始化失败：' + e.message;
-      $('m-overlay').classList.remove('hide');
-    }
-  }
+  // ⚠️ **懒初始化**：`GsViewer` 会创建一个 WebGL1 上下文，而它只负责
+  // glb / 普通 ply（网格、点云）。高斯模式用的是参考渲染器（自带 WebGL2 上下文），
+  // 预览模式只显示 PNG。所以在页面加载时就 init 等于**白占一个上下文**，
+  // 也让"到底哪个渲染器在画"变得不可判断（用户说的"不要硬嵌入"）。
+  // 改成真正需要时再建（见 ensureViewer / loadModelFile）。
   initLocalFilePicker();
   // 服务端渲染 / 返回 WebGL：把"高质量静态图"与"可交互低延迟"两种模式接起来
   const btnSrv = $('m-srv-render');
@@ -952,15 +968,20 @@ async function loadModelFile(f) {
 
   $('m-overlay').classList.remove('hide');
   $('m-overlay').textContent = '载入 ' + f.name + ' …';
+  // 到这里说明是 glb / 普通 ply（高斯与图片在前面已分流）⇒ 现在才需要 WebGL1
+  if (!ensureViewer()) {
+    $('m-status').textContent = '查看器不可用';
+    return;
+  }
   try {
     // ⚠️ 不能只看文件名后缀判断格式：`gauss3d` 条目的显示名是
     // "point_cloud.ply（完整 59 维）"，`endsWith('.ply')` 为 false，
     // 会被误当成 glb 去解析（然后报含糊的错）。
     // 优先用后端给的 `kind`；它是权威来源。
     const low = String(f.name || '').toLowerCase();
-    const kind = f.kind === 'gauss3d' ? 'ply'
-      : ((low.endsWith('.splat') || f.kind === 'splat') ? 'splat'
-        : ((low.endsWith('.ply') || f.url.toLowerCase().includes('.ply')) ? 'ply' : 'glb'));
+    const kind = (f.kind === 'gauss3d' || low.endsWith('.splat') || f.kind === 'splat')
+      ? 'splat'
+      : ((low.endsWith('.ply') || f.url.toLowerCase().includes('.ply')) ? 'ply' : 'glb');
     const info = await window.GsViewer.load(f.url, kind);
     showModelInfo(f.name, info);
   } catch (e) {

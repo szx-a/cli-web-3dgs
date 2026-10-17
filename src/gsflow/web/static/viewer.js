@@ -1152,63 +1152,12 @@ window.GsViewer = (function () {
       if (onStatus) onStatus('解析中…');
       const isSplat = (kind === 'splat' || low.endsWith('.splat'));
 
-      // ---- 高斯泼溅：交给专用的泼溅渲染器 ----
-      // 为什么单独一条路：泼溅需要 WebGL 实例化 + 逐帧深度桶排序 + 预乘 alpha 混合，
-      // 与"网格/点云"的绘制管线完全不同。混在一条管线上只会两边都做不好。
+      // 高斯类产物由 `refviewer.js`（社区参考实现 gaussian-splats-3d v0.4.7）负责渲染。
+      // 这里保留一句明确报错，避免有人再把 .splat 路由回这个 WebGL1 查看器
+      // —— 自研光栅化器的差距会被误读成模型质量差（docs/03 G116/G122）。
       if (isSplat) {
-        if (!window.GsSplatRenderer) {
-          throw new Error('缺少 splat 渲染器（splat.js 未加载）');
-        }
-        if (obj) {
-          const g = R.gl;
-          [obj.vbuf, obj.cbuf, obj.ubuf, obj.nbuf, obj.ibuf, obj.lineIbuf]
-            .forEach((b) => { if (b) g.deleteBuffer(b); });
-          if (obj.texture) g.deleteTexture(obj.texture);
-          obj = null;
-        }
-        // ⚠️ 泼溅失败必须**降级到点云**，不能让用户看到一块黑屏。
-        // 真实故障：着色器里用了 `transpose()`（GLSL ES 3.00 才有），
-        // WebGL1 编译失败 ⇒ 整块模型完全不可见，用户只得到一句报错。
-        // 降级后至少还能看到点云 + 明确的降级提示。
-        try {
-          const sp = window.GsSplatRenderer.create(R.gl, buf);
-          const cen = sp.bounds.center, rad = sp.bounds.radius;
-          obj = { mode: -1, splat: sp, count: sp.count, indexCount: 0,
-                  center: cen, radius: rad,
-                  useCol: true, useNrm: false, texture: null };
-          this.reset();
-          draw();
-          // 画完抽查像素：把"黑屏"变成可报告的事实（索引扩展缺失等情况不会抛异常）
-          const px = sp.probePixels ? sp.probePixels(canvas.width, canvas.height) : null;
-          return { vertices: sp.count, triangles: 0, mode: 'splat',
-                   textured: false, colors: true, normals: false,
-                   gaussians: sp.count, pixels: px, indexed: sp.indexed };
-        } catch (e) {
-          const data = window.GsSplatRenderer.parseSplat(buf);
-          const n = data.count;
-          const color = new Float32Array(n * 3);
-          for (let i = 0; i < n; i++) {
-            color[i * 3] = data.color[i * 4];
-            color[i * 3 + 1] = data.color[i * 4 + 1];
-            color[i * 3 + 2] = data.color[i * 4 + 2];
-          }
-          const fb = { mode: 0, position: data.center, color, uv: null,
-                       normal: null, indices: null, textureUrl: null };
-          if (obj) {
-            const g = R.gl;
-            [obj.vbuf, obj.cbuf, obj.ubuf, obj.nbuf, obj.ibuf, obj.lineIbuf]
-              .forEach((b) => { if (b) g.deleteBuffer(b); });
-            obj = null;
-          }
-          obj = makeMesh(R, fb, wire);
-          this.reset();
-          draw();
-          // 把原因带出去（界面层会显示在状态栏），但**不抛异常**
-          if (onStatus) onStatus('泼溅不可用，已降级为点云：' + e.message);
-          return { vertices: n, triangles: 0, mode: 0,
-                   textured: false, colors: true, normals: false,
-                   degraded: true, degradeReason: e.message };
-        }
+        throw new Error('高斯模型请用参考渲染器（refviewer.js）；'
+                        + '本查看器只负责 glb / 普通 ply');
       }
 
       let model;
@@ -1218,66 +1167,19 @@ window.GsViewer = (function () {
         } else if (kind === 'ply' || low.endsWith('.ply')) {
           model = parsePly(buf);
         } else {
-          // ⚠️ 只支持 glb / ply / splat 三种容器。OBJ / SPZ 等**必须在界面层就过滤掉** ——
+          // ⚠️ 只支持 glb / ply 两种容器。OBJ / SPZ 等**必须在界面层就过滤掉** ——
           // 否则这里会走进 GLB 解析分支、抛一个含糊的错误，用户只看到"黑"。
-          throw new Error('查看器不支持该格式（仅 GLB / PLY / SPLAT）：'
+          throw new Error('查看器不支持该格式（仅 GLB / 普通 PLY）：'
                           + (label.split('/').pop() || label));
         }
       } catch (e) {
         throw new Error('解析失败：' + e.message);
       }
 
-      // ---- 3DGS PLY：**完整信息维度**（59 维/高斯，含 SH 48）⇒ 走泼溅渲染 ----
+      // 完整 3DGS PLY（含 f_dc_*）也归参考渲染器，理由同上。
       if (model && model.gauss3d) {
-        if (!window.GsSplatRenderer) throw new Error('缺少 splat 渲染器（splat.js 未加载）');
-        if (obj) {
-          const g = R.gl;
-          [obj.vbuf, obj.cbuf, obj.ubuf, obj.nbuf, obj.ibuf, obj.lineIbuf]
-            .forEach((b) => { if (b) g.deleteBuffer(b); });
-          if (obj.texture) g.deleteTexture(obj.texture);
-          obj = null;
-        }
-        // 同样要**降级到点云**（理由见 `.splat` 分支）：
-        // 着色器/扩展出问题时，宁可显示点云 + 降级提示，也不要一块黑屏。
-        try {
-          const sp3 = window.GsSplatRenderer.createFromGauss3D(R.gl, model.gauss3d);
-          obj = { mode: -1, splat: sp3, count: sp3.count, indexCount: 0,
-                  center: sp3.bounds.center, radius: sp3.bounds.radius,
-                  useCol: true, useNrm: false, texture: null };
-          this.reset();
-          draw();
-          const px3 = sp3.probePixels
-            ? sp3.probePixels(canvas.width, canvas.height) : null;
-          return { vertices: sp3.count, triangles: 0, mode: 'gauss3d',
-                   textured: false, colors: true, normals: false,
-                   gaussians: sp3.count,
-                   shDegree: model.gauss3d.shDegree,
-                   hasSH: !!model.gauss3d.shRest,
-                   pixels: px3, indexed: sp3.indexed };
-        } catch (e) {
-          const g3 = model.gauss3d;
-          const n = g3.pos.length / 3;
-          // 用 SH DC 还原近似颜色（0.5 + C0·f_dc），至少不是全黑
-          const SH_C0 = 0.28209479177387814;
-          const color = new Float32Array(n * 3);
-          for (let i = 0; i < n; i++) {
-            for (let k = 0; k < 3; k++) {
-              const v = 0.5 + SH_C0 * g3.shDC[i * 3 + k];
-              color[i * 3 + k] = Math.min(1, Math.max(0, v));
-            }
-          }
-          const fb = { mode: 0, position: g3.pos, color, uv: null,
-                       normal: null, indices: null, textureUrl: null };
-          obj = makeMesh(R, fb, wire);
-          this.reset();
-          draw();
-          if (onStatus) onStatus('泼溅不可用，已降级为点云：' + e.message);
-          return { vertices: n, triangles: 0, mode: 0,
-                   textured: false, colors: true, normals: false,
-                   degraded: true, degradeReason: e.message };
-        }
+        throw new Error('这是完整 3DGS PLY（59 维含 SH），请用参考渲染器（refviewer.js）');
       }
-
       if (!model || !model.position || model.position.length < 3) {
         throw new Error('解析后没有任何顶点（文件可能只含空网格）');
       }

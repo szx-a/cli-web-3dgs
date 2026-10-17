@@ -143,7 +143,9 @@ def create_app():
         """
         root = Path(str(load_settings().get("project.workspace_dir")))
         rep: dict[str, Any] = {"static": {}, "job": job or None, "problems": []}
-        for s in ("index.html", "splat.js", "viewer.js", "app.js"):
+        for s in ("index.html", "viewer.js", "app.js", "refviewer.js",
+                  "splat.legacy.js", "vendor/three.module.js",
+                  "vendor/gaussian-splats-3d.module.js"):
             f = STATIC_DIR / s
             rep["static"][s] = {"exists": f.exists(),
                                 "bytes": f.stat().st_size if f.exists() else 0}
@@ -341,6 +343,7 @@ def create_app():
         radius = max(1e-6, float(np.linalg.norm(mx - mn) / 2.0))
 
         up = np.array([0.0, 1.0, 0.0])
+        up_source = "default"
         cams_p = None
         root = (Path(str(load_settings().get("project.workspace_dir")))
                 / job_id).resolve()
@@ -356,21 +359,38 @@ def create_app():
                     best = rec
             if best is not None and len(best.images) >= 3:
                 cams_p = np.array([im.cam_to_world()[1] for im in best.images])
+                # ---- 上方向：取**相机自身姿态**，不要用相机中心的平面法向 ----
+                #
+                # ⚠️ 我原来用"相机中心点云的最小方差轴"，然后按
+                # `dot(n,[0,1,0])<0` 把它翻成 +Y。这是**错的**，实测代价是
+                # 模型**上下颠倒**（用户："模型初始是倒的"）：
+                #
+                #   平面法向给 [-0.032, 0.980, 0.198]（被我翻成 +Y）
+                #   而逐相机 `-c2w[:,1]` 的均值是 [0.016, -0.995, -0.102]
+                #   ⇒ 这个世界坐标的"上"其实是 **-Y**，翻转后正好倒过来。
+                #
+                # 正解：COLMAP 相机坐标是 X 右 / Y 下 / Z 前，
+                # 所以**相机 Y 轴的世界方向取反就是世界"上"**。
+                # 而且它的离散度极小（406 台相机中位偏差 2.7°、p95 5.8°），
+                # 比平面法向稳健得多，还自带正确的符号。
+                ups = np.array([-im.cam_to_world()[0][:3, 1] for im in best.images])
+                m = ups.mean(axis=0)
+                nm = float(np.linalg.norm(m))
+                if nm > 1e-9:
+                    up = m / nm
+                    up_source = "camera_axes"
         except Exception:  # noqa: BLE001
             cams_p = None
 
-        if cams_p is not None and len(cams_p) >= 3:
+        # 兜底：没有位姿时才退回平面法向（此时符号确实无法确定，只能取接近 +Y）
+        if up_source == "default" and cams_p is not None and len(cams_p) >= 3:
             d = cams_p - cams_p.mean(axis=0)
-            # 最小方差方向 = 相机所在平面的法向
             _, _, vt = np.linalg.svd(d, full_matrices=False)
             n = vt[-1] / max(np.linalg.norm(vt[-1]), 1e-12)
-            # 让法向大致朝上（与质心到相机的平均方向同侧就不再翻转）
-            if float(np.dot(n, np.mean(cams_p - cams_p.mean(0), axis=0))) < 0:
-                pass
-            # 取更接近 +Y 的那个朝向作为"上"，保证不同作业一致
             if float(np.dot(n, np.array([0.0, 1.0, 0.0]))) < 0:
                 n = -n
             up = n
+            up_source = "camera_plane_normal"
 
         # 相机位置：沿 up 抬高 12°，距离 2.8R，朝向 -Z 方向偏移
         elev = math.radians(12.0)
@@ -386,6 +406,7 @@ def create_app():
         return {"center": [float(x) for x in center],
                 "radius": float(radius),
                 "up": [float(x) for x in up],
+                "upSource": up_source,
                 "cameraPosition": [float(x) for x in cam],
                 "cameraLookAt": [float(x) for x in center],
                 "gaussians": int(len(xyz)),

@@ -612,9 +612,19 @@ class ExportStage(Stage):
         # 泊松对远处杂点比 TSDF 更敏感（会生成巨大的"鼓包"），所以默认裁得更紧。
         xyz_np = np.asarray(gauss["xyz"], dtype=np.float64)
         op_np = np.asarray(gauss["opacity"], dtype=np.float64).reshape(-1)
-        # 自动聚焦默认分位 0.95：实测 0.90 偏紧（会切掉主体部分外缘），
-        # 同一模型同一验证脚本下轮廓 IoU 0.95 明显更好（0.750 vs 0.696）。
-        default_q = 0.95 if method == "poisson" else 0.98
+        # 自动聚焦：**只用不透明度过滤，不按分位数裁**。
+        #
+        # ⚠️ 这里原来用 `quantile=0.95/0.98`，是一个**真实事故**的源头：
+        # 3DGS 把容量放在细节密集处（门楼雕花），屋檐/翼角面积大但纹理平滑
+        # ⇒ 分到的高斯很少。按"点的分位数"裁，会先把稀疏但真实的结构裁掉：
+        #
+        #     不透明度>0.3 的高斯 24,629 个，铺满 5.83 × 2.16 × 2.85
+        #     但 95% 分位框只有 1.67 × 1.05 × 0.49
+        #     最终网格 bbox 只有高斯的 25% / 22% / 15%，体积占 0.85%
+        #
+        # 用户看到的就是"网络破碎"—— 导出的网格只是中央一小块扭曲碎片。
+        # 详见 `gsdata/mesh_export.auto_crop_bounds` 与 docs/03 G119。
+        default_q = 1.0
         if ctx.cfg("mesh_auto_crop", True):
             lo, hi, cinfo = auto_crop_bounds(
                 xyz_np, op_np,
@@ -1896,11 +1906,14 @@ class ExportStage(Stage):
                 if best is None or len(rec.images) > len(best.images):
                     best = rec
             if best is not None and len(best.images) >= 3:
-                cs = np.array([im.cam_to_world()[1] for im in best.images])
-                d = cs - cs.mean(axis=0)
-                _, _, vt = np.linalg.svd(d, full_matrices=False)
-                n = vt[-1] / max(np.linalg.norm(vt[-1]), 1e-12)
-                up = -n if float(np.dot(n, [0.0, 1.0, 0.0])) < 0 else n
+                # 上方向取**相机姿态**（COLMAP 相机 Y 向下 ⇒ up = -c2w[:,1]）。
+                # ⚠️ 不要用"相机中心平面的法向再翻成 +Y"：实测该法向是 -Y，
+                # 翻转后模型**上下颠倒**（用户："模型初始是倒的"）。
+                ups = np.array([-im.cam_to_world()[0][:3, 1] for im in best.images])
+                m = ups.mean(axis=0)
+                nm = float(np.linalg.norm(m))
+                if nm > 1e-9:
+                    up = m / nm
         except Exception:  # noqa: BLE001
             pass
 
