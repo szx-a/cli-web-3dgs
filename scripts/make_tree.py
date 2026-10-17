@@ -27,6 +27,7 @@ DIR_NOTES = {
     "src/gsflow/tools": "外部工具适配（COLMAP/FFmpeg 定位与调用）",
     "src/gsflow/web": "FastAPI Web GUI（+ static 前端）",
     "src/gsflow/web/static": "前端（无构建步骤的纯 JS/CSS）",
+    "src/gsflow/web/static/vendor": "离线第三方前端库（three.js + gaussian-splats-3d）",
     "scripts": "运维/诊断/实验脚本（不参与产品运行）",
     "tests": "pytest 回归",
     "docs": "文档",
@@ -42,7 +43,10 @@ DIR_NOTES = {
 SKIP_NAMES = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
               "node_modules", ".ipynb_checkpoints"}
 # 这些目录只统计、不展开（体量太大或内容无信息量）
-COLLAPSE = {"env", "workspace", "downloads", "logs", "models", "tools/ffmpeg", "tools/colmap"}
+COLLAPSE = {"env", "workspace", "downloads", "logs", "models", "tools/ffmpeg", "tools/colmap",
+            # vendor 里是两个 ~600KB~1.2MB 的压缩库，展开没信息量，但**必须出现在树里**：
+            # 高斯渲染完全依赖它们（离线可用），早期版本的文件树漏掉了这一层。
+            "src/gsflow/web/static/vendor"}
 
 
 def py_lines(p: Path) -> int:
@@ -81,7 +85,10 @@ def walk(p: Path, prefix: str, rel: str, out: list[str], max_depth: int, depth: 
         r = f"{rel}/{x.name}" if rel else x.name
         note = DIR_NOTES.get(r, "")
         if x.is_dir():
-            collapse = x.name in COLLAPSE or r in COLLAPSE
+            # `tools/` 下面是第三方可执行（COLMAP 几百个文件），整棵子树只统计不展开；
+            # 否则 `--depth` 一大，文件树会多出 600+ 行噪声，把真正的代码结构淹掉。
+            collapse = (x.name in COLLAPSE or r in COLLAPSE
+                        or r == "tools" or r.startswith("tools/"))
             if collapse:
                 f, d = dir_size(x)
                 out.append(f"{prefix}{branch}{x.name}/   "
@@ -104,7 +111,7 @@ def walk(p: Path, prefix: str, rel: str, out: list[str], max_depth: int, depth: 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="docs/04-文件树.md")
-    ap.add_argument("--depth", type=int, default=3)
+    ap.add_argument("--depth", type=int, default=5)
     args = ap.parse_args()
 
     lines: list[str] = []
@@ -143,6 +150,12 @@ def main() -> int:
     lines.append("| `gsdata/` | COLMAP 读写、深度反投影、泊松/TSDF 网格提取 | 纯几何，不依赖训练栈 |")
     lines.append("| `segment/` | 分割后端（rembg/classical/FastSAM/SAM2/SAM3） | 实现 `Segmenter` 协议 |")
     lines.append("| `web/` | FastAPI + 静态前端 | 与 CLI **共用同一 Orchestrator**（同构红线） |")
+    lines.append("| `web/static/refviewer.js` | 高斯显示的**适配层** | 渲染像素交给 "
+                 "vendored `gaussian-splats-3d`，本文件不含任何着色器代码（`docs/03` G116/G121）|")
+    lines.append("| `web/static/viewer.js` | WebGL1 查看器：glb / **普通** ply（网格、点云）| "
+                 "遇到 3DGS PLY 或 `.splat` **明确报错**并指向 refviewer |")
+    lines.append("| `web/static/splat.legacy.js` | 已下线的自研泼溅器（归档）| **不被 index.html 加载**；"
+                 "保留仅供追溯 |")
     lines.append("| `cli.py` | 命令行入口 | 与 GUI 等价，GUI 会打印等价 CLI 命令 |")
     lines.append("")
 
