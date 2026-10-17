@@ -1259,8 +1259,7 @@ def train(cfg: TrainConfig, ctx) -> dict:
         else:
             render = render + background * (1 - alphas[0])
 
-        l1 = (render - gt).abs()
-        # ---- 掩码处理：**合成背景后在全图上算损失**（本轮的重要算法修正）----
+        # ---- 掩码处理：**先改 GT，再算损失**（本轮的重要算法修正）----
         #
         # 原实现是 `l1 = l1[m].mean()`（只在掩码内取均值），有两个真实后果：
         #   1) **loss 量级随前景占比变化**：实测各视角前景占比 12%~55%，
@@ -1276,11 +1275,28 @@ def train(cfg: TrainConfig, ctx) -> dict:
         #   * 前景：照常监督真实像素；
         #   * 背景：监督"必须渲染成背景色"⇒ 抑制背景里的游离高斯；
         #   * 每个视角的 loss 尺度一致（不再随前景占比漂移）。
+        #
+        # ⚠️⚠️ **这里曾经有一个致命顺序错误**（本轮查出）：
+        #
+        #     l1 = (render - gt).abs()          # ← 用**原始** gt 算好了
+        #     if masks and ...:
+        #         gt = torch.where(...)          # ← 只替换了 gt
+        #     l1 = l1.mean()                     # ← 用的还是**旧** l1
+        #
+        # 于是 `composite` 对 **L1 完全没有生效**（只有 SSIM 用了被替换的 gt，
+        # 而 ssim_weight 通常只有 0.2）⇒ 掩码形同虚设，背景照样被拟合。
+        # 实测证据（`scripts/diag_alpha_background.py`）：
+        #
+        #     掩码外渲染亮度 **0.904**（应为黑）、alpha 0.998
+        #     `mask_loss_mode` 改成 inside 后亮权重 61.2% → 59.6%（几乎无变化）
+        #
+        # 现在：**先**把 gt 在掩码外合成背景色，**再**算 l1。
+        _mask = None
         if masks and step < int(cfg.iterations * cfg.mask_loss_until):
-            m = masks[idx]
-            if max_side and m.shape[0] != gt.shape[0]:
-                m = torch.nn.functional.interpolate(
-                    m[None, None].float(), size=gt.shape[:2], mode="nearest"
+            _mask = masks[idx]
+            if max_side and _mask.shape[0] != gt.shape[0]:
+                _mask = torch.nn.functional.interpolate(
+                    _mask[None, None].float(), size=gt.shape[:2], mode="nearest"
                 )[0, 0] > 0.5
             # ⚠️ 插值分支产生的张量在 **CPU** 上（`m` 原本是 CPU 上的 bool 张量），
             # 而 `gt` 在 CUDA 上。旧代码只在 else 分支做了 `.to(device)`，
@@ -1289,14 +1305,18 @@ def train(cfg: TrainConfig, ctx) -> dict:
             #                   but found at least two devices, cuda:0 and cpu!
             # 这个分支只在**图像被缩放**时触发（例如 576x1280 的素材去畸变后变
             # 577x1309），所以小数据集一直没暴露它。这里统一搬设备。
-            m = m.to(device)
-            if str(cfg.mask_loss_mode).lower() == "inside":
-                # 旧行为（仅用于对照/复现）：只在掩码内取均值
-                if m.any():
-                    l1 = l1[m].mean() if l1[m].numel() else l1.mean()
-            elif m.any() and not bool(m.all()):
-                # 默认：掩码外合成背景色，损失在全图上算
-                gt = torch.where(m[..., None], gt, background.to(device=gt.device, dtype=gt.dtype))
+            _mask = _mask.to(device)
+            _mode = str(cfg.mask_loss_mode).lower()
+            if _mode != "inside" and _mask.any() and not bool(_mask.all()):
+                # 默认：掩码外合成背景色 —— **必须在算 l1 之前**
+                gt = torch.where(_mask[..., None], gt,
+                                 background.to(device=gt.device, dtype=gt.dtype))
+
+        l1 = (render - gt).abs()
+        if (_mask is not None and str(cfg.mask_loss_mode).lower() == "inside"
+                and _mask.any()):
+            # 旧行为（仅用于对照/复现）：只在掩码内取均值
+            l1 = l1[_mask] if l1[_mask].numel() else l1
         l1 = l1.mean()
 
         ssim_val = ssim_simple(render.permute(2, 0, 1)[None], gt.permute(2, 0, 1)[None],
@@ -1585,9 +1605,12 @@ def train(cfg: TrainConfig, ctx) -> dict:
                 want_lpips=bool(getattr(cfg, "eval_metrics", True)) and is_final,
             )
             cur_psnr = float(eval_res.get("psnr", 0.0))
+            _cur_masked = eval_res.get("psnr_masked")
             cur_ssim = float(eval_res.get("ssim", 0.0))
             cur_lpips = eval_res.get("lpips")
             psnr_log.append({"step": step, "psnr": round(cur_psnr, 3),
+                         "psnr_masked": (round(float(_cur_masked), 3)
+                                          if _cur_masked is not None else None),
                              "ssim": round(cur_ssim, 4),
                              "lpips": (round(float(cur_lpips), 4)
                                        if cur_lpips is not None else None),
@@ -1844,6 +1867,9 @@ def train(cfg: TrainConfig, ctx) -> dict:
         "elapsed_min": round((time.time() - t0) / 60, 2),
         "final_loss": loss_log[-1]["loss"] if loss_log else None,
         "psnr": psnr_log[-1]["psnr"] if psnr_log else None,
+        # 掩码内 PSNR：掩码生效后全图 PSNR 会被"该黑的背景"主导而失去意义
+        # （实测 26.3 → 3.4 dB 而目视更好），物体区域画质看这个。
+        "psnr_masked": (psnr_log[-1].get("psnr_masked") if psnr_log else None),
         # 多指标评估（用户方案第 6 项）：PSNR 高不等于视觉好，
         # 同时记录 SSIM / LPIPS，便于判断"哪个检查点真的更好"。
         "ssim": (psnr_log[-1].get("ssim") if psnr_log else None),
@@ -2036,6 +2062,7 @@ def evaluate(rasterization, means, quats, scales, opacities, shs, imgs, masks, k
     if not eval_idx:
         return {"psnr": 0.0, "ssim": 0.0, "lpips": None, "views": 0}
     psnrs: list[float] = []
+    psnrs_in: list[float] = []   # 掩码内 PSNR（物体区域画质）
     ssims: list[float] = []
     lpipss: list[float] = []
     lp = None
@@ -2068,6 +2095,23 @@ def evaluate(rasterization, means, quats, scales, opacities, shs, imgs, masks, k
             render = colors[0] + background * (1 - alphas[0])
             mse = torch.mean((render - gt) ** 2).clamp_min(1e-10)
             psnrs.append(float(10.0 * torch.log10(1.0 / mse)))
+            # ---- 掩码内 PSNR：训练把掩码外压成背景色之后，**全图 PSNR 必然失效** ----
+            #
+            # 背景被有意压黑后，全图 MSE 主要来自"该黑的地方渲成了亮的模型"，
+            # 与"物体画得好不好"几乎无关。实测修复掩码后全图 PSNR 直接从
+            # 26.3 dB 掉到 **3.4 dB**，而目视质量明显更好 —— 这就是指标与目标脱节。
+            # 所以必须同时给出**只统计掩码内像素**的 PSNR（物体区域的画质）。
+            if masks is not None and i < len(masks):
+                _m = masks[i]
+                if _m.shape[0] != gt.shape[0]:
+                    _m = torch.nn.functional.interpolate(
+                        _m[None, None].float(), size=gt.shape[:2], mode="nearest"
+                    )[0, 0] > 0.5
+                _m = _m.to(device)
+                if bool(_m.any()):
+                    d2 = (render - gt) ** 2
+                    mse_in = d2[_m].mean().clamp_min(1e-10)
+                    psnrs_in.append(float(10.0 * torch.log10(1.0 / mse_in)))
             try:
                 s = ssim_simple(render.permute(2, 0, 1)[None], gt.permute(2, 0, 1)[None])
                 ssims.append(float(s))
@@ -2082,6 +2126,10 @@ def evaluate(rasterization, means, quats, scales, opacities, shs, imgs, masks, k
                 _dump_compare(dump_dir, i, render, gt)
     return {
         "psnr": sum(psnrs) / len(psnrs),
+        # 掩码内 PSNR：训练把掩码外压成背景色之后，**全图 PSNR 不再代表画质**
+        # （实测修复掩码后全图从 26.3 → 3.4 dB，而目视质量更好）。
+        # 物体区域画质要看这个。
+        "psnr_masked": (sum(psnrs_in) / len(psnrs_in)) if psnrs_in else None,
         "ssim": (sum(ssims) / len(ssims)) if ssims else 0.0,
         "lpips": (sum(lpipss) / len(lpipss)) if lpipss else None,
         "views": len(psnrs),

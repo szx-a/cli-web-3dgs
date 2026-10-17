@@ -35,23 +35,37 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--job", default="img3-final")
     ap.add_argument("--views", type=int, default=3)
+    ap.add_argument("--data-dir", default="",
+                    help="相机位姿/掩码所在的数据目录（默认在作业目录下找）")
     args = ap.parse_args()
 
     from gsflow.gsdata.colmap_io import read_model
     from gsflow.gsdata.shio import read_gaussians_full
 
-    # ⚠️ 先确认 gsplat 的 CUDA 内核**已经构建**，否则 `render_view` 会触发一次
-    # JIT 编译（80 秒级），而本机在 GBK 代码页下探测编译器版本会直接崩：
+    # ⚠️ 先确认 gsplat 的 CUDA 内核**已就绪**，否则 `render_view` 会触发一次
+    # JIT 编译（本机实测 80~140 秒），而本机在 GBK 代码页下探测编译器版本会直接崩：
     #     UnicodeDecodeError: 'cp1' codec can't decode ...
-    # 导出流程早就用同样的判据规避过这个问题（`_splat_kernel_ready`），
-    # 这里照抄一份，宁可明确报"内核未就绪"也不去偷偷编译。
-    try:
-        import gsplat  # noqa: F401
-        from gsplat import cuda as _gscuda
+    #
+    # 判据要与项目里的 `export._splat_kernel_ready()` **完全一致**：
+    #   1) `paths.apply_runtime_env()` 已把预编译内核注册进 `sys.modules`
+    #      （它会注册 `gsplat_cuda` 与 `gsplat.csrc`，让 gsplat 跳过编译分支）；
+    #   2) `gsplat.cuda._backend._C` 不为 None。
+    # 我第一版写成 `hasattr(gsplat.cuda, "_C")` —— 那是错的属性路径，
+    # 于是永远"未就绪"，把一条本来能跑的检查挡掉了。
+    from gsflow.paths import apply_runtime_env
 
-        if not hasattr(_gscuda, "_C") or getattr(_gscuda, "_C", None) is None:
+    apply_runtime_env()
+    import sys as _sys
+
+    if _sys.modules.get("gsplat.csrc") is None:
+        print("gsplat CUDA 内核未注册（apply_runtime_env 未生效），本检查跳过。")
+        return 0
+    try:
+        from gsplat.cuda._backend import _C as _kernel
+
+        if _kernel is None:
             print("gsplat CUDA 内核未就绪（会触发 JIT 编译），本检查跳过。")
-            print("  提示：先跑一次训练（内核会构建并缓存），再执行本脚本。")
+            print("  提示：先跑一次训练/导出（内核会构建并缓存），再执行本脚本。")
             return 0
     except Exception as exc:  # noqa: BLE001
         print(f"gsplat 不可用（{type(exc).__name__}），本检查跳过。")
@@ -66,7 +80,15 @@ def main() -> int:
         return 1
     g = read_gaussians_full(plys[-1])
 
-    cands = sorted({p.parent for p in (jd / "03_colmap" / "sparse").rglob("cameras.bin")})
+    # 相机位姿可能在 03_colmap/sparse，也可能随训练数据复制到 04_train/data/sparse
+    roots = [jd / "03_colmap" / "sparse", jd / "04_train" / "data" / "sparse"]
+    if args.data_dir:
+        roots.insert(0, Path(args.data_dir) / "sparse")
+    cands = []
+    for r in roots:
+        if r.exists():
+            cands.extend(sorted({p.parent for p in r.rglob("cameras.bin")}))
+    cands = sorted(set(cands))
     best = None
     for c in cands:
         rec = read_model(c)
@@ -123,6 +145,25 @@ def main() -> int:
         if bright.any():
             print(f"    亮度>0.8 的像素: {bright.mean()*100:.1f}%，"
                   f"其中 alpha<0.05 的占 {(bright & empty).sum()/max(bright.sum(),1)*100:.1f}%")
+
+        # ---- 掩码内/外分开统计：直接看"背景有没有被抑制" ----
+        from PIL import Image as _Im
+
+        mdata = (Path(args.data_dir) / "masks") if args.data_dir \
+            else (jd / "04_train" / "data" / "masks")
+        mp = None
+        for cand in (mdata / (im.name + ".png"),
+                     mdata / (Path(im.name).stem + ".png")):
+            if cand.exists():
+                mp = cand
+                break
+        if mp is not None:
+            with _Im.open(mp) as mm:
+                msk = np.asarray(mm.convert("L").resize((W, H), _Im.NEAREST)) > 127
+            if msk.any() and (~msk).any():
+                print(f"    掩码内: 亮度 {lum[msk].mean():.3f}  alpha {a[msk].mean():.3f}")
+                print(f"    掩码外: 亮度 {lum[~msk].mean():.3f}  alpha {a[~msk].mean():.3f}"
+                      f"   ← 若掩码生效，这里应接近 **黑**（合成损失把掩码外 GT 涂黑）")
 
     print("\n  判读：若'亮度>0.8 的像素'里大部分 alpha<0.05 ⇒ 亮背景**不是高斯**，"
           "\n        而是渲染器/合成时的背景色 ⇒ 观感问题的修法在查看器（背景/色调），"
