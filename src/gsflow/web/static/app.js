@@ -668,8 +668,7 @@ let MODELS = null;          // 当前作业的 /api/models 结果
 let ACTIVE_MODE = 'preview'; // 默认显示最可靠的视图（没有则自动回退）
 let VIEWER_READY = false;
 
-function initModelsPage() {
-  // ⚠️ 先确认两个脚本都到位。缺 `splat.js` 时泼溅模式必然失败，
+function initModelsPage() {  // ⚠️ 先确认两个脚本都到位。缺 `splat.js` 时泼溅模式必然失败，
   // 而症状只是"画面全黑"——用户从控制台很难看出是脚本没加载。
   // 这里显式提示，并给出自救办法（强制刷新 / 查自检接口）。
   const missing = [];
@@ -695,6 +694,27 @@ function initModelsPage() {
     }
   }
   initLocalFilePicker();
+  // 服务端渲染 / 返回 WebGL：把"高质量静态图"与"可交互低延迟"两种模式接起来
+  const btnSrv = $('m-srv-render');
+  if (btnSrv) {
+    btnSrv.onclick = () => {
+      renderCurrentViewOnServer().catch((e) => {
+        $('m-status').textContent = '服务端渲染失败：' + e.message;
+      });
+    };
+  }
+  const btnBack = $('m-back-webgl');
+  if (btnBack) {
+    btnBack.onclick = () => {
+      const img = $('m-image');
+      if (img) { img.style.display = 'none'; img.removeAttribute('src'); }
+      const cv = $('m-canvas');
+      if (cv) cv.style.display = 'block';
+      if (window.GsViewer && window.GsViewer.redraw) window.GsViewer.redraw();
+      $('m-overlay').classList.add('hide');
+      $('m-status').textContent = 'WebGL 交互模式';
+    };
+  }
   loadModelJobs();
 }
 
@@ -753,6 +773,54 @@ function fmtSize(f) {
     return (m >= 1024 ? (m / 1024).toFixed(2) + ' GB' : m.toFixed(2) + ' MB');
   }
   return '—';
+}
+
+/**
+ * 「服务端渲染当前视角」：把前端相机交给后端，用 **gsplat 官方光栅化器**出图。
+ *
+ * 为什么要这条路：GUI 的 WebGL 泼溅是我重新实现的渲染器（逐高斯桶排序、
+ * 四边形 2σ 近似、固定低通），与 `preview_*.png` 的 gsplat 渲染**必然有差距**。
+ * 任何 WebGL 复刻都消不掉这个差距；唯一能"按构造一致"的做法就是：
+ * 前端只负责相机，像素由同一个渲染器算。
+ *
+ * 相机约定（与 `viewer.js::getCamera()` 和后端 `/api/render` 一致）：
+ *   direction = [cos(pitch)·sin(yaw), sin(pitch), cos(pitch)·cos(yaw)]，单位为度。
+ */
+async function renderCurrentViewOnServer() {
+  if (!MODELS) return;
+  const job = $('m-job') && $('m-job').value;
+  if (!job) { $('m-status').textContent = '先选择一个作业'; return; }
+  if (!window.GsViewer || !window.GsViewer.getCamera) {
+    $('m-status').textContent = '查看器未就绪，无法取当前相机';
+    return;
+  }
+  const cam = window.GsViewer.getCamera();
+  const w = Math.max(320, Math.min(1200, ($('m-canvas') ? $('m-canvas').width : 720) || 720));
+  const h = Math.max(320, Math.min(1200, ($('m-canvas') ? $('m-canvas').height : 720) || 720));
+  const url = `/api/render/${encodeURIComponent(job)}`
+    + `?yaw=${cam.yaw.toFixed(3)}&pitch=${cam.pitch.toFixed(3)}`
+    + `&dist=${cam.dist.toFixed(4)}&width=${w}&height=${h}`;
+  $('m-status').textContent = '服务端渲染中…（gsplat）';
+  $('m-overlay').classList.remove('hide');
+  $('m-overlay').textContent = '服务端渲染中…';
+  const img = $('m-image');
+  const cv = $('m-canvas');
+  const tmp = new Image();
+  tmp.onload = () => {
+    if (img) { img.style.display = 'block'; img.src = tmp.src; }
+    if (cv) cv.style.display = 'none';
+    $('m-overlay').classList.add('hide');
+    $('m-status').textContent = `服务端渲染 yaw=${cam.yaw.toFixed(1)}° `
+      + `pitch=${cam.pitch.toFixed(1)}° · gsplat 官方光栅化器`;
+  };
+  tmp.onerror = () => {
+    $('m-overlay').classList.remove('hide');
+    $('m-overlay').style.whiteSpace = 'pre-line';
+    $('m-overlay').textContent = '服务端渲染失败（后端未重启或 GPU 忙）\n'
+      + '地址：' + url;
+    $('m-status').textContent = '服务端渲染失败';
+  };
+  tmp.src = url;
 }
 
 function renderModeFiles() {

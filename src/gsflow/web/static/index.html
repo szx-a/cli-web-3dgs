@@ -345,6 +345,11 @@
           <img id="m-image" alt="服务端渲染预览" style="display:none">
           <div id="m-overlay" class="muted">选择一个模型…</div>
         </div>
+        <div class="row" style="margin-top:8px; gap:8px; flex-wrap:wrap">
+          <button id="m-srv-render" type="button">服务端渲染当前视角</button>
+          <button id="m-back-webgl" type="button">返回 WebGL 交互</button>
+          <span class="muted" id="m-srv-hint">服务端渲染用 gsplat 官方光栅化器，与对照图同一渲染器</span>
+        </div>
         <p class="hint">左键拖动旋转 · 滚轮缩放 · 右键（或 Shift+左键）平移。
           点云模式下渲染的是 <code>model.glb</code> / <code>model.ply</code>；
           网格模式是 <code>model_mesh.glb</code>；带贴图模式是

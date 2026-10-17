@@ -1031,9 +1031,32 @@ window.GsViewer = (function () {
       draw();
     },
     toggleWire() { wire = !wire; draw(); return wire; },
+    /** 主动重绘（例如从"服务端渲染图"切回 WebGL 交互时用；不改变相机）。 */
+    redraw() { draw(); },
     /** 旋转模式：'free'（默认，可翻越极点）| 'clamp'（到顶/底停住） */
     setRotMode,
     getRotMode,
+
+    /**
+     * 导出当前相机（供"服务端渲染当前视角"使用）。
+     *
+     * 返回 `{ yaw, pitch, dist, target }`，角度单位为**度**，
+     * 与后端 `/api/render` 的约定一致：
+     *   相机方向 = [cos(pitch)·sin(yaw), sin(pitch), cos(pitch)·cos(yaw)]
+     * 于是"前端转视角 + 后端 gsplat 渲染"看到的是**同一个相机**，
+     * 查看器与预览图按构造一致，不再依赖 WebGL 复刻的精度。
+     */
+    getCamera() {
+      const cp = eyePos();
+      const dx = cp[0] - target[0];
+      const dy = cp[1] - target[1];
+      const dz = cp[2] - target[2];
+      const d = Math.hypot(dx, dy, dz) || 1e-6;
+      const yaw = Math.atan2(dx, dz) * 180 / Math.PI;
+      const pitch = Math.asin(Math.max(-1, Math.min(1, dy / d))) * 180 / Math.PI;
+      return { yaw, pitch, dist: d, target: target.slice(),
+               radius: obj ? obj.radius : 1 };
+    },
 
     /**
      * 诊断接口：返回查看器的实际运行状态。

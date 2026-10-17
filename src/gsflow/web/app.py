@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import threading
 import time
 import webbrowser
 from pathlib import Path
@@ -34,7 +35,8 @@ STATIC_DIR = Path(__file__).parent / "static"
 def create_app():
     try:
         from fastapi import Body, FastAPI, HTTPException, Query
-        from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+        from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse, Response,
+                               StreamingResponse)
     except ImportError as exc:  # pragma: no cover
         raise SystemExit(
             "未安装 Web 依赖，请先执行：pip install fastapi 'uvicorn[standard]'\n"
@@ -299,6 +301,140 @@ def create_app():
             "running": manager.list(),
             "history": list_jobs(Path(str(load_settings().get("project.workspace_dir")))),
         }
+
+    # ------------------------------------------------------------------ 服务端渲染
+    #
+    # 为什么要有这条路由：GUI 里的"泼溅"是我用 WebGL **重新实现**的渲染器
+    # （逐高斯桶排序、四边形 2σ 近似、固定低通），与 `preview_*.png` 用的
+    # **gsplat 官方光栅化器**（逐像素排序、精确 EWA、完整 SH）必然有差距。
+    # 用户反复看到"查看器里的模型比对照图差很多"，而任何 WebGL 复刻都消不掉这个差距。
+    #
+    # 正确做法：**按用户当前相机，用同一个 gsplat 渲染器出图**，返回 PNG。
+    # 这样查看器和预览图**按构造完全一致**，不再依赖我复刻 WebGL。
+    _RENDER_CACHE: dict[str, Any] = {}
+    _RENDER_LOCK = threading.Lock()
+
+    def _gauss_for(job_id: str):
+        """按 (路径, mtime) 缓存高斯，避免每次渲染都读 29MB PLY。"""
+        root = (Path(str(load_settings().get("project.workspace_dir")))
+                / job_id).resolve()
+        if not root.is_dir():
+            raise HTTPException(404, f"作业不存在：{job_id}")
+        ply = None
+        mp = root / "04_train" / "metrics.json"
+        if mp.exists():
+            try:
+                best = str(json.loads(mp.read_text(encoding="utf-8"))
+                           .get("best_ply") or "")
+                if best:
+                    p = Path(best)
+                    if not p.is_absolute():
+                        p = root / p
+                    if p.exists():
+                        ply = p
+            except Exception:  # noqa: BLE001
+                ply = None
+        if ply is None:
+            cands = sorted((root / "04_train" / "point_cloud").glob("*/point_cloud.ply"))
+            if cands:
+                ply = cands[-1]
+        if ply is None:
+            raise HTTPException(404, "找不到训练产物 point_cloud.ply")
+        ply = ply.resolve()
+        if not str(ply).startswith(str(root)):
+            raise HTTPException(400, "路径越界")
+        key = f"{ply}::{ply.stat().st_mtime_ns}"
+        hit = _RENDER_CACHE.get(key)
+        if hit is None:
+            from ..gsdata.shio import read_gaussians_full
+
+            hit = read_gaussians_full(ply)
+            # 只保留最近一份，避免长时间运行把显存/内存撑爆
+            _RENDER_CACHE.clear()
+            _RENDER_CACHE[key] = hit
+        return hit
+
+    @app.get("/api/render/{job_id}")
+    def render(job_id: str, yaw: float = 0.0, pitch: float = 0.0,
+               dist: float = 0.0, width: int = 720, height: int = 720):
+        """用 gsplat 渲染一帧，返回 PNG。
+
+        `yaw`/`pitch` 为角度（度），`dist` 为相机到物体中心的距离
+        （<=0 时用 2.8×包围球半径，与查看器的默认取景一致）。
+        """
+        import io
+        import math
+
+        width = max(64, min(int(width), 1600))
+        height = max(64, min(int(height), 1600))
+        try:
+            g = _gauss_for(job_id)
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(500, f"读取高斯失败：{type(exc).__name__}: {exc}") from exc
+
+        import numpy as np
+
+        xyz = np.asarray(g["xyz"], dtype=np.float64)
+        mn, mx = xyz.min(0), xyz.max(0)
+        center = (mn + mx) / 2.0
+        radius = max(1e-6, float(np.linalg.norm(mx - mn) / 2.0))
+        d = float(dist) if dist and dist > 0 else radius * 2.8
+
+        # 球坐标 → 相机位置（与查看器的约定一致：yaw 绕 Y，pitch 抬高）
+        cy, sy = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
+        cp, sp = math.cos(math.radians(pitch)), math.sin(math.radians(pitch))
+        direction = np.array([cp * sy, sp, cp * cy], dtype=np.float64)
+        eye = center + direction * d
+
+        # look-at：相机看 -Z，up 取 +Y
+        fwd = center - eye
+        fwd /= max(np.linalg.norm(fwd), 1e-12)
+        up_world = np.array([0.0, 1.0, 0.0])
+        if abs(float(np.dot(fwd, up_world))) > 0.999:
+            up_world = np.array([0.0, 0.0, 1.0])
+        right = np.cross(fwd, up_world)
+        right /= max(np.linalg.norm(right), 1e-12)
+        up = np.cross(right, fwd)
+        w2c = np.eye(4, dtype=np.float64)
+        w2c[0, :3], w2c[1, :3], w2c[2, :3] = right, up, -fwd
+        w2c[:3, 3] = -w2c[:3, :3] @ eye
+
+        fov = math.radians(45.0)
+        f = 0.5 * height / math.tan(fov / 2.0)
+        K = np.array([[f, 0, width / 2.0],
+                      [0, f, height / 2.0],
+                      [0, 0, 1]], dtype=np.float64)
+
+        try:
+            from ..gsdata.shio import render_view
+
+            # GPU 同一时刻只跑一个渲染：训练在跑时排队，而不是抢显存
+            with _RENDER_LOCK:
+                colors, alphas = render_view(g, w2c, K, width, height)
+            img = np.asarray(colors.detach().cpu().numpy()
+                             if hasattr(colors, "detach") else colors)
+            a = np.asarray(alphas.detach().cpu().numpy()
+                           if hasattr(alphas, "detach") else alphas)
+            if img.ndim == 3 and img.shape[-1] >= 3:
+                img = img[..., :3]
+            if a.ndim == 3:
+                a = a[..., 0]
+            # 与 canvas 背景同色，便于对比
+            bg = np.array([0.02, 0.03, 0.045], dtype=np.float32)
+            comp = img * a[..., None] + bg * (1.0 - a[..., None])
+            u8 = np.clip(comp * 255.0, 0, 255).astype(np.uint8)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                503, f"服务端渲染不可用（{type(exc).__name__}: {exc}）") from exc
+
+        from PIL import Image as _Image
+
+        buf = io.BytesIO()
+        _Image.fromarray(u8).save(buf, format="PNG")
+        return Response(content=buf.getvalue(), media_type="image/png",
+                        headers={"Cache-Control": "no-store"})
 
     @app.get("/api/jobs/{job_id}")
     def job_detail(job_id: str) -> dict[str, Any]:
