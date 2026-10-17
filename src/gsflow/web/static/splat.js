@@ -50,16 +50,24 @@ window.GsSplatRenderer = (function () {
     '  mat3 M = mat3(aCovA.x, aCovA.y, aCovA.z,',
     '                aCovA.y, aCovB.x, aCovB.y,',
     '                aCovA.z, aCovB.y, aCovB.z);',
-    '  mat3 T = mat3(uView);',                  // 视图旋转（无缩放）
-    '  mat3 cov = T * M * transpose(T);',
-    '  mat3 J = mat3(uFocal.x / z, 0.0, 0.0,',
-    '                0.0, uFocal.y / z, 0.0,',
-    '                -uFocal.x * cam.x / (z * z), -uFocal.y * cam.y / (z * z), 0.0);',
-    '  mat3 cov2 = J * cov * transpose(J);',
-    // 低通：给极小的方差加 0.3 px²，避免亚像素高斯闪烁（Mip-Splatting 的最简形式）
-    '  float a = cov2[0][0] + 0.3;',
-    '  float b = cov2[0][1];',
-    '  float c = cov2[1][1] + 0.3;',
+    '  mat3 R = mat3(uView);',                  // 视图旋转（无缩放）
+    // ⚠️ **不能用 `transpose()` / `inverse()`**：那是 GLSL ES 3.00（WebGL2）才有的函数，
+    // 在 WebGL1 的 ES 1.00 里会直接编译失败：
+    //     ERROR: 'transpose' : no matching overloaded function found
+    // 这里改用"标量点积"等价形式，全程只用 `dot()` 与 `mat3 * vec3`（ES 1.00 都支持）：
+    //   2×2 屏幕协方差 = J · cov · Jᵀ，其中 cov = R·M·Rᵀ
+    //   利用 (Rᵀw)·(M(Rᵀw')) = wᵀ·cov·w'，把 J 的两行投影到视图空间再乘 M。
+    '  vec3 j0 = vec3(uFocal.x / z, 0.0, -uFocal.x * cam.x / (z * z));',
+    '  vec3 j1 = vec3(0.0, uFocal.y / z, -uFocal.y * cam.y / (z * z));',
+    // Rᵀ·j：`R[i]` 取的是**第 i 列**，所以第 i 个分量就是 dot(R[i], j)
+    '  vec3 u0 = vec3(dot(R[0], j0), dot(R[1], j0), dot(R[2], j0));',
+    '  vec3 u1 = vec3(dot(R[0], j1), dot(R[1], j1), dot(R[2], j1));',
+    '  vec3 Mu0 = M * u0;',
+    '  vec3 Mu1 = M * u1;',
+    // 低通：给极小方差加 0.3 px²，避免亚像素高斯闪烁（Mip-Splatting 最简形式）
+    '  float a = dot(u0, Mu0) + 0.3;',
+    '  float b = dot(u0, Mu1);',
+    '  float c = dot(u1, Mu1) + 0.3;',
     '  float mid = 0.5 * (a + c);',
     '  float disc = sqrt(max(0.0, mid * mid - (a * c - b * b)));',
     '  float l1 = mid + disc;',                 // 较大方差（px²）
@@ -71,7 +79,6 @@ window.GsSplatRenderer = (function () {
     '  vec2 axis2 = v2 * sqrt(l2);',
     '  vec2 offPx = aCorner.x * axis1 + aCorner.y * axis2;',  // 像素偏移
     '  vec4 clip = uProj * cam;',
-    '  vec2 ndc = clip.xy / clip.w;',
     '  clip.xy += (offPx / (uViewport * 0.5)) * clip.w;',     // 转回裁剪空间
     '  gl_Position = clip;',
     '  vPos = aCorner;',

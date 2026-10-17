@@ -1448,15 +1448,20 @@ def train(cfg: TrainConfig, ctx) -> dict:
             else:
                 ctx.warn("拿不到 means2d 梯度（densify_criterion=grad2d），"
                          "本轮退回 3D 梯度；如需稳定请检查 gsplat 版本")
+        # 兜底：grad2d 没算出来（拿不到 means2d 梯度）时才用 3D 梯度。
+        #
+        # ⚠️ 这里**曾经有一个孤儿 `elif`**：那是打 `densify_criterion` 补丁时
+        # 留下的旧代码（原本属于"if means.grad is not None"那条链）。补丁之后
+        # 它变成挂在新 `if` 上的 `elif means.grad is not None:`，
+        # 语义从"拿不到 means2d"错成了"**grad2d 算成功了**" ⇒
+        # **正确的 2D 梯度被 3D 梯度覆盖**，还打出一条假告警
+        # "未取到 means2d 梯度…"。实测两个作业各 **30000 次**（每步一次），
+        # 导致 grad2d 从未真正生效：`img3-auto3` 只得到 8,563 个高斯、PSNR 19.34。
         if grad_norm_cache is None and means.grad is not None:
             with torch.no_grad():
                 grad_norm_cache = means.grad.norm(dim=-1).detach().clone()
-        elif means.grad is not None:
-            # 退路：拿不到 means2d 时仍用 3D 梯度，但**量纲不同**，
-            # 阈值需要另行标定，不要套用官方的 2e-4。
-            with torch.no_grad():
-                grad_norm_cache = means.grad.norm(dim=-1).detach().clone()
-                ctx.warn("未取到 means2d 梯度，密度控制退回 3D 梯度（阈值需另行标定）")
+            ctx.warn("未取到 means2d 梯度，密度控制退回 3D 梯度"
+                     "（量纲不同，阈值需另行标定）")
 
         # ---- 利用率统计（方案 B）：用 gsplat 的 `tiles_per_gauss`，不是梯度 ----
         #

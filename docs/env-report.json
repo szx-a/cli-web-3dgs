@@ -15,8 +15,8 @@
   },
   "memory": {
     "total_gb": 15.2,
-    "available_gb": 3.4,
-    "load_percent": 77.0
+    "available_gb": 2.9,
+    "load_percent": 80.0
   },
   "gpu": {
     "available": true,
@@ -26,7 +26,7 @@
         "name": "NVIDIA GeForce RTX 5060 Laptop GPU",
         "driver": "573.22",
         "vram_total_mb": 8151.0,
-        "vram_used_mb": 2887.0,
+        "vram_used_mb": 1589.0,
         "compute_cap": "12.0"
       }
     ]
@@ -57,7 +57,7 @@
     {
       "drive": "C:",
       "total_gb": 384.1,
-      "free_gb": 171.1
+      "free_gb": 170.8
     },
     {
       "drive": "D:",
@@ -67,7 +67,7 @@
     {
       "drive": "F:",
       "total_gb": 146.5,
-      "free_gb": 75.4
+      "free_gb": 72.0
     }
   ],
   "tools": [

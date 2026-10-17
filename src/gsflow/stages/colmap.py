@@ -82,49 +82,18 @@ class ColmapStage(Stage):
         images_dir = self._pick_images_dir(ctx)
         mask_dir = ctx.job_dir / "02_masks"
 
-        # ---- `mask.mode=keep` 时必须**自动关闭 COLMAP 的掩码** ----
+        # ⚠️ 曾在这里做过一件**有害**的事：当 mask.mode=keep 时自动把
+        # colmap.use_masks 设为 False，理由是"保留背景就该让 COLMAP 看到背景"。
+        # 它确实修好了"keep 模式下 COLMAP 只注册 2/406"的表面症状，
+        # 但代价是 **COLMAP 把整个房间都重建出来**：
+        #   img3-auto3 点云 bbox 13.7×1.6×8.5、到质心最远 10.63
+        #   img3-crop（裁剪后才 COLMAP）只有 5.7×1.0×5.4、最远 4.51
+        # 初始化高斯散布整个房间 ⇒ 后续只监督物体 ⇒ PSNR 19.97（对照 28.78）。
         #
-        # 这是一个**自相矛盾**的组合，实测让 COLMAP 直接崩掉：
-        #   * `mask.mode=keep`（转台模式）保留背景，理由是"静态背景是相机没动的唯一证据"；
-        #   * 但 `use_masks=True` 会让 COLMAP **只在掩码内提特征**，
-        #     而转台素材的物体只占 8.5% ⇒ 背景被保留却被无视，特征只剩物体那一小块。
-        #
-        # 实测 `img3-auto`（406 帧、keep + use_masks=True）：
-        #   COLMAP 注册到 35 帧后报
-        #   `Discarding reconstruction due to insufficient size`，
-        #   **整个重建被丢弃**，最终 report 只剩 2/406 帧、261 个稀疏点。
-        # 同样的输入（逐字节相同的图与掩码）在另一次运行里侥幸得到 406/406，
-        # 说明这是**临界失败**，不能靠运气。
-        #
-        # 正确做法：保留背景就必须让 COLMAP **能看到**背景 ⇒ `use_masks=False`。
-        # 显式设置 `colmap.use_masks` 时以用户为准（这里只在"未显式设置"时改）。
+        # **正确做法**：不要动掩码，而是**先把画面裁到物体再跑 COLMAP**
+        # （`frames.auto_crop` 已实现：用"时间方差"求包围盒，无需掩码）。
+        # 掩码仍按用户配置使用：裁剪后物体占画面 80%+，掩码内特征足够多。
         use_masks_cfg = ctx.cfg("use_masks", True)
-        # ⚠️ 必须读 **mask 阶段实际生效的模式**，不能只读 `mask.mode` 配置。
-        # mask 阶段会在运行时把 `black` 改成 `keep`（capture.mode=turntable 时），
-        # 但**不回写配置** ⇒ colmap 阶段读配置永远是用户请求的 `black`，
-        # 于是"自动关闭掩码"的条件永远不成立。
-        #   实测 img3-auto2：colmap 日志 `Mask: Yes`、特征只有 **1001**（上限 8192），
-        #   因为掩码把特征限制在占画面 8.5% 的物体上 ⇒ 重建被丢弃、只剩 2/406 帧。
-        # mask 阶段已把生效值写进 `02_masks/capture_mode.json`，这里读它。
-        mask_mode = str(ctx.cfg("mask.mode", "black") or "black").strip().lower()
-        try:
-            import json as _json
-
-            _eff = ctx.job_dir / "02_masks" / "capture_mode.json"
-            if _eff.exists():
-                _d = _json.loads(_eff.read_text(encoding="utf-8"))
-                _m = str(_d.get("mask_mode_effective") or "").strip().lower()
-                if _m:
-                    mask_mode = _m
-                    ctx.info(f"按 mask 阶段实际生效的模式判定：mask_mode={mask_mode}"
-                             f"（配置里是 {ctx.cfg('mask.mode', 'black')}）")
-        except Exception:  # noqa: BLE001
-            pass
-        _explicit = ctx.params.get("colmap.use_masks", None)
-        if mask_mode == "keep" and _explicit is None and bool(use_masks_cfg):
-            use_masks_cfg = False
-            ctx.warn("mask.mode=keep（保留背景）⇒ 自动关闭 COLMAP 的掩码，"
-                     "否则背景虽被保留却不参与特征提取，实测会导致重建被丢弃")
         mask_dir_arg = (self._pick_mask_dir(ctx, images_dir, mask_dir)
                         if bool(use_masks_cfg) else None)
 

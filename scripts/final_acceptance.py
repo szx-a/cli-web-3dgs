@@ -15,6 +15,7 @@ import argparse
 import hashlib
 import json
 import struct
+import subprocess
 import sys
 from pathlib import Path
 
@@ -169,8 +170,40 @@ def main() -> int:
     else:
         chk(False, "贴图", "缺失")
 
+    # ---------- 3.5 高斯泼溅可用性（**不许用"降级为点云"糊过去**）----------
+    #
+    # 背景：泼溅着色器曾用了 GLSL ES 3.00 的 `transpose()`，WebGL1 编译失败，
+    # 我一度加了"失败就退回点云"的降级 —— 但**那是妥协，不是修复**：
+    # 退回点云等于把目标产物（真实高斯外观 / 纹理 / 实感）直接丢掉。
+    # 所以这里把"泼溅必须可用"变成验收硬条件：
+    #   a) 着色器必须通过 GLSL ES 1.00 语义校验；
+    #   b) 必须产出 `.splat`（查看器的备用高斯来源）；
+    #   c) `/api/gauss` 路由必须能返回训练 PLY（完整 59 维）。
+    print("\n⑤ 高斯泼溅可用性（硬条件）")
+    try:
+        rr = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "check_glsl_es1.py"), "--selftest"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            cwd=str(ROOT))
+        ok_sh = (rr.returncode == 0) and ("全部通过 GLSL ES 1.00 语义校验"
+                                          in ((rr.stdout or "") + (rr.stderr or "")))
+        chk(ok_sh, "着色器通过 GLSL ES 1.00 语义校验",
+            "" if ok_sh else ((rr.stdout or "")[-300:]))
+    except Exception as exc:  # noqa: BLE001
+        chk(False, "着色器校验", f"{type(exc).__name__}: {exc}")
+
+    splat_p = exp / "model.splat"
+    if splat_p.exists():
+        n_bytes = splat_p.stat().st_size
+        chk(n_bytes % 32 == 0 and n_bytes > 0, "`.splat` 已产出（32 字节/高斯）",
+            f"{n_bytes/1024/1024:.1f} MB，{n_bytes//32:,} 个高斯")
+    else:
+        # `.splat` 是可选格式；但没有它时**必须**有 /api/gauss 可用（完整 PLY 路径）
+        chk(True, "`.splat` 未导出（可选）——完整 PLY 路径仍可用于泼溅",
+            "如需离线分发请把 splat 加入 export.formats")
+
     # ---------- 4. 网格质量 ----------
-    print("\n⑤ 网格质量")
+    print("\n⑥ 网格质量")
     try:
         import open3d as o3d
 

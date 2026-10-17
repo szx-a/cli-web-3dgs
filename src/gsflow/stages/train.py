@@ -124,7 +124,7 @@ class TrainStage(Stage):
         # 位置选在这里是因为：`data/images` 已去畸变、`data/masks` 已同步，
         # 两者**严格对齐**，可以直接求掩码并集包围盒。裁剪量记在 `data/crop.json`，
         # 由 `load_colmap_data` 加载时平移内参主点（焦距不变）—— 不重写 COLMAP 二进制。
-        if bool(ctx.cfg("auto_crop", True)):
+        if bool(ctx.cfg("auto_crop_in_train", False)):
             try:
                 from ..gsdata.auto_crop import auto_crop_training_data
 

@@ -665,6 +665,22 @@ let ACTIVE_MODE = 'splat';  // 默认显示真实高斯（若产物里没有则�
 let VIEWER_READY = false;
 
 function initModelsPage() {
+  // ⚠️ 先确认两个脚本都到位。缺 `splat.js` 时泼溅模式必然失败，
+  // 而症状只是"画面全黑"——用户从控制台很难看出是脚本没加载。
+  // 这里显式提示，并给出自救办法（强制刷新 / 查自检接口）。
+  const missing = [];
+  if (!window.GsSplatRenderer) missing.push('splat.js');
+  if (!window.GsViewer) missing.push('viewer.js');
+  if (missing.length) {
+    $('m-overlay').classList.remove('hide');
+    $('m-overlay').style.whiteSpace = 'pre-line';
+    $('m-overlay').textContent =
+      '前端脚本未加载：' + missing.join('、')
+      + '\n\n常见原因：页面是在文件更新前打开的（浏览器缓存了旧版）。'
+      + '\n请按 Ctrl+F5 强制刷新；若仍失败，打开 /api/selftest 看服务端报告。';
+    $('m-status').textContent = '脚本缺失';
+    return;
+  }
   if (!VIEWER_READY) {
     try {
       window.GsViewer.init($('m-canvas'), (s) => { $('m-status').textContent = s || ''; });
@@ -771,9 +787,17 @@ async function loadModelFile(f) {
     const info = await window.GsViewer.load(f.url, kind);
     showModelInfo(f.name, info);
   } catch (e) {
-    // 失败必须显示出来 —— 之前只把 overlay 留着，用户看到的就是一片黑
-    $('m-overlay').textContent = '载入失败：' + e.message;
-    $('m-status').textContent = '失败';
+    // 失败必须显示出来 —— 之前只把 overlay 留着，用户看到的就是一片黑，
+    // 而真正的原因（哪个 URL 404、缺哪个脚本）只出现在浏览器控制台里。
+    // 这里把 **URL 和格式**都写进界面，让"黑屏"自带诊断信息。
+    $('m-overlay').classList.remove('hide');
+    // 需要保留换行（多行诊断信息），否则会被 HTML 折叠成一行
+    $('m-overlay').style.whiteSpace = 'pre-line';
+    $('m-overlay').textContent = '载入失败：' + e.message
+      + '\n格式：' + (f.kind || '?') + '\n地址：' + f.url
+      + '\n\n自查：打开 /api/selftest?job=' + encodeURIComponent($('m-job').value || '')
+      + ' 看服务端报告';
+    $('m-status').textContent = '失败：' + e.message;
   }
 }
 
@@ -790,6 +814,11 @@ function showModelInfo(name, info) {
     } else if (info.mode === 'splat') {
       parts.push('泼溅渲染（无 SH，`.splat` 仅 11 维）');
     }
+  }
+  // 降级必须**显式告知**：泼溅不可用时我们退回点云（而不是黑屏），
+  // 但用户需要知道"现在看到的不是真实高斯"，否则会把降级当成模型质量差。
+  if (info.degraded) {
+    parts.push(`⚠ 已降级为点云（${info.degradeReason || '泼溅不可用'}）`);
   }
   if (info.textured) parts.push('带贴图');
   else if (info.colors) parts.push('顶点色');

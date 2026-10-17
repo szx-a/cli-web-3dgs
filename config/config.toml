@@ -63,6 +63,7 @@ densify_until = 4000
 densify_interval = 100
 densify_quantile = 0.0
 auto_crop = true
+auto_crop_in_train = false
 auto_crop_threshold = 0.75
 rasterize_mode = "classic"
 absgrad = false

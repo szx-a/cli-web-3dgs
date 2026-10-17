@@ -193,6 +193,38 @@ class FramesStage(Stage):
         if blur > 0:
             dropped = self._drop_blurry(ctx, frames, blur, out_dir)
             frames = sorted(out_dir.glob("*.jpg"))
+        # ---- 自动裁剪（**必须在 COLMAP 之前**）----
+        #
+        # 为什么必须在这一步：实测"先跑 COLMAP 再裁"会让 COLMAP **把整个房间都重建出来**
+        # （点云 bbox 13.7×1.6×8.5、离质心最远 10.63），初始化高斯散布全场景，
+        # 后续只监督物体 ⇒ PSNR **19.97 dB**；而裁剪后再跑 COLMAP 是 **28.78 dB**。
+        #
+        # 判据用**帧间时间方差**（`auto_crop.detect_bbox_temporal`），不需要掩码：
+        # 转台时物体在动（高方差）、背景静止（低方差）；相机绕行时全图都变 ⇒
+        # 包围盒≈全图 ⇒ 自然不裁（安全）。
+        if bool(ctx.cfg("auto_crop", True)) and not str(crop_v or "").strip():
+            try:
+                from PIL import Image as _PILImage
+
+                from ..gsdata.auto_crop import (apply_crop_to_frames,
+                                                detect_bbox_temporal)
+
+                box = detect_bbox_temporal(out_dir, log=ctx.info)
+                if box is not None:
+                    # 缩略图坐标 → 原图坐标
+                    with _PILImage.open(frames[0]) as im0:
+                        W, H = im0.size
+                    x0, y0, x1, y1, TW, TH = box
+                    sx, sy = W / float(TW), H / float(TH)
+                    box_full = (int(x0 * sx), int(y0 * sy),
+                                min(W - 1, int(x1 * sx) + 1),
+                                min(H - 1, int(y1 * sy) + 1), W, H)
+                    res = apply_crop_to_frames(out_dir, box_full, log=ctx.info)
+                    if res.get("applied"):
+                        frames = sorted(out_dir.glob("*.jpg"))
+            except Exception as exc:  # noqa: BLE001
+                ctx.warn(f"自动裁剪失败（{type(exc).__name__}: {exc}），按原尺寸继续")
+
         metrics = {
             "source": str(src),
             "mode": mode,
@@ -202,6 +234,12 @@ class FramesStage(Stage):
             "dropped_blurry": dropped,
             "long_side": long_side,
         }
+        crop_meta = out_dir / "crop.json"
+        if crop_meta.exists():
+            try:
+                metrics["auto_crop"] = json.loads(crop_meta.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                pass
         (out_dir / META_NAME).write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
         return StageResult(artifacts=[str(out_dir)], metrics=metrics,
                            message=f"抽帧 {len(frames)} 张（丢弃模糊 {dropped} 张）")

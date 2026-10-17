@@ -1164,22 +1164,47 @@ window.GsViewer = (function () {
           if (obj.texture) g.deleteTexture(obj.texture);
           obj = null;
         }
-        let sp;
+        // ⚠️ 泼溅失败必须**降级到点云**，不能让用户看到一块黑屏。
+        // 真实故障：着色器里用了 `transpose()`（GLSL ES 3.00 才有），
+        // WebGL1 编译失败 ⇒ 整块模型完全不可见，用户只得到一句报错。
+        // 降级后至少还能看到点云 + 明确的降级提示。
         try {
-          sp = window.GsSplatRenderer.create(R.gl, buf);
+          const sp = window.GsSplatRenderer.create(R.gl, buf);
+          const cen = sp.bounds.center, rad = sp.bounds.radius;
+          obj = { mode: -1, splat: sp, count: sp.count, indexCount: 0,
+                  center: cen, radius: rad,
+                  useCol: true, useNrm: false, texture: null };
+          this.reset();
+          draw();
+          return { vertices: sp.count, triangles: 0, mode: 'splat',
+                   textured: false, colors: true, normals: false,
+                   gaussians: sp.count };
         } catch (e) {
-          throw new Error('泼溅初始化失败：' + e.message);
+          const data = window.GsSplatRenderer.parseSplat(buf);
+          const n = data.count;
+          const color = new Float32Array(n * 3);
+          for (let i = 0; i < n; i++) {
+            color[i * 3] = data.color[i * 4];
+            color[i * 3 + 1] = data.color[i * 4 + 1];
+            color[i * 3 + 2] = data.color[i * 4 + 2];
+          }
+          const fb = { mode: 0, position: data.center, color, uv: null,
+                       normal: null, indices: null, textureUrl: null };
+          if (obj) {
+            const g = R.gl;
+            [obj.vbuf, obj.cbuf, obj.ubuf, obj.nbuf, obj.ibuf, obj.lineIbuf]
+              .forEach((b) => { if (b) g.deleteBuffer(b); });
+            obj = null;
+          }
+          obj = makeMesh(R, fb, wire);
+          this.reset();
+          draw();
+          // 把原因带出去（界面层会显示在状态栏），但**不抛异常**
+          if (onStatus) onStatus('泼溅不可用，已降级为点云：' + e.message);
+          return { vertices: n, triangles: 0, mode: 0,
+                   textured: false, colors: true, normals: false,
+                   degraded: true, degradeReason: e.message };
         }
-        // reset() 依赖 center / radius 取景，泼溅对象也要给（由高斯中心包围盒算出）
-        const cen = sp.bounds.center, rad = sp.bounds.radius;
-        obj = { mode: -1, splat: sp, count: sp.count, indexCount: 0,
-                center: cen, radius: rad,
-                useCol: true, useNrm: false, texture: null };
-        this.reset();
-        draw();
-        return { vertices: sp.count, triangles: 0, mode: 'splat',
-                 textured: false, colors: true, normals: false,
-                 gaussians: sp.count };
       }
 
       let model;
@@ -1208,22 +1233,42 @@ window.GsViewer = (function () {
           if (obj.texture) g.deleteTexture(obj.texture);
           obj = null;
         }
-        let sp3;
+        // 同样要**降级到点云**（理由见 `.splat` 分支）：
+        // 着色器/扩展出问题时，宁可显示点云 + 降级提示，也不要一块黑屏。
         try {
-          sp3 = window.GsSplatRenderer.createFromGauss3D(R.gl, model.gauss3d);
+          const sp3 = window.GsSplatRenderer.createFromGauss3D(R.gl, model.gauss3d);
+          obj = { mode: -1, splat: sp3, count: sp3.count, indexCount: 0,
+                  center: sp3.bounds.center, radius: sp3.bounds.radius,
+                  useCol: true, useNrm: false, texture: null };
+          this.reset();
+          draw();
+          return { vertices: sp3.count, triangles: 0, mode: 'gauss3d',
+                   textured: false, colors: true, normals: false,
+                   gaussians: sp3.count,
+                   shDegree: model.gauss3d.shDegree,
+                   hasSH: !!model.gauss3d.shRest };
         } catch (e) {
-          throw new Error('泼溅初始化失败：' + e.message);
+          const g3 = model.gauss3d;
+          const n = g3.pos.length / 3;
+          // 用 SH DC 还原近似颜色（0.5 + C0·f_dc），至少不是全黑
+          const SH_C0 = 0.28209479177387814;
+          const color = new Float32Array(n * 3);
+          for (let i = 0; i < n; i++) {
+            for (let k = 0; k < 3; k++) {
+              const v = 0.5 + SH_C0 * g3.shDC[i * 3 + k];
+              color[i * 3 + k] = Math.min(1, Math.max(0, v));
+            }
+          }
+          const fb = { mode: 0, position: g3.pos, color, uv: null,
+                       normal: null, indices: null, textureUrl: null };
+          obj = makeMesh(R, fb, wire);
+          this.reset();
+          draw();
+          if (onStatus) onStatus('泼溅不可用，已降级为点云：' + e.message);
+          return { vertices: n, triangles: 0, mode: 0,
+                   textured: false, colors: true, normals: false,
+                   degraded: true, degradeReason: e.message };
         }
-        obj = { mode: -1, splat: sp3, count: sp3.count, indexCount: 0,
-                center: sp3.bounds.center, radius: sp3.bounds.radius,
-                useCol: true, useNrm: false, texture: null };
-        this.reset();
-        draw();
-        return { vertices: sp3.count, triangles: 0, mode: 'gauss3d',
-                 textured: false, colors: true, normals: false,
-                 gaussians: sp3.count,
-                 shDegree: model.gauss3d.shDegree,
-                 hasSH: !!model.gauss3d.shRest };
       }
 
       if (!model || !model.position || model.position.length < 3) {

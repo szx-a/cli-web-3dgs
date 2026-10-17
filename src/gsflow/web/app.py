@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import webbrowser
 from pathlib import Path
@@ -107,7 +108,92 @@ def create_app():
         # 结果就是"代码改了、界面没变" —— 用户会以为修复没生效。
         # 用 `no-cache` 而不是 `no-store`：仍然允许条件请求（ETag/Last-Modified），
         # 命中就返回 304，不牺牲性能，但保证不会用过期的副本。
+        #
+        # ---- 给脚本引用加**内容版本号**（防新旧混用）----
+        #
+        # 真实风险：用户页面开着的时候我改了 `viewer.js`/新增了 `splat.js`，
+        # 浏览器可能只重新拉到一部分脚本 ⇒ 新版 `app.js` 调用 `splat` 模式，
+        # 而旧版 `viewer.js` 不认识 ⇒ 画面全黑、控制台还可能出现 404。
+        # 用文件 mtime 作为 `?v=`，任何脚本一改，URL 就变，缓存必然失效。
+        def _v(name: str) -> str:
+            f = STATIC_DIR / name
+            try:
+                return f"{int(f.stat().st_mtime)}"
+            except Exception:  # noqa: BLE001
+                return "0"
+
+        for script in ("splat.js", "viewer.js", "app.js"):
+            html = re.sub(
+                r'src="/static/' + re.escape(script) + r'"',
+                f'src="/static/{script}?v={_v(script)}"', html)
         return HTMLResponse(html, headers={"Cache-Control": "no-cache, must-revalidate"})
+
+    @app.get("/api/selftest")
+    def selftest(job: str = "") -> dict[str, Any]:
+        """**自检**：一次回答"前端为什么打不开/全黑"。
+
+        只靠客户端报错很难定位 —— 这里在服务端把关键条件都验证一遍：
+          * 三个前端脚本是否都存在（缺 `splat.js` ⇒ 泼溅不可用 ⇒ 全黑）；
+          * 指定作业的 `/api/models` 里每个 URL 是否真的能取到；
+          * `/api/gauss/{job}`（完整 59 维高斯）是否可用；
+          * manifest 里每条产物路径是否都能取到。
+        """
+        root = Path(str(load_settings().get("project.workspace_dir")))
+        rep: dict[str, Any] = {"static": {}, "job": job or None, "problems": []}
+        for s in ("index.html", "splat.js", "viewer.js", "app.js"):
+            f = STATIC_DIR / s
+            rep["static"][s] = {"exists": f.exists(),
+                                "bytes": f.stat().st_size if f.exists() else 0}
+            if not f.exists():
+                rep["problems"].append(f"缺少前端文件 {s}")
+        if job:
+            jd = root / job
+            if not jd.is_dir():
+                rep["problems"].append(f"作业不存在：{job}")
+            else:
+                out = jd / "05_export"
+                man = out / "manifest.json"
+                rep["job_dir"] = str(jd)
+                rep["has_export"] = out.is_dir()
+                rep["has_manifest"] = man.exists()
+                if man.exists():
+                    try:
+                        md = json.loads(man.read_text(encoding="utf-8"))
+                        miss = [a.get("path") for a in (md.get("artifacts") or [])
+                                if a.get("path") and not (out / a["path"]).exists()]
+                        rep["manifest_artifacts"] = len(md.get("artifacts") or [])
+                        rep["manifest_missing"] = miss
+                        if miss:
+                            rep["problems"].append(
+                                f"manifest 声明了 {len(miss)} 个不存在的产物"
+                                f"（下载会 404）：{miss[:3]}")
+                    except Exception as exc:  # noqa: BLE001
+                        rep["problems"].append(f"manifest 解析失败：{exc}")
+                # 完整 3DGS PLY
+                g = None
+                mp = jd / "04_train" / "metrics.json"
+                if mp.exists():
+                    try:
+                        g = json.loads(mp.read_text(encoding="utf-8")).get("best_ply")
+                    except Exception:  # noqa: BLE001
+                        g = None
+                gp = Path(g) if g else None
+                if gp and not gp.is_absolute():
+                    gp = jd / gp
+                ok_g = bool(gp and gp.exists())
+                if not ok_g:
+                    cands = sorted((jd / "04_train" / "point_cloud").glob(
+                        "*/point_cloud.ply"))
+                    ok_g = bool(cands)
+                    gp = cands[-1] if cands else None
+                rep["gauss3d"] = {"available": ok_g,
+                                  "path": str(gp) if gp else None,
+                                  "bytes": gp.stat().st_size if ok_g and gp else 0}
+                if not ok_g:
+                    rep["problems"].append(
+                        "没有训练产物 point_cloud.ply ⇒ 泼溅模式（真实高斯）不可用")
+        rep["ok"] = not rep["problems"]
+        return rep
 
     @app.get("/static/{name}")
     def static_file(name: str):
