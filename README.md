@@ -214,6 +214,7 @@ scripts\gsflow_gpu.cmd run --job-id <job> --stages export --force export --set e
 | `export.mesh_smooth_iters` | 5 | Taubin 平滑迭代（比拉普拉斯好：不收缩体积） |
 | `export.mesh_texture` | false | 是否烘焙贴图（>8 万面时 xatlas 超线性变慢） |
 | `export.mesh_texture_size` | 2048 | 贴图边长 |
+| `export.mesh_texture_reject_black` | true | 拒绝采到**纯黑背景**的像素（`mask.mode=black` 的训练图背景是 0）。实测 `final-v1` 黑色 texel **35.99% → 2.30%**。阈值是 `6/255`（注意图像在烘焙里是 **0~1 尺度**，写成 `> 6` 会永远为假 —— 我踩过，见 `docs/03` G104）|
 | `export.mesh_drop_unseen` | true | **删除"从未被任何相机看到"的网格面**（泊松重建的内部垃圾几何）。实测 25.6% 的面从未被看到且散布在物体内部，它们白占 UV 空间却烘不出颜色 ⇒ **纹理黑洞**。判据是"是否被相机看到过"，**不是**"落在前景掩码内的比例"（后者在转台素材上原理错误，见 `docs/03` G101）|
 | `export.mesh_min_views` | 1 | 保留"被至少这么多视角看到"的面 |
 | `train.lambda_lpips` | 0 | 感知损失权重（自己实现的 VGG16 LPIPS，见 `docs/05` §5.3）。**默认关闭**：3 次重复实测三指标均不显著，且方差约 3 倍 |

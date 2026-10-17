@@ -1039,7 +1039,8 @@ def unwrap_uv(mesh, tex_size: int = 2048):
 
 def bake_texture_from_views(mesh, uv_tris, uv, images, c2ws, ks, src_whs,
                             tex_size: int = 2048, batch: int = 200,
-                            margin_px: int = 2, max_views: int = 60):
+                            margin_px: int = 2, max_views: int = 60,
+                            bake_reject_black: bool = True):
     """从多视角图像给网格烘焙一张漫反射贴图。
 
     做法（社区常用思路，不依赖可微渲染器）：
@@ -1080,6 +1081,8 @@ def bake_texture_from_views(mesh, uv_tris, uv, images, c2ws, ks, src_whs,
 
     tex = np.zeros((tex_size, tex_size, 3), dtype=np.float32)
     filled = np.zeros((tex_size, tex_size), dtype=bool)
+    # 因采到黑背景而被拒绝的采样数（写进统计，避免行为变化被静默吞掉）
+    n_rejected = 0
 
     # 大三角形优先（小碎面容易被覆盖，且大面贡献的像素多）
     area = np.abs(
@@ -1153,8 +1156,39 @@ def bake_texture_from_views(mesh, uv_tris, uv, images, c2ws, ks, src_whs,
             sx = (img.shape[1] - 1) / max(iw - 1, 1)
             ui = np.clip((u[take] * sx).astype(np.int32), 0, img.shape[1] - 1)
             vi = np.clip((v[take] * sy).astype(np.int32), 0, img.shape[0] - 1)
-            col[take] = img[vi, ui]
-            best[take] = sc[take]
+
+            # ---- 拒绝采到"黑背景"的像素 ----
+            #
+            # `mask.mode=black` 的训练图里背景被涂成**纯黑**（实测 85.4% 像素为黑）。
+            # 网格表面在轮廓边缘的采样点会投影到那片黑上 ⇒ 采到 (0,0,0)
+            # ⇒ 纹理出现黑斑。实测 final-v1：**黑色 texel 占 35.99%**。
+            #
+            # 判据：采样像素三通道最大值 <= 阈值即视为背景，拒绝该视角。
+            # 阈值取 6（接近纯黑）：真实物体上的暗部通常 >10，
+            # 而涂黑的背景是**精确的 0**。
+            # `bake_reject_black` 可关闭（若素材本身就是深色物体、怕误杀）。
+            if bake_reject_black:
+                # ⚠️ 两个踩过的坑：
+                #   1) `vi` / `ui` 的长度是 `take.sum()`（已筛选后的），不是原数组长度。
+                #      用原索引访问会报 `IndexError: index 1259 is out of bounds`。
+                #   2) **图像已归一化到 0~1**（`images[i].astype(np.float32) / 255.0`），
+                #      所以阈值必须用 0~1 尺度。我第一版写 `> 6`（0~255 尺度）
+                #      ⇒ 永远 False ⇒ **全部采样被拒、覆盖 0.0%**。
+                #      选 6/255 ≈ 0.024 的原因：被涂黑的背景是**精确的 0**，
+                #      而真实物体的暗部一般 >10/255。
+                idx_take = np.nonzero(take)[0]
+                pix = img[vi, ui]                      # 长度 = len(idx_take)
+                sel = pix.max(axis=1) > (6.0 / 255.0)  # 非黑背景（0~1 尺度）
+                if not sel.any():
+                    continue
+                its = idx_take[sel]
+                # 未被采纳的像素**不更新** best，给别的视角机会
+                col[its] = pix[sel]
+                best[its] = sc[its]
+                n_rejected += int((~sel).sum())
+            else:
+                col[take] = img[vi, ui]
+                best[take] = sc[take]
 
         got = best >= 0
         if got.any():
@@ -1209,7 +1243,8 @@ def bake_texture_from_views(mesh, uv_tris, uv, images, c2ws, ks, src_whs,
 
     return ((np.clip(tex, 0, 1) * 255).astype(np.uint8),
             {"tex_size": tex_size, "coverage": float(filled.mean()),
-             "views_used": len(cams)})
+             "views_used": len(cams),
+             "samples_rejected_black": int(n_rejected)})
 
 
 def render_mesh_previews(mesh, out_dir, size: int = 512, views=None) -> list[dict]:

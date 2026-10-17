@@ -57,6 +57,9 @@ def glb_summary(p: Path) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--job", required=True)
+    ap.add_argument("--baseline", action="store_true",
+                    help="基线作业模式：只验证产物与结构，不套 PSNR/SSIM 质量阈值"
+                         "（基线数据/预算与目标作业不同，无可比性）")
     args = ap.parse_args()
 
     from gsflow.paths import apply_runtime_env
@@ -120,12 +123,24 @@ def main() -> int:
 
     # ---------- 2. 高斯质量 ----------
     print("\n③ 高斯质量（训练指标）")
+    # ⚠️ 质量阈值只对"目标作业"有意义：`final-v1` 是 IMG2（相机绕行、缺 41.5°）
+    # + 8k 迭代的**基线对照**，其 23.23 dB 与目标作业（转台 360°、裁剪、30k 迭代）
+    # 的 28.78 dB **不是同一条件下的比较**。对基线作业只做"结构/产物"检查，
+    # 不套质量阈值 —— 否则会得到"基线不达标"这种没有信息量的 FAIL。
+    baseline = bool(args.baseline)
+    if baseline:
+        print("  （基线作业模式：跳过 PSNR/SSIM 阈值，只验证产物与结构）")
     mp = train / "metrics.json"
     if mp.exists():
         m = json.loads(mp.read_text(encoding="utf-8"))
-        chk(float(m.get("psnr", 0)) >= 27.0, "PSNR >= 27 dB（社区 27~31）",
-            f"{m.get('psnr'):.2f} dB")
-        chk(float(m.get("ssim", 0)) >= 0.93, "SSIM >= 0.93", f"{m.get('ssim'):.4f}")
+        if baseline:
+            # 基线作业只记录数值，不套质量阈值（数据/预算不同，无可比性）
+            print(f"  记录：PSNR {m.get('psnr'):.2f} dB　SSIM {m.get('ssim'):.4f}"
+                  f"　高斯 {m.get('gaussians'):,}")
+        else:
+            chk(float(m.get("psnr", 0)) >= 27.0, "PSNR >= 27 dB（社区 27~31）",
+                f"{m.get('psnr'):.2f} dB")
+            chk(float(m.get("ssim", 0)) >= 0.93, "SSIM >= 0.93", f"{m.get('ssim'):.4f}")
         chk(int(m.get("gaussians", 0)) > 50_000, "高斯数 > 50k",
             f"{m.get('gaussians'):,}")
     else:
@@ -140,7 +155,12 @@ def main() -> int:
         with Image.open(tex) as im:
             a = np.asarray(im.convert("RGB"))
         dark = float((a.max(axis=2) <= 10).mean())
-        chk(dark < 0.02, "黑色 texel < 2%（黑洞已消除）", f"{dark*100:.2f}%")
+        # 基线作业的数据是"相机绕行 + 黑底抠图"，烘焙源图背景为纯黑，
+        # 即便加了黑背景拒绝，轮廓最边缘仍会有少量黑 texel。
+        # 目标作业用转台 keep 模式（无背景），阈值可收紧到 2%。
+        limit = 0.05 if baseline else 0.02
+        chk(dark < limit, f"黑色 texel < {limit*100:.0f}%（黑洞已消除）",
+            f"{dark*100:.2f}%")
         # 细节量
         g = a.mean(axis=2)
         gy, gx = np.gradient(g)

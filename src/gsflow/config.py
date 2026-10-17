@@ -373,6 +373,11 @@ DEFAULTS: dict[str, Any] = {
         "mesh_texture": False,
         "mesh_texture_size": 2048,
         "mesh_texture_timeout": 300,    # UV 展开超时（秒）；超时跳过纹理烘焙
+        # 拒绝采到"黑背景"的像素。`mask.mode=black` 的训练图背景是纯黑，
+        # 网格轮廓边缘的采样点会采到 (0,0,0) ⇒ 纹理黑斑
+        # （实测 final-v1 黑色 texel 35.99%）。转台模式（mask.mode=keep）本来就没有背景，
+        # 该选项对它是无害的空操作。若素材本身是深色物体、担心误杀，可设为 False。
+        "mesh_texture_reject_black": True,
         # 按"到输入点距离"裁掉泊松桥接出来的面（阈值 = 输入点间距 × 该值；0=关闭）
         "mesh_trim_sigma": 2.5,
         # 删除"从未被任何相机看到"的网格面（泊松重建的内部垃圾几何）。

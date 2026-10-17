@@ -1063,8 +1063,13 @@ class ExportStage(Stage):
                 ctx.info(f"   UV 展开完成：{uw_sec:.1f}s")
                 images, c2ws, ks, whs = self._load_bake_inputs(ctx, cams)
                 tex, tinfo = bake_texture_from_views(
-                    uv_mesh, uv_tris, uv, images, c2ws, ks, whs, tex_size=tex_size)
-                ctx.info(f"   贴图覆盖 UV 图集 {tinfo['coverage']*100:.1f}%")
+                    uv_mesh, uv_tris, uv, images, c2ws, ks, whs, tex_size=tex_size,
+                    # 拒绝采到"黑背景"的像素：`mask.mode=black` 的训练图背景是纯黑
+                    # （实测 final-v1 训练图 85.4% 像素为黑），轮廓边缘的采样点会采到
+                    # (0,0,0) ⇒ 纹理黑斑（实测黑色 texel 35.99%）。
+                    bake_reject_black=bool(ctx.cfg("mesh_texture_reject_black", True)))
+                ctx.info(f"   贴图覆盖 UV 图集 {tinfo['coverage']*100:.1f}%"
+                         f"，因黑背景拒绝采样 {tinfo.get('samples_rejected_black', 0):,} 次")
 
                 o3d.io.write_triangle_mesh(str(out_dir / "model_mesh_uv.obj"), uv_mesh,
                                            write_vertex_colors=True, write_triangle_uvs=True)

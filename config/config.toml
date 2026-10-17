@@ -125,6 +125,7 @@ mesh_largest_only = true
 mesh_texture = false
 mesh_texture_size = 2048
 mesh_texture_timeout = 300
+mesh_texture_reject_black = true
 mesh_drop_unseen = true
 mesh_min_views = 1
 mesh_consistency_min_views = 2
