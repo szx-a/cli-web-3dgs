@@ -23,6 +23,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--job", required=True)
     ap.add_argument("--set", action="append", default=[], dest="sets")
+    # 交付目录里已有 >=3 个交付物时默认拒绝写入（导出会清空整个目录）。
+    # 做对照实验请换作业目录，或显式允许覆盖。
+    ap.add_argument("--allow-overwrite", action="store_true",
+                    help="允许覆盖已有交付物的导出目录（会清空它！）")
     args = ap.parse_args()
 
     from gsflow.paths import apply_runtime_env
@@ -41,6 +45,14 @@ def main() -> int:
         params[k.strip()] = v.strip()
 
     job_dir = ROOT / "workspace" / args.job
+    # ⚠️ 交付物保护（真实事故）：`export.py` 每次重跑会**清空整个 05_export**。
+    # 我用本脚本做"只导 mesh"的 depth 对照时，把 final-v1 里已有的
+    # `model.glb`（点云 glb）与 `model_mesh_textured.glb`（带纹理）删掉了 ——
+    # 用户打开目录只看到 3 个模型文件。
+    # 所以这里默认**拒绝**写入已有交付物的目录，除非显式 --allow-overwrite。
+    from gsflow.gsdata.export_guard import assert_safe_export_target
+    assert_safe_export_target(job_dir / "05_export",
+                              allow_overwrite=bool(args.allow_overwrite))
     ev = EventBus()
     # 把事件实时打出来：导出阶段内部会 try/except 吞掉网格异常并记成 WARN，
     # 不打印就只看到"没有产物"而不知道原因。
