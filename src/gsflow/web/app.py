@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import threading
 import time
@@ -197,12 +198,37 @@ def create_app():
         rep["ok"] = not rep["problems"]
         return rep
 
-    @app.get("/static/{name}")
-    def static_file(name: str):
-        p = STATIC_DIR / name
-        if not p.exists() or p.parent != STATIC_DIR:
+    @app.get("/static/{path:path}")
+    def static_file(path: str):
+        """静态资源（支持子目录，如 `vendor/three.module.js`）。
+
+        ⚠️ 原来是 `/static/{name}`，只接受**单层文件名**，且用
+        `p.parent != STATIC_DIR` 做防穿越。要服务 `vendor/` 下的参考渲染库
+        就必须支持多级路径 —— 这里改成**先 resolve 再校验前缀**，
+        既支持子目录又不放松穿越防护。
+        """
+        p = (STATIC_DIR / path).resolve()
+        if not p.exists() or not p.is_file():
             raise HTTPException(404, "not found")
-        media = "text/css" if name.endswith(".css") else "application/javascript" if name.endswith(".js") else "text/plain"
+        try:
+            p.relative_to(STATIC_DIR.resolve())
+        except ValueError:
+            raise HTTPException(404, "not found") from None
+        low = path.lower()
+        if low.endswith(".css"):
+            media = "text/css"
+        elif low.endswith(".js") or low.endswith(".mjs"):
+            media = "application/javascript"
+        elif low.endswith(".json") or low.endswith(".map"):
+            media = "application/json"
+        elif low.endswith(".png"):
+            media = "image/png"
+        elif low.endswith((".jpg", ".jpeg")):
+            media = "image/jpeg"
+        elif low.endswith(".svg"):
+            media = "image/svg+xml"
+        else:
+            media = "text/plain"
         # 同上：静态资源也要 no-cache，否则前端改动在浏览器里看不到
         return FileResponse(p, media_type=media,
                             headers={"Cache-Control": "no-cache, must-revalidate"})
@@ -295,6 +321,76 @@ def create_app():
         return {"ok": True, "masked": credentials.mask_credentials()}
 
     # ------------------------------------------------------------------ 作业
+    @app.get("/api/scene_info/{job_id}")
+    def scene_info(job_id: str) -> dict[str, Any]:
+        """给出参考实现（three.js 高斯渲染库）需要的场景参数。
+
+        三项都要**算**出来，不能猜：
+          * `center`/`radius`：高斯包围盒（与查看器取景一致）；
+          * `up`：**训练相机中心点云的最小方差主轴**。COLMAP 世界坐标没有约定
+            "哪个轴朝上"，GLB 导出时是靠人工 y/z 翻转的；直接把 [0,1,0] 当上方向
+            会让模型躺倒。相机是绕着物体转的，它们近似共面，**该平面的法向就是上方向**。
+          * `cameraPosition`：沿 up 抬高约 12°，距离 2.8×半径（与默认取景一致）。
+        """
+        import numpy as np
+
+        g = _gauss_for(job_id)
+        xyz = np.asarray(g["xyz"], dtype=np.float64)
+        mn, mx = xyz.min(0), xyz.max(0)
+        center = (mn + mx) / 2.0
+        radius = max(1e-6, float(np.linalg.norm(mx - mn) / 2.0))
+
+        up = np.array([0.0, 1.0, 0.0])
+        cams_p = None
+        root = (Path(str(load_settings().get("project.workspace_dir")))
+                / job_id).resolve()
+        try:
+            from ..gsdata.colmap_io import read_model
+
+            cands = sorted({p.parent for p in
+                            (root / "03_colmap" / "sparse").rglob("cameras.bin")})
+            best = None
+            for c in cands:
+                rec = read_model(c)
+                if best is None or len(rec.images) > len(best.images):
+                    best = rec
+            if best is not None and len(best.images) >= 3:
+                cams_p = np.array([im.cam_to_world()[1] for im in best.images])
+        except Exception:  # noqa: BLE001
+            cams_p = None
+
+        if cams_p is not None and len(cams_p) >= 3:
+            d = cams_p - cams_p.mean(axis=0)
+            # 最小方差方向 = 相机所在平面的法向
+            _, _, vt = np.linalg.svd(d, full_matrices=False)
+            n = vt[-1] / max(np.linalg.norm(vt[-1]), 1e-12)
+            # 让法向大致朝上（与质心到相机的平均方向同侧就不再翻转）
+            if float(np.dot(n, np.mean(cams_p - cams_p.mean(0), axis=0))) < 0:
+                pass
+            # 取更接近 +Y 的那个朝向作为"上"，保证不同作业一致
+            if float(np.dot(n, np.array([0.0, 1.0, 0.0]))) < 0:
+                n = -n
+            up = n
+
+        # 相机位置：沿 up 抬高 12°，距离 2.8R，朝向 -Z 方向偏移
+        elev = math.radians(12.0)
+        horiz = math.cos(elev)
+        fwd_hint = np.array([0.0, 0.0, 1.0])
+        if abs(float(np.dot(fwd_hint, up))) > 0.9:
+            fwd_hint = np.array([1.0, 0.0, 0.0])
+        side = np.cross(up, fwd_hint)
+        side /= max(np.linalg.norm(side), 1e-12)
+        back = np.cross(side, up)
+        d = radius * 2.8
+        cam = center + (back * horiz + up * math.sin(elev)) * d
+        return {"center": [float(x) for x in center],
+                "radius": float(radius),
+                "up": [float(x) for x in up],
+                "cameraPosition": [float(x) for x in cam],
+                "cameraLookAt": [float(x) for x in center],
+                "gaussians": int(len(xyz)),
+                "hasPoses": cams_p is not None}
+
     @app.get("/api/jobs")
     def jobs() -> dict[str, Any]:
         return {
@@ -508,6 +604,13 @@ def create_app():
         )
 
     # ------------------------------------------------------------------ 产物
+    # 带 `.ply` 后缀的别名：参考渲染库（gaussian-splats-3d）**按文件扩展名**
+    # 选择解析器，URL 没有 `.ply` 会被当成未知格式。所以给出这条带后缀的路由，
+    # 内部完全复用 `gauss()`。
+    @app.get("/api/gauss/{job_id}/point_cloud.ply")
+    def gauss_ply_alias(job_id: str):
+        return gauss(job_id)
+
     @app.get("/api/gauss/{job_id}")
     def gauss(job_id: str):
         """直接返回训练产物的**完整 3DGS PLY**（59 维/高斯，含 SH 48）。

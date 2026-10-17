@@ -868,6 +868,57 @@ function renderModeFiles() {
 }
 
 async function loadModelFile(f) {
+  // ---- 高斯类产物：交给**参考实现**渲染，不再用我手写的 WebGL 渲染器 ----
+  //
+  // 用户的原话："光栅化你从头写没必要啊，而且也不好，你至少参考一下官方的啊，
+  // 不然我这里看出来，模型差会误导我"。这是对的：自研渲染器的差距会被误读成
+  // 模型质量差。这里用 `@mkkellogg/gaussian-splats-3d`（MIT，three.js，WebGL2，
+  // 直接支持 3DGS PLY 的 59 维含 SH）来渲染，本文件只负责取景与状态显示。
+  const isGauss = f.kind === 'gauss3d' || f.kind === 'splat'
+    || /\.splat$/i.test(String(f.url || ''));
+  if (isGauss) {
+    const ref = window.GsRefViewer;
+    if (!ref) {
+      $('m-overlay').classList.remove('hide');
+      $('m-overlay').style.whiteSpace = 'pre-line';
+      $('m-overlay').textContent =
+        '参考渲染库尚未加载完成：refviewer.js（type=module）\n'
+        + '若持续如此，请确认 /static/vendor/ 下的 three.module.js 与 '
+        + 'gaussian-splats-3d.module.js 存在，并按 Ctrl+F5 刷新。';
+      return;
+    }
+    const job = $('m-job') && $('m-job').value;
+    const host = $('m-canvas-wrap');
+    if (!host) return;
+    // 隐藏我自己的 canvas / 图片，把容器让给参考渲染器
+    const cv = $('m-canvas'); if (cv) cv.style.display = 'none';
+    const im = $('m-image'); if (im) { im.style.display = 'none'; im.removeAttribute('src'); }
+    $('m-overlay').classList.remove('hide');
+    $('m-overlay').style.whiteSpace = 'pre-line';
+    $('m-overlay').textContent = '载入中…';
+    $('m-status').textContent = '载入 ' + f.name + ' …';
+    try {
+      const info = job ? await api('/api/scene_info/' + encodeURIComponent(job)) : null;
+      // 优先用 `.ply` 后缀路由：库按扩展名选解析器，且 PLY 有完整 SH
+      const url = job
+        ? `/api/gauss/${encodeURIComponent(job)}/point_cloud.ply`
+        : f.url;
+      const r = await ref.mount(host, url, info || {}, (s) => {
+        $('m-status').textContent = s || '';
+      });
+      $('m-overlay').classList.add('hide');
+      $('m-status').textContent = `${f.name} · 参考渲染器 `
+        + `(${r.renderer}) · ${(r.gaussians || 0).toLocaleString()} 高斯（含 SH）`;
+    } catch (e) {
+      $('m-overlay').classList.remove('hide');
+      $('m-overlay').style.whiteSpace = 'pre-line';
+      $('m-overlay').textContent = '参考渲染器加载失败：' + e.message
+        + '\n地址：' + f.url;
+      $('m-status').textContent = '加载失败';
+    }
+    return;
+  }
+
   // ---- 图片类产物（服务端渲染预览）：不走 WebGL，直接 <img> 显示 ----
   //
   // 这条路径是 WebGL 出问题时的**兜底**：`preview_*.png` 由训练用的同一个

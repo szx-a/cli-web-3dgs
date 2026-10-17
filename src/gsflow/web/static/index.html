@@ -5,6 +5,17 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>gsflow · AI 清理 + 3DGS 重建控制台</title>
 <link rel="stylesheet" href="/static/style.css">
+<!-- 参考渲染库（gaussian-splats-3d v0.4.7 + three.js r160）的模块解析：
+     该库 `import 'three'`，用 import map 指到本地 vendored 副本，离线可用。
+     ⚠️ import map 必须在任何 type="module" 脚本**之前**出现。 -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "/static/vendor/three.module.js"
+  }
+}
+</script>
+<script type="module" src="/static/refviewer.js"></script>
 </head>
 <body>
 <header>
