@@ -277,6 +277,33 @@ def main() -> int:
         outward = float((np.einsum("ij,ij->i", tn, fc) > 0).mean())
         chk(outward > 0.95, "法线朝外比例 > 95%", f"{outward*100:.1f}%")
         chk(len(t) > 20_000, "网格面数 > 20k", f"{len(t):,}")
+
+        # ---- 几何缺陷体检（此前完全没有覆盖）----
+        #
+        # 只看"法线朝外 + 面数"是不够的：非流形边、零面积面、翻面
+        # 都会让模型在 Blender / 客户端里出问题，而这两项检查都发现不了。
+        #
+        # ⚠️ 刻意区分 **零面积面（真退化，必须为 0）** 与 **细长面（sliver，只报告）**：
+        # 细长面面积非零、能正常渲染，删掉会在网格上**开洞**（贴图后可见），
+        # 所以不能当缺陷处理。我第一版把两者混为一谈，误报过一次。
+        area = 0.5 * np.linalg.norm(
+            np.cross(p1 - p0, p2 - p0), axis=1)
+        zero_area = int((area <= 1e-12).sum())
+        med = float(np.median(area)) if len(area) else 0.0
+        slivers = int(((area < max(med * 1e-3, 1e-15)) & (area > 1e-12)).sum())
+        chk(zero_area == 0, "无零面积面（真退化面会出 NaN 法线）", f"{zero_area} 个")
+
+        edges = np.concatenate([t[:, [0, 1]], t[:, [1, 2]], t[:, [2, 0]]], axis=0)
+        edges.sort(axis=1)
+        _, cnt = np.unique(edges, axis=0, return_counts=True)
+        nonmanifold = float((cnt > 2).mean())
+        boundary = float((cnt == 1).mean())
+        chk(nonmanifold < 0.01, "非流形边 < 1%（否则无法编辑）",
+            f"{nonmanifold*100:.3f}%")
+        chk(boundary < 0.35, "边界边 < 35%（孔洞不过多）", f"{boundary*100:.1f}%")
+        # 细长面只报告，不判失败
+        print(f"  [info] 细长面 {slivers} 个（{slivers/max(len(t),1)*100:.3f}%，"
+              f"非零面积，删掉会开洞 ⇒ 仅报告）")
     except Exception as exc:  # noqa: BLE001
         chk(False, "网格读取", f"{type(exc).__name__}: {exc}")
 

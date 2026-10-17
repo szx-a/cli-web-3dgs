@@ -981,7 +981,7 @@ class ExportStage(Stage):
         import numpy as np
         import open3d as o3d
 
-        from ..gsdata.mesh_export import clean_mesh, to_largest_component
+        from ..gsdata.mesh_export import clean_mesh, sanitize_mesh, to_largest_component
 
         largest_only = ctx.cfg("mesh_largest_only", True)
         if isinstance(largest_only, str):
@@ -992,6 +992,19 @@ class ExportStage(Stage):
             ctx.info(f"只保留最大连通块，去掉 {removed} 个三角形")
         else:
             mesh, removed = clean_mesh(mesh)
+
+        # ---- 安全清理：零面积面 / 重复面 / 重复顶点 ----
+        #
+        # 必须在**法线定向之前**：清理会重排三角形索引，绕序可能被打乱，
+        # 定向必须作用在"最终几何"上（这个顺序问题此前已经踩过两次，见下方法线注释）。
+        # 实测 `img3-final`：删掉 1 个**重复三角形**，零面积面 0 个，
+        # 表面积变化 <0.002%、包围盒不变、朝外比例仍 100%（见
+        # `scripts/eval_mesh_sanitize.py` 的 6 项判定）。
+        try:
+            mesh, san = sanitize_mesh(mesh, log=ctx.info)
+            info["mesh_sanitize"] = san
+        except Exception as exc:  # noqa: BLE001
+            ctx.warn(f"网格清理失败（{type(exc).__name__}: {exc}），继续用未清理网格")
 
         if len(mesh.triangles) == 0:
             ctx.warn("网格后处理后为空，放弃导出")

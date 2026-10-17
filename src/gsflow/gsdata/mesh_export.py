@@ -1531,3 +1531,108 @@ def to_largest_component(mesh):
     mesh.remove_unreferenced_vertices()
     mesh.compute_vertex_normals()
     return mesh, removed
+
+
+def sanitize_mesh(mesh, log=None):
+    """安全清理：去退化面 / 重复三角形 / 重复顶点 / 未引用顶点。
+
+    ## 为什么这一步必要
+
+    泊松重建 + QEM 简化之后，网格里会留下：
+      * **零面积三角形** —— 法线算出来是 NaN，光栅化时直接出黑点/闪点；
+      * **重复顶点**（同一位置多份）—— 顶点数与文件体积虚高，
+        而且"按位置焊接"的工具（Blender、Blender 的 Merge by Distance）会重算拓扑；
+      * **重复三角形**（同一组三个顶点出现两次）—— 双面渲染时 z-fighting。
+
+    实测 `img3-final` 的 `model_mesh.ply`：退化面 1 个、重复顶点 0、
+    最大长宽比 **577.7**（`img3-crop` 只有 17.4）。
+
+    ## 为什么**不**顺手删细长三角形
+
+    删掉长宽比超阈值的面会**在网格上开一个洞**（周围没有替代面），
+    贴图烘焙后表现为一个可见的洞 —— 比留一个细长面更糟。
+    所以这里只删"面积≈0"的退化面（它们本来就不贡献面积），
+    细长面只统计、报告，不删。
+
+    返回 `(mesh, stats)`，stats 里记清楚删了多少，便于验收核对。
+    """
+    import numpy as np
+
+    stats = {"degenerate_removed": 0, "zero_area_removed": 0,
+             "duplicate_tri_removed": 0,
+             "duplicate_vert_removed": 0, "unreferenced_removed": 0,
+             "tris_before": int(len(mesh.triangles)),
+             "verts_before": int(len(mesh.vertices))}
+    if len(mesh.triangles) == 0:
+        return mesh, stats
+
+    try:
+        before = len(mesh.triangles)
+        mesh.remove_degenerate_triangles()
+        stats["degenerate_removed"] = before - len(mesh.triangles)
+    except Exception as exc:  # noqa: BLE001
+        if log:
+            log(f"去掉退化三角形失败（{type(exc).__name__}: {exc}）")
+
+    # ---- 几何上的零面积面（open3d **不**处理这一种）----
+    #
+    # ⚠️ 用合成网格（三点共线）测试时才发现：
+    # `remove_degenerate_triangles()` 只删**索引重复**的面（如 (a,a,b)），
+    # 对"三个不同顶点但几何共线、面积为 0"的面它删 **0** 个。
+    # 而零面积面会让面法线变成 NaN ⇒ 光栅化出现黑点/闪点，必须自己按面积清一遍。
+    #
+    # 阈值取**相对**面积 `med * 1e-12`：足以区分"真零面积"（浮点上通常正好 0）
+    # 与"细长面"（约 med*1e-4 量级），从而**不会误删细长面**
+    # （删细长面会在网格上开洞，贴图后可见）。
+    try:
+        v = np.asarray(mesh.vertices)
+        f = np.asarray(mesh.triangles)
+        if len(f):
+            a0, a1, a2 = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
+            area = 0.5 * np.linalg.norm(np.cross(a1 - a0, a2 - a0), axis=1)
+            med = float(np.median(area)) if len(area) else 0.0
+            eps = max(med * 1e-12, 1e-18)
+            bad = area < eps
+            n_bad = int(bad.sum())
+            if n_bad:
+                mesh.remove_triangles_by_mask(bad)
+                mesh.remove_unreferenced_vertices()
+                stats["zero_area_removed"] = n_bad
+                if log:
+                    log(f"去掉几何零面积面 {n_bad} 个（open3d 不会删这一类）")
+    except Exception as exc:  # noqa: BLE001
+        if log:
+            log(f"零面积面清理失败（{type(exc).__name__}: {exc}）")
+
+    try:
+        before = len(mesh.triangles)
+        mesh.remove_duplicated_triangles()
+        stats["duplicate_tri_removed"] = before - len(mesh.triangles)
+    except Exception as exc:  # noqa: BLE001
+        if log:
+            log(f"去掉重复三角形失败（{type(exc).__name__}: {exc}）")
+
+    try:
+        before = len(mesh.vertices)
+        mesh.remove_duplicated_vertices()
+        mesh.remove_unreferenced_vertices()
+        stats["duplicate_vert_removed"] = before - len(mesh.vertices)
+    except Exception as exc:  # noqa: BLE001
+        if log:
+            log(f"合并重复顶点失败（{type(exc).__name__}: {exc}）")
+
+    try:
+        before = len(mesh.vertices)
+        mesh.remove_unreferenced_vertices()
+        stats["unreferenced_removed"] = before - len(mesh.vertices)
+    except Exception:  # noqa: BLE001
+        pass
+
+    mesh.compute_vertex_normals()
+    stats["tris_after"] = int(len(mesh.triangles))
+    stats["verts_after"] = int(len(mesh.vertices))
+    if log:
+        log("网格清理：退化面 -{}, 重复面 -{}, 顶点 {} → {}".format(
+            stats["degenerate_removed"], stats["duplicate_tri_removed"],
+            stats["verts_before"], stats["verts_after"]))
+    return mesh, stats
