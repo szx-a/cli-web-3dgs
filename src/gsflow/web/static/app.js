@@ -671,17 +671,31 @@ let VIEWER_READY = false;
 /**
  * 懒创建 WebGL1 查看器（只服务 glb / 普通 ply）。
  * 高斯与预览模式不碰它 —— 见 initModelsPage 里的说明。
+ *
+ * ⚠️ 初始化前**必须先把 canvas 显示出来**：`display:none`（或 0×0）的 canvas
+ * 拿不到有效尺寸，WebGL 视口会是 0，表现为"模型看不见、按钮点了没反应"。
  */
 function ensureViewer() {
-  if (VIEWER_READY) return true;
   if (!window.GsViewer) return false;
+  const cv = $('m-canvas');
+  if (cv) cv.style.display = 'block';
+  const im = $('m-image');
+  if (im) { im.style.display = 'none'; }
+  // 参考渲染器的层要撤掉，否则两块画面叠在一起
+  if (window.GsRefViewer && window.GsRefViewer.dispose) {
+    try { window.GsRefViewer.dispose(); } catch (e) { /* 忽略 */ }
+  }
+  if (VIEWER_READY) return true;
   try {
-    window.GsViewer.init($('m-canvas'), (s) => { $('m-status').textContent = s || ''; });
+    window.GsViewer.init(cv, (s) => { $('m-status').textContent = s || ''; });
     VIEWER_READY = true;
     return true;
   } catch (e) {
-    $('m-overlay').classList.remove('hide');
-    $('m-overlay').textContent = '查看器初始化失败：' + e.message;
+    const ov = $('m-overlay');
+    if (ov) {
+      ov.classList.remove('hide');
+      ov.textContent = '查看器初始化失败：' + e.message;
+    }
     return false;
   }
 }
@@ -940,6 +954,10 @@ async function loadModelFile(f) {
   // 这条路径是 WebGL 出问题时的**兜底**：`preview_*.png` 由训练用的同一个
   // gsplat 渲染器在服务端生成，无论浏览器/驱动什么状态都能看到真实外观。
   if (f.kind === 'image' || /\.(png|jpe?g|webp)$/i.test(String(f.url || ''))) {
+    // 先撤掉参考渲染器的层，否则高斯/图片两块画面会叠在一起
+    if (window.GsRefViewer && window.GsRefViewer.dispose) {
+      try { window.GsRefViewer.dispose(); } catch (e) { /* 忽略 */ }
+    }
     const img = $('m-image');
     const cv = $('m-canvas');
     if (img) {
@@ -1125,8 +1143,13 @@ async function selectModelJob() {
 
 $('btn-m-reload').onclick = loadModelJobs;
 $('m-job').onchange = selectModelJob;
-$('btn-m-reset').onclick = () => window.GsViewer.reset();
+// 这三个按钮都依赖 WebGL1 查看器已初始化。改成先 ensureViewer()，
+// 否则在"懒初始化"之后它们会静默失效（用户报"重置视角/切换线框/旋转模式没用了"）。
+$('btn-m-reset').onclick = () => {
+  if (ensureViewer()) window.GsViewer.reset();
+};
 $('btn-m-wire').onclick = () => {
+  if (!ensureViewer()) return;
   const on = window.GsViewer.toggleWire();
   $('btn-m-wire').textContent = on ? '关闭线框' : '切换线框';
 };
@@ -1134,6 +1157,7 @@ $('btn-m-wire').onclick = () => {
 // 两种都**不会中途反向**（那才是"卡住"）；差别只在极点处停住还是翻过去。
 if ($('btn-m-rotmode')) {
   $('btn-m-rotmode').onclick = () => {
+    if (!ensureViewer()) return;
     const cur = window.GsViewer.getRotMode ? window.GsViewer.getRotMode() : 'clamp';
     const next = cur === 'free' ? 'clamp' : 'free';
     window.GsViewer.setRotMode(next);

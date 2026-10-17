@@ -162,3 +162,64 @@ def test_ply_alias_route_has_extension() -> None:
     r = c.get(f"/api/gauss/{job}/point_cloud.ply")
     assert r.status_code == 200
     assert r.content[:3] == b"ply"
+
+
+def test_refviewer_does_not_clobber_host_dom() -> None:
+    """参考渲染器**不得清空宿主容器** —— 这曾一次性毁掉三个功能。
+
+    事故：`refviewer.mount()` 里写了 `host.innerHTML = ''`，而 host 是
+    `#m-canvas-wrap` ⇒ 把 `#m-overlay` / `#m-canvas` / `#m-image` 全删掉。后果：
+
+      * 用户看到「服务端渲染失败：Cannot read properties of null (reading 'classList')」；
+      * glb / 普通 ply 没有画布 ⇒ **看不了**；
+      * `GsViewer` 没有画布 ⇒ **重置视角 / 切换线框 / 旋转模式全部失效**。
+
+    正确做法：库只拿到一个**专属子容器**（`.gs-ref-stage`），销毁时只删它。
+    """
+    src = (STATIC / "refviewer.js").read_text(encoding="utf-8")
+    # ⚠️ 必须先剥注释：`disposeViewer` 的说明里**引用**了那行旧代码
+    # （`hostEl.innerHTML = ''`），直接 `in src` 会把注释当成违规 —— 我第一版就误报了。
+    code, in_block = [], False
+    for line in src.splitlines():
+        s = line.strip()
+        if in_block:
+            if "*/" in s:
+                in_block = False
+            continue
+        if s.startswith("/*"):
+            in_block = "*/" not in s
+            continue
+        if s.startswith("//"):
+            continue
+        code.append(line)
+    code = "\n".join(code)
+    assert "host.innerHTML" not in code, "refviewer 又在清空宿主 DOM"
+    assert "hostEl.innerHTML" not in code
+    assert "gs-ref-stage" in code, "缺少专属子容器"
+    assert "rootElement: stageEl" in code, "库应挂在专属子容器上，而不是宿主"
+
+
+def test_app_switches_modes_cleanly() -> None:
+    """切换模式时必须撤掉参考渲染器的层，并确保 canvas 可见后再初始化。"""
+    src = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert src.count("GsRefViewer.dispose") >= 2, \
+        "切换模式（图片/3D）时都应 dispose 参考渲染器"
+    # ensureViewer 里必须先显示 canvas 再 init（0×0 的画布拿不到有效视口）
+    i = src.find("function ensureViewer()")
+    j = src.find("function initModelsPage()")
+    seg = src[i:j]
+    assert "cv.style.display = 'block'" in seg, "初始化前必须先显示 canvas"
+    assert seg.find("cv.style.display = 'block'") < seg.find("GsViewer.init"), \
+        "显示 canvas 必须在 init 之前"
+    # 三个按钮都要先 ensureViewer
+    for btn in ("btn-m-reset", "btn-m-wire", "btn-m-rotmode"):
+        k = src.find(f"$('{btn}').onclick")
+        assert k > 0, btn
+        assert "ensureViewer()" in src[k:k + 220], f"{btn} 没有先 ensureViewer"
+
+
+def test_stage_layer_has_css() -> None:
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    assert ".gs-ref-stage" in css, "专属子容器缺少样式（会与画布叠在一起）"
+    assert "position: absolute" in css
+

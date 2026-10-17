@@ -164,6 +164,14 @@ ul { padding-left: 20px; }
 }
 #m-canvas { display: block; width: 100%; height: 100%; cursor: grab; }
 #m-canvas:active { cursor: grabbing; }
+/* 参考渲染器（gaussian-splats-3d）的专属层。
+   必须**独立于** #m-canvas / #m-overlay / #m-image —— 库会往 rootElement 里
+   创建 canvas，若把宿主整个交给它（或清空 innerHTML），会把我们自己的
+   覆盖层与画布一起删掉，导致"重置视角/线框/旋转模式"全部失效。 */
+.gs-ref-stage {
+  position: absolute; inset: 0; z-index: 1; background: #05080b;
+}
+.gs-ref-stage canvas { display: block; width: 100%; height: 100%; }
 /* 服务端渲染预览图：与 canvas 同区域叠放，靠 display 切换。
    `object-fit: contain` 保证 1024x512 的预览图不被拉伸变形。 */
 #m-image {

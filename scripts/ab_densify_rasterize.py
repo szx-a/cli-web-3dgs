@@ -59,6 +59,17 @@ ARMS: dict[str, dict[str, str]] = {
     "aa": {"train.densify_criterion": "grad2d",
            "train.densify_grad2d_threshold": "2e-4",
            "train.rasterize_mode": "antialiased"},
+    # 背景是否参与训练。
+    #
+    # 用户："现在我看到的东西就像曝光一样"。实测模型里 **13.5% 的亮高斯占了
+    # 62.8% 的视觉权重**（`scripts/diag_bright_background.py`），因为转台 + `keep`
+    # 模式把整片亮背景也拟合成高斯了。
+    #
+    # `mask_loss_mode=inside` 只在物体掩码内算损失 ⇒ 背景不再被拟合，
+    # 但 COLMAP 仍然"看得到"背景（掩码只作用于训练损失，不作用于注册）。
+    # 注意：全图 PSNR 会下降（背景故意不拟合），要看**物体区域的画质**与
+    # **背景视觉权重占比**，不能只看全图 PSNR。
+    "inside": {"train.mask_loss_mode": "inside"},
 }
 BASELINE = "g2d"
 

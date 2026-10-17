@@ -25,13 +25,38 @@ import * as GaussianSplats3D from './vendor/gaussian-splats-3d.module.js';
 
 let viewer = null;
 let hostEl = null;
+let stageEl = null;
 
 function disposeViewer() {
-  if (!viewer) return;
-  try { viewer.stop(); } catch (e) { /* 忽略：某些版本没有 start 过 */ }
-  try { viewer.dispose(); } catch (e) { /* 同上 */ }
-  viewer = null;
-  if (hostEl) hostEl.innerHTML = '';
+  if (viewer) {
+    try { viewer.stop(); } catch (e) { /* 忽略：某些版本没有 start 过 */ }
+    try { viewer.dispose(); } catch (e) { /* 同上 */ }
+    viewer = null;
+  }
+  // ⚠️ **只删自己的容器**。
+  //
+  // 曾经这里是 `hostEl.innerHTML = ''`，而 hostEl 是 `#m-canvas-wrap` ——
+  // 于是把 `#m-overlay` / `#m-canvas` / `#m-image` 一并删掉了。后果：
+  //   * 任何 `$('m-overlay').classList` 都变成 null 报错
+  //     （用户看到的「服务端渲染失败：Cannot read properties of null (reading 'classList')」）；
+  //   * glb / 普通 ply 没有画布 ⇒ 看不了；
+  //   * `GsViewer` 没有画布 ⇒ 重置视角 / 切换线框 / 旋转模式全部失效。
+  // 一个"清空宿主"的写法，连带毁掉三个功能 —— 所以这里改成独立子容器。
+  if (stageEl && stageEl.parentNode) {
+    stageEl.parentNode.removeChild(stageEl);
+  }
+  stageEl = null;
+}
+
+/** 在宿主容器里建（或复用）一个只属于参考渲染器的子容器。 */
+function ensureStage(host) {
+  let el = host.querySelector(':scope > .gs-ref-stage');
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'gs-ref-stage';
+    host.appendChild(el);
+  }
+  return el;
 }
 
 /**
@@ -46,7 +71,7 @@ function disposeViewer() {
 export async function mount(host, url, info, onStatus) {
   disposeViewer();
   hostEl = host;
-  host.innerHTML = '';
+  stageEl = ensureStage(host);
   const say = (m) => { if (typeof onStatus === 'function') onStatus(m); };
 
   const center = (info && info.center) || [0, 0, 0];
@@ -56,8 +81,9 @@ export async function mount(host, url, info, onStatus) {
   say('初始化参考渲染器…');
 
   viewer = new GaussianSplats3D.Viewer({
-    // 库自己创建 canvas 并填满 rootElement
-    rootElement: host,
+    // 库自己创建 canvas 并填满 rootElement —— 这里给的是**专属子容器**，
+    // 不是 `#m-canvas-wrap`，避免它清空宿主 DOM（见 disposeViewer 的说明）。
+    rootElement: stageEl,
     cameraUp: up,
     initialCameraPosition: camPos,
     initialCameraLookAt: lookAt,
