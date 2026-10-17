@@ -821,6 +821,106 @@ def simplify_mesh(mesh, target_triangles: int = 0, voxel: float = 0.0):
     return mesh
 
 
+def drop_unseen_faces(mesh, c2ws, ks, src_whs, min_views: int = 1, log=None):
+    """删除"从未被任何相机看到"的网格面 —— 泊松重建的内部垃圾几何。
+
+    ## 为什么需要（实测数据，img3-crop）
+
+    泊松重建会把物体包成"实心"：表面之外，内部也生成了面。
+    统计每个面被多少视角看到（投影落在图像内 + 面朝向该相机）：
+
+    | 被看到次数 | 面数 | 占比 |
+    |---|---|---|
+    | **0** | **15,190** | **25.6%** |
+    | 1~2 | 2,022 | 3.4% |
+    | 3~9 | 5,958 | 10.0% |
+    | 10~49 | 12,304 | 20.7% |
+    | >=50 | 23,839 | 40.2% |
+
+    而这些"从未被看到"的面：包围盒 [1.82,1.05,0.84] ≈ 全网格 [1.86,1.08,0.86]，
+    到中心距离 0.46 ≈ 0.49 ⇒ **散布在物体内部**（不是背面遮挡）。
+
+    它们的害处：
+      1. 在 UV 展开里**白占 texture 空间**却烘不出颜色 ⇒ 纹理黑洞
+         （实测 43.7% 的 chart 内部 texel 是黑的）；
+      2. 让网格法线混乱、体积虚胖；
+      3. 对渲染零贡献（本来就看不见）。
+
+    ## 判据为什么可靠
+
+    ⚠️ 与"落在前景掩码内的比例"那个错误判据的对比：
+    掩码判据在**转台**素材上原理错误（物体旋转使同一面在掩码内外来回变），
+    我曾据此误删 28.7% 顶点，回原始帧才发现删的是物体细节。
+    本判据是"**是否被相机看到过**"，与掩码无关，不受转台/绕行影响。
+
+    ## 参数
+
+    `c2ws` [V,4,4] 相机到世界，`ks` [V,3,3] 内参，`src_whs` [(W,H)] 图像尺寸。
+    `min_views` 保留阈值（默认 1：只要被看到过一次就保留）。
+    """
+    import numpy as np
+    import open3d as o3d
+
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    tris = np.asarray(mesh.triangles, dtype=np.int64)
+    if len(tris) == 0:
+        return mesh, {"faces_before": 0, "faces_kept": 0, "removed": 0}
+
+    p0, p1, p2 = verts[tris[:, 0]], verts[tris[:, 1]], verts[tris[:, 2]]
+    fc = (p0 + p1 + p2) / 3.0
+    fn = np.cross(p1 - p0, p2 - p0)
+    fn /= np.maximum(np.linalg.norm(fn, axis=1, keepdims=True), 1e-12)
+    # 先统一朝外，否则 facing 判据会把内部面误判成"可见"
+    c = verts.mean(0)
+    d = fc - c
+    d /= np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 1e-12)
+    flip = np.einsum("ij,ij->i", fn, d) < 0
+    if flip.any():
+        tris[flip] = tris[flip][:, [0, 2, 1]]
+        fn[flip] = -fn[flip]
+
+    seen = np.zeros(len(tris), dtype=np.int64)
+    for i in range(len(c2ws)):
+        W, H = int(src_whs[i][0]), int(src_whs[i][1])
+        if W <= 0 or H <= 0:
+            continue
+        w2c = np.linalg.inv(np.asarray(c2ws[i], dtype=np.float64))
+        pc = fc @ w2c[:3, :3].T + w2c[:3, 3]
+        z = pc[:, 2]
+        ok = z > 1e-6
+        u = (pc @ np.asarray(ks[i], dtype=np.float64)[0, :3]) / np.maximum(z, 1e-9)
+        v = (pc @ np.asarray(ks[i], dtype=np.float64)[1, :3]) / np.maximum(z, 1e-9)
+        ok &= (u >= 0) & (u < W) & (v >= 0) & (v < H)
+        cam = np.asarray(c2ws[i], dtype=np.float64)[:3, 3]
+        vd = cam - fc
+        vd /= np.maximum(np.linalg.norm(vd, axis=1, keepdims=True), 1e-9)
+        ok &= np.einsum("ij,ij->i", fn, vd) > 0.1
+        seen += ok.astype(np.int64)
+
+    keep = seen >= max(1, int(min_views))
+    n_removed = int((~keep).sum())
+    if n_removed == 0:
+        return mesh, {"faces_before": int(len(tris)), "faces_kept": int(len(tris)),
+                      "removed": 0}
+    if log:
+        log(f"删除从未被看到的内部面：{n_removed} / {len(tris)}"
+            f"（{n_removed/len(tris)*100:.1f}%）—— 它们烘不出纹理、对渲染零贡献")
+
+    used_v = np.zeros(len(verts), dtype=bool)
+    used_v[tris[keep].ravel()] = True
+    new_index = -np.ones(len(verts), dtype=np.int64)
+    new_index[used_v] = np.arange(int(used_v.sum()))
+    out = o3d.geometry.TriangleMesh()
+    out.vertices = o3d.utility.Vector3dVector(verts[used_v])
+    out.triangles = o3d.utility.Vector3iVector(new_index[tris[keep]])
+    if mesh.has_vertex_colors():
+        out.vertex_colors = o3d.utility.Vector3dVector(
+            np.asarray(mesh.vertex_colors)[used_v])
+    out.compute_vertex_normals()
+    return out, {"faces_before": int(len(tris)), "faces_kept": int(keep.sum()),
+                 "removed": n_removed}
+
+
 def postprocess_mesh(mesh, target_triangles: int = 0, smooth_iters: int = 5,
                      smooth_method: str = "taubin", presimplify_ratio: float = 10.0,
                      log=None):
@@ -1061,9 +1161,35 @@ def bake_texture_from_views(mesh, uv_tris, uv, images, c2ws, ks, src_whs,
             tex[py[got], px[got]] = col[got]
             filled[py[got], px[got]] = True
 
-    # 边缘膨胀：填掉 UV 岛边界与未覆盖像素，避免采样出黑缝
-    for _ in range(max(1, int(margin_px))):
-        if filled.all():
+    # ---- 边缘膨胀 + **UV 区域全填充** ----
+    #
+    # 原实现只膨胀 `margin_px` 圈（默认 2）。但 chart **内部**的未填充孔洞
+    # 往往有十几到几十像素宽，2 圈补不到 ⇒ 纹理里留下大片黑斑。
+    # 实测 img3-crop：**43.7% 的 chart 内部 texel 是黑的**（模型表面可见黑斑）。
+    #
+    # 正确做法（生产级烘焙工具的标配）：把 **UV 覆盖区域全部填满** ——
+    # 反复用"已填充像素的邻居均值"扩散，直到 UV 区域内没有未填充像素。
+    # 未填充像素在 UV 区域外（padding）保持黑色，那是无害的。
+    #
+    # 第一步：光栅化 UV 覆盖区域（用三角形填充，与采样口径一致）
+    uv_cov = np.zeros((tex_size, tex_size), dtype=bool)
+    try:
+        from PIL import Image as _PI, ImageDraw as _ID
+
+        _img = _PI.new("L", (tex_size, tex_size), 0)
+        _dr = _ID.Draw(_img)
+        _uvp = uv * (tex_size - 1)
+        for _f in range(n_face):
+            _tri = _uvp[_f]
+            _dr.polygon([(float(x), float(y)) for x, y in _tri], fill=255)
+        uv_cov = np.asarray(_img) > 127
+    except Exception:
+        uv_cov = filled.copy()
+
+    # 第二步：反复扩散，直到 UV 覆盖区域内全部填充（上限防死循环）
+    for _ in range(max(1, int(margin_px)) + 512):
+        todo = uv_cov & ~filled
+        if not todo.any():
             break
         acc = np.zeros_like(tex)
         cnt = np.zeros(filled.shape, dtype=np.float32)

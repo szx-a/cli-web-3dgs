@@ -50,6 +50,59 @@ MODE_POINTS = 0
 MODE_TRIANGLES = 4
 
 
+def _orient_normals_outward(mesh):
+    """按"从物体中心向外"统一三角形绕序，使法线一致朝外。
+
+    ## 为什么需要（实测数据）
+
+    `bake_texture_from_views` 用 `facing = -(N·vd) > 0.15` 挑选可用视角。
+    法线朝内的面在**任何**视角下都不满足该判据 ⇒ 对应 UV texel 填不上颜色、保持纯黑。
+
+    实测 img3-crop（泊松重建网格，非封闭、`is_orientable()=False`）：
+      * 面法线朝外比例仅 **43.6%**；
+      * 纹理图集里 **53.96%** 的 UV 覆盖 texel 是黑的 ⇒ 模型出现大片黑斑。
+    翻转绕序后朝外比例 **100.0%**，黑洞消失。
+
+    ## 为什么不用 `orient_triangles()`
+
+    对这份非封闭网格它是**空操作**（以前实测翻转率 17.9% → 17.9%）——
+    它依赖可定向的流形拓扑，而泊松网格表面自交导致拓扑混乱。
+
+    这里用最直接的判据：面法线与"物体中心→面心"同向即视为朝外。
+    对凸/星形物体完全正确；对凹形物体在极少数面上可能判错，
+    但**远好于 43.6% 的随机朝向**，且不改变几何形状（只换绕序）。
+    """
+    import numpy as np
+
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    tris = np.asarray(mesh.triangles, dtype=np.int64)
+    if len(verts) == 0 or len(tris) == 0:
+        return mesh
+
+    p0, p1, p2 = verts[tris[:, 0]], verts[tris[:, 1]], verts[tris[:, 2]]
+    fn = np.cross(p1 - p0, p2 - p0)
+    fn /= np.maximum(np.linalg.norm(fn, axis=1, keepdims=True), 1e-12)
+    c = verts.mean(0)
+    fc = (p0 + p1 + p2) / 3.0 - c
+    fc /= np.maximum(np.linalg.norm(fc, axis=1, keepdims=True), 1e-12)
+    need_flip = np.einsum("ij,ij->i", fn, fc) < 0
+    if not need_flip.any():
+        return mesh
+
+    new_tris = tris.copy()
+    new_tris[need_flip] = new_tris[need_flip][:, [0, 2, 1]]     # 交换第 1、2 顶点
+
+    import open3d as o3d
+
+    out = o3d.geometry.TriangleMesh()
+    out.vertices = o3d.utility.Vector3dVector(verts)
+    out.triangles = o3d.utility.Vector3iVector(new_tris)
+    if mesh.has_vertex_colors():
+        out.vertex_colors = o3d.utility.Vector3dVector(np.asarray(mesh.vertex_colors))
+    out.compute_vertex_normals()
+    return out
+
+
 def _unwrap_uv_with_timeout(unwrap_fn, mesh, tex_size: int, timeout_s: float):
     """带超时地做 UV 展开。超时返回 (None, None, None, 已用秒数)。
 
@@ -233,7 +286,22 @@ class ExportStage(Stage):
     outputs = (Artifact("05_export/manifest.json", "导出清单"),)
 
     def run(self, ctx: StageContext) -> StageResult:
-        ply = self._find_ply(ctx.job_dir)
+        # `export.ply` 可显式指定输入点云 —— 这条曾**只写在报错提示里、代码却没读**，
+        # 导致 `--set export.ply=...` 静默无效（本次排查纹理时踩到）。
+        # 用途：用"已过滤掉内部面的点云/网格"再导出，而不重跑训练。
+        ply = None
+        explicit = str(ctx.cfg("ply", "") or "").strip()
+        if explicit:
+            cand = Path(explicit)
+            if not cand.is_absolute():
+                cand = (ctx.job_dir / cand) if (ctx.job_dir / cand).exists() else (Path.cwd() / cand)
+            if cand.exists():
+                ply = cand
+                ctx.info(f"使用显式指定的输入：{explicit}")
+            else:
+                ctx.warn(f"export.ply 指定的文件不存在：{explicit}（回退自动查找）")
+        if ply is None:
+            ply = self._find_ply(ctx.job_dir)
         if ply is None:
             raise StageError(self.name, "找不到 point_cloud.ply", "先完成 train 阶段，或在作业里指定 --set export.ply=<路径>")
         ctx.info(f"模型文件：{ply} ({ply.stat().st_size/1024/1024:.1f} MB)")
@@ -723,6 +791,30 @@ class ExportStage(Stage):
                 presimplify_ratio=float(ctx.cfg("mesh_presimplify_ratio", 10.0) or 0.0),
                 log=ctx.info,
             )
+            # ---- 删除"从未被任何相机看到"的内部面（泊松重建的垃圾几何）----
+            #
+            # 实测 img3-crop：**25.6% 的面从未被任何视角看到**，且它们的
+            # 包围盒 ≈ 全网格、到中心距离 ≈ 全网格 ⇒ **散布在物体内部**，
+            # 不是背面遮挡。害处：
+            #   * 在 UV 展开里白占 texture 空间却烘不出颜色 ⇒ 纹理黑洞
+            #     （实测 43.7% 的 chart 内部 texel 是黑的）；
+            #   * 让网格法线混乱、体积虚胖；对渲染零贡献。
+            #
+            # ⚠️ 判据用"是否被相机看到过"，**不用**"落在前景掩码内的比例"——
+            # 后者在转台素材上原理错误（物体旋转使同一面在掩码内外来回变），
+            # 我曾据此误删 28.7% 顶点，回原始帧才发现删的是物体细节（见 docs/03 G96）。
+            if bool(ctx.cfg("mesh_drop_unseen", True)):
+                try:
+                    from ..gsdata.mesh_export import drop_unseen_faces
+
+                    imgs_b, c2ws_b, ks_b, whs_b = self._load_bake_inputs(ctx, cams)
+                    mesh, dinfo = drop_unseen_faces(
+                        mesh, c2ws_b, ks_b, whs_b,
+                        min_views=int(ctx.cfg("mesh_min_views", 1) or 1),
+                        log=ctx.info)
+                    info = {**info, "drop_unseen": dinfo}
+                except Exception as exc:  # noqa: BLE001
+                    ctx.warn(f"删除不可见面失败（{type(exc).__name__}: {exc}），继续导出")
             return self._finish_mesh(ctx, mesh, info, out_dir, cams=cams)
 
         # ---------------- 路线二：TSDF 融合 ----------------
@@ -912,6 +1004,22 @@ class ExportStage(Stage):
             # 让"纹理"成为可选的加分项，而不是阻塞整条导出的必经环节。
             timeout_s = float(ctx.cfg("mesh_texture_timeout", 300) or 0)
             n_tri_now = len(mesh.triangles)
+            # ---- 烘焙前把法线统一成朝外（本轮修的 54% 纹理黑洞）----
+            #
+            # 实测 img3-crop：网格**只有 43.6% 的面法线朝外**（is_orientable=False、
+            # 非封闭）。而 `bake_texture_from_views` 用
+            #     facing = -(N·vd);  ok &= facing > 0.15
+            # 挑选视角 —— 朝内的面**任何视角都被剔除**，对应 texel 填不上颜色，
+            # 保持纯黑。实测 **53.96% 的 UV 覆盖 texel 是黑的** ⇒ 模型上大片黑斑。
+            #
+            # 修法：按"从物体中心向外"翻转绕序（实测 43.6% → **100.0%**）。
+            # 注意**不能**依赖 `orient_triangles()`：对这份非封闭网格它是空操作
+            # （以前实测 17.9% → 17.9%）。
+            try:
+                mesh = _orient_normals_outward(mesh)
+                ctx.info("烘焙前法线定向：已按'中心向外'统一绕序")
+            except Exception as exc:  # noqa: BLE001
+                ctx.warn(f"法线定向失败（{type(exc).__name__}: {exc}），烘焙可能产生黑斑")
             ctx.info(f"⑦ 纹理烘焙：UV 展开（xatlas）+ 从 {len(cams)} 个视角采样 @{tex_size}²"
                      f"（网格 {n_tri_now} 面，超时 {timeout_s:.0f}s）...")
             uv_mesh, uv_tris, uv, uw_sec = _unwrap_uv_with_timeout(
