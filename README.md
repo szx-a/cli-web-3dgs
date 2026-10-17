@@ -215,8 +215,11 @@ scripts\gsflow_gpu.cmd run --job-id <job> --stages export --force export --set e
 | `export.mesh_texture` | false | 是否烘焙贴图（>8 万面时 xatlas 超线性变慢） |
 | `export.mesh_texture_size` | 2048 | 贴图边长 |
 | `train.lambda_lpips` | 0 | 感知损失权重（自己实现的 VGG16 LPIPS，见 `docs/05` §5.3）。**默认关闭**：3 次重复实测三指标均不显著，且方差约 3 倍 |
-| `train.lambda_depth_distortion` | 0 | 深度失真正则（2DGS 的 λd）。**权重必须按本项目损失口径实测校准**，不能照抄论文的 1000：λd=1.5 是唯一稳超噪声底的改进（+0.199 dB），见 `docs/03` G82 |
+| `train.lambda_depth_distortion` | 0 | 深度失真正则（2DGS 的 λd）。**权重必须按本项目损失口径实测校准**，不能照抄论文的 1000。**注意**：单次测得 +0.199 dB，但 3 次重复后 **+0.026 dB、不显著**（见 `docs/03` G90-B）|
 | `train.opacity_cleanup` | none | **不透明度治理方案**（GUI 下拉框与 CLI `--opacity-cleanup` 共用同一份映射，见 `trainers/opacity_cleanup.py`）：`none`（默认最稳）/ `decay`（C·平滑衰减）/ `recovery`（A·恢复感知剪枝）/ `utilization`（B·利用率剪枝）/ `reset`（官方周期重置，实测最差）。实测见 `docs/03` G84 |
+| `train.densify_criterion` | grad2d | 致密化判据来源：`grad2d`（官方口径：屏幕空间梯度 / 可见次数）/ `grad3d`（旧：世界空间梯度）。**两者量纲差 45 倍、选中的高斯 IoU 仅 0.065**（`docs/03` G90-C）|
+| `capture.mode` | auto | **拍摄模式**（GUI 下拉框与 CLI `--capture-mode` 共用同一份映射，见 `gsdata/capture_mode_params.py`）：`auto`（按背景帧间差异自动判定）/ `turntable`（物体转、相机固定 ⇒ **保留背景** `mask.mode=keep`）/ `orbit`（相机绕行 ⇒ 抠背景）。实测两类素材的比值相差 **34 倍**（`docs/03` G91）|
+| `mask.mode` | black | `black`（背景填黑）/ `inpaint`（纹理补全）/ **`keep`（保留原始背景 —— 转台拍摄必须用）** |
 
 > 网格流程（对应社区标准做法）：渲深度 → 按不透明度/深度一致性过滤 →
 > **反投影成紧贴表面的稠密点云** → 体素下采样均匀化 → 泊松重建 →

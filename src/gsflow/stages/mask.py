@@ -124,11 +124,22 @@ class MaskStage(Stage):
                 mask = imageops.dilate(mask, dilate)
             alpha = imageops.feather(mask, feather_px) if feather_px > 0 else mask.astype(np.float32)
             rgb = imageops.load_rgb(img)
-            clean = (
-                imageops.apply_black_background(rgb, alpha)
-                if mode == "black"
-                else imageops.apply_alpha(rgb, alpha, background=0)
-            )
+            # `keep` 模式：**保留原始背景**，只把掩码单独输出。
+            #
+            # 为什么需要（转台拍法的关键）：物体在转台上转、相机固定时，
+            # 静态背景是"相机确实没动"的唯一证据。合成黑底会把背景信息抹掉，
+            # 重建只能靠"物体自身的旋转"解释像素 ⇒ 把物体转当成相机转 ⇒
+            # 光照/遮挡不自洽 ⇒ 细节糊、网格碎。
+            # 实测（scripts/detect_turntable_capture.py）：
+            #   img3-01 背景帧间差异 0.34（比值 0.013）⇒ 转台；
+            #   maskloss-v2 17.88（比值 0.489）⇒ 相机绕行。
+            # 转台素材应用 `mask.mode=keep`，让背景参与监督，导出阶段再裁出物体。
+            if mode == "keep":
+                clean = rgb
+            elif mode == "black":
+                clean = imageops.apply_black_background(rgb, alpha)
+            else:
+                clean = imageops.apply_alpha(rgb, alpha, background=0)
             out_img = clean_dir / f"{img.stem}.jpg"
             from PIL import Image
 

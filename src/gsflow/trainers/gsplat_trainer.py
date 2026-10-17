@@ -76,6 +76,18 @@ class TrainConfig:
     # 让 PSNR 从 33.75 掉到 21.47）。梯度随优化自然衰减本身就是停止加密的信号，
     # 不需要（也不应该）人为跟随。这里默认用固定阈值。
     densify_grad_threshold: float = 2e-4
+    # 加密判据的来源（本轮审计的核心修正）：
+    #   "grad2d"（默认）—— 官方口径：`means2d.grad` 屏幕空间梯度 / 可见次数。
+    #       `densify_grad_threshold` 在此口径下的含义与官方 `grow_grad2d` 一致。
+    #   "grad3d"       —— 旧行为：`means.grad` 世界空间梯度 + 固定阈值。
+    #       保留以便 A/B 复现。
+    # 实测差异（probe_densify_criterion.py）：两者量纲差 ~45 倍，
+    # 且选中的高斯集合 **IoU 仅 0.065** —— 加密位置几乎完全不同。
+    # 用 grad3d 时 densify_until=15000 会让高斯涨 4.3 倍而 PSNR **降 0.874 dB**。
+    densify_criterion: str = "grad2d"
+    # grad2d 口径下的阈值（官方 grow_grad2d 的常用值）。
+    # 与 grad3d 的 2e-4 不是同一个量纲，**不要混用**。
+    densify_grad2d_threshold: float = 2e-4
     # 可选：>0 时改用"梯度的 (1-q) 分位"作阈值（仅用于实验对比）
     densify_quantile: float = 0.0
     densify_grad_max: float = 5e-3           # 自适应阈值的上限
@@ -1074,11 +1086,16 @@ def train(cfg: TrainConfig, ctx) -> dict:
             # 量纲已归一化，所以 2e-4 这类阈值在不同分辨率/场景下可迁移。
             # 调用方传入的就是这个平均量（见 train() 里的 grad2d/count 累加）。
             # densify_quantile>0 时才启用分位自适应（实验用）。
+            # 阈值按**判据来源**取：grad2d 与 grad3d 不是同一量纲，不能混用。
+            # 实测两者 p50 相差 ~45 倍（1.6e-4 vs 3.5e-6），混用会让加密量完全失控。
+            _crit = str(getattr(cfg, "densify_criterion", "grad2d") or "grad2d").lower()
+            _base_thr = (float(getattr(cfg, "densify_grad2d_threshold", 2e-4))
+                         if _crit == "grad2d" else cfg.densify_grad_threshold)
             if cfg.densify_quantile > 0:
                 thr = _quantile(grad_norm, 1.0 - cfg.densify_quantile)
-                thr = min(max(thr, cfg.densify_grad_threshold), cfg.densify_grad_max)
+                thr = min(max(thr, _base_thr), cfg.densify_grad_max)
             else:
-                thr = cfg.densify_grad_threshold
+                thr = _base_thr
             is_grad_high = grad_norm > thr
 
             # 官方语义：按**绝对尺度阈值**（0.01 * scene_scale）区分克隆/分裂。
@@ -1234,15 +1251,21 @@ def train(cfg: TrainConfig, ctx) -> dict:
                 m = torch.nn.functional.interpolate(
                     m[None, None].float(), size=gt.shape[:2], mode="nearest"
                 )[0, 0] > 0.5
-            else:
-                m = m.to(device)
+            # ⚠️ 插值分支产生的张量在 **CPU** 上（`m` 原本是 CPU 上的 bool 张量），
+            # 而 `gt` 在 CUDA 上。旧代码只在 else 分支做了 `.to(device)`，
+            # 于是"掩码尺寸与图像不一致"时会崩：
+            #     RuntimeError: Expected all tensors to be on the same device,
+            #                   but found at least two devices, cuda:0 and cpu!
+            # 这个分支只在**图像被缩放**时触发（例如 576x1280 的素材去畸变后变
+            # 577x1309），所以小数据集一直没暴露它。这里统一搬设备。
+            m = m.to(device)
             if str(cfg.mask_loss_mode).lower() == "inside":
                 # 旧行为（仅用于对照/复现）：只在掩码内取均值
                 if m.any():
                     l1 = l1[m].mean() if l1[m].numel() else l1.mean()
             elif m.any() and not bool(m.all()):
                 # 默认：掩码外合成背景色，损失在全图上算
-                gt = torch.where(m[..., None], gt, background.to(gt.dtype))
+                gt = torch.where(m[..., None], gt, background.to(device=gt.device, dtype=gt.dtype))
         l1 = l1.mean()
 
         ssim_val = ssim_simple(render.permute(2, 0, 1)[None], gt.permute(2, 0, 1)[None],
@@ -1348,8 +1371,53 @@ def train(cfg: TrainConfig, ctx) -> dict:
         #
         # ⇒ 要真正对齐官方，应整体移植 `DefaultStrategy`（约 200 行 +
         #   `ops.py`），而不是零散补几处。在那之前，这里的实测校准值更可靠。
+        # ---- 致密化判据（官方口径 vs 旧的 3D 口径）----
+        #
+        # 官方 `DefaultStrategy` 用**屏幕空间**梯度并除以可见次数：
+        #     g = meta["means2d"].grad;  g[...,0] *= width/2*n_cameras
+        #     g = g.norm(dim=-1);  g = g / count.clamp_min(1)
+        #     densify if g > grow_grad2d
+        # 我们旧版用 `means.grad.norm()`（3D 世界空间）+ 固定 2e-4。
+        # 实测（scripts/probe_densify_criterion.py）：两者量纲差 ~45 倍，
+        # 且选出的高斯集合 **IoU 仅 0.065** —— 加密位置几乎完全不同。
+        # 后果已验证：densify_until=15000 时高斯 4.3 倍，PSNR 反降 0.874 dB，
+        # 近透明高斯 21.2% -> 36.8%（"雾"变多，细节没变多）。
         grad_norm_cache = None
-        if means.grad is not None:
+        _crit = str(getattr(cfg, "densify_criterion", "grad2d") or "grad2d").lower()
+        if _crit == "grad2d":
+            _m2 = meta.get("means2d") if isinstance(meta, dict) else None
+            _radii = meta.get("radii") if isinstance(meta, dict) else None
+            if _m2 is not None and _m2.grad is not None:
+                with torch.no_grad():
+                    gg = _m2.grad.detach().clone()          # [C,N,2]
+                    # ⚠️ 官方（`gsplat/strategy/default.py::step_post_backward`）是：
+                    #     grads[..., 0] *= width  / 2.0 * n_cameras
+                    #     grads[..., 1] *= height / 2.0 * n_cameras
+                    #     state["grad2d"].index_add_(0, gs_ids, grads.norm(dim=-1))
+                    #     grads = state["grad2d"] / count.clamp_min(1)
+                    # **两个分量都要缩放**（各自按自己的像素维度换算到 [-1,1]）。
+                    # 我的第一版只缩放了 x、且没乘 n_cameras —— 对竖屏素材
+                    # （577x1309）y 方向梯度被低估约 650 倍 ⇒ 加密几乎不触发。
+                    # 实测后果：406 视图、30000 迭代只得到 **22,675** 个高斯
+                    # （每视图 125 个，社区 1000~5000）。
+                    _H, _W = float(gt.shape[0]), float(gt.shape[1])
+                    _nc = float(gg.shape[0])
+                    gg[..., 0] *= _W / 2.0 * _nc
+                    gg[..., 1] *= _H / 2.0 * _nc
+                    g2d = gg.norm(dim=-1)                    # [C,N]
+                    # 除以"被看到次数"（radii>0 视为可见；取不到就按 1）
+                    if _radii is not None:
+                        vis = (_radii.detach().reshape(-1, 2) > 0).any(dim=-1).float()
+                        vis = vis.clamp_min(1.0)
+                    else:
+                        vis = torch.ones(g2d.shape[-1], device=g2d.device)
+                    # 逐视角累积后取最大（官方是累加进 state，这里每步重算，取 max
+                    # 与"本步最需要加密的视角"等价，且不引入跨步状态）
+                    grad_norm_cache = (g2d / vis[None]).max(dim=0).values.detach().clone()
+            else:
+                ctx.warn("拿不到 means2d 梯度（densify_criterion=grad2d），"
+                         "本轮退回 3D 梯度；如需稳定请检查 gsplat 版本")
+        if grad_norm_cache is None and means.grad is not None:
             with torch.no_grad():
                 grad_norm_cache = means.grad.norm(dim=-1).detach().clone()
         elif means.grad is not None:

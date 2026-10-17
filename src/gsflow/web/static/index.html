@@ -68,9 +68,22 @@
             <select id="p-mask-mode">
               <option value="black">black（背景纯黑，COLMAP 最稳）</option>
               <option value="inpaint">inpaint（纹理补全，实验）</option>
+              <option value="keep">keep（保留原始背景，转台拍摄用）</option>
+            </select>
+          </label>
+          <label class="grow">拍摄模式（capture.mode）
+            <select id="p-capture-mode">
+              <option value="auto">auto（自动判定，推荐）</option>
+              <option value="orbit">orbit · 相机绕物体走（挖背景安全）</option>
+              <option value="turntable">turntable · 物体转、相机固定（保留背景）</option>
             </select>
           </label>
         </div>
+        <p class="hint" id="capture-hint">拍摄模式决定**要不要保留背景**：
+          <b>orbit</b>（相机绕行）抠背景是安全的；<b>turntable</b>（物体在转台上转、
+          相机与光源固定）**必须保留背景**——静态背景是"相机没动"的唯一证据，
+          抠掉会逼模型把"物体转"当成"相机转"，导致光照/遮挡不自洽、细节糊。
+          <b>auto</b> 按"背景帧间差异"判定（实测两类素材相差 34 倍）。</p>
         <div class="row">
           <label class="grow">分割提示 prompt（可空，如 person / 椅子）
             <input id="p-mask-prompt" placeholder="留空则取最大前景">

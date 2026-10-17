@@ -25,6 +25,19 @@ const api = async (path, opts) => {
   return res.headers.get('content-type')?.includes('json') ? res.json() : res.text();
 };
 
+// 拍摄模式的映射表（**由后端 /api/capture_modes 填充**，不在前端硬编码）。
+// 这样 CLI 的 --capture-mode 与 GUI 下拉框一定产出相同的参数集合。
+const CAPTURE_MAP = {};
+async function loadCaptureMap() {
+  try {
+    const d = await api('/api/capture_modes');
+    (d.choices || []).forEach((c) => { CAPTURE_MAP[c.value] = c.params; });
+    console.debug('[capture_mode] 已从后端载入映射：', Object.keys(CAPTURE_MAP));
+  } catch (e) {
+    console.warn('[capture_mode] 无法从后端载入映射，将只发送模式名：', e);
+  }
+}
+
 let STAGES = [];
 let CONFIG = {};
 let CONFIG_PATH = '';
@@ -113,6 +126,17 @@ function collectParams() {
   const put = (k, v) => { if (v !== '' && v !== null && v !== undefined) p[k] = v; };
   put('mask.backend', $('p-mask-backend').value);
   put('mask.mode', $('p-mask-mode').value);
+  // 拍摄模式：映射**从后端取**（/api/capture_modes），不在 JS 里重写 ——
+  // 与 --capture-mode 共用 `gsdata/capture_mode_params.py` 一份定义。
+  // 注意：显式选择了模式时，模式带来的键（如 turntable 的 mask.mode=keep）
+  // **覆盖**上面的手动选择，避免"两个地方都能设、结果取决于顺序"的混乱。
+  const capSel = $('p-capture-mode');
+  if (capSel) {
+    const mode = capSel.value || 'auto';
+    put('capture.mode', mode);
+    const mapped = CAPTURE_MAP[mode];
+    if (mapped) Object.entries(mapped).forEach(([k, v]) => { p[k] = v; });
+  }
   put('mask.prompt', $('p-mask-prompt').value.trim());
   put('frames.fps', $('p-frames-fps').value);
   put('frames.long_side', $('p-frames-long').value);
@@ -484,6 +508,7 @@ $('btn-save-config').onclick = saveConfig;
 $('btn-reload-config').onclick = loadConfig;
 $('btn-reset-config').onclick = async () => { await api('/api/config/reset', { method: 'POST' }); loadConfig(); };
 ['in-path', 'in-title', 'in-jobid', 'in-force', 'p-mask-backend', 'p-mask-mode', 'p-mask-prompt',
+  'p-capture-mode',
   'p-frames-fps', 'p-frames-long', 'p-colmap-matcher', 'p-train-backend', 'p-train-iters',
   'p-train-res', 'p-train-cap', 'p-train-densify', 'p-train-maskloss',
   'p-train-opacityclean', 'p-train-opacityparam',
@@ -857,6 +882,7 @@ if ($('btn-m-rotmode')) {
   await health();
   await loadStages();
   await loadOpacityMap();   // 必须在 loadConfig 之前：表单要用到映射
+  await loadCaptureMap();   // 同上：拍摄模式也要先拿到映射
   await refreshJobs();
   await loadConfig();
   await loadCreds();

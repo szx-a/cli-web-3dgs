@@ -136,6 +136,23 @@ def create_app():
         return registry.describe()
 
     # ------------------------------------------------------------------ 配置
+    @app.get("/api/capture_modes")
+    def capture_modes() -> dict[str, Any]:
+        """列出"拍摄模式"的选项与各自生成的参数。
+
+        与 `/api/opacity_cleanup` 同样的理由：CLI 的 `--capture-mode` 与 GUI 下拉框
+        必须产出**完全一致**的参数集合，所以映射只在
+        `gsdata/capture_mode_params.py` 一处定义，前端从这里取。
+        """
+        from ..gsdata.capture_mode_params import CHOICES, capture_mode_params
+
+        return {
+            "choices": [
+                {"value": c, "params": capture_mode_params(c)}
+                for c in CHOICES
+            ],
+        }
+
     @app.get("/api/opacity_cleanup")
     def opacity_cleanup_options() -> dict[str, Any]:
         """列出"不透明度治理方案"的选项与各自生成的参数。

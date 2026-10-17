@@ -68,6 +68,16 @@ def build_parser() -> argparse.ArgumentParser:
     #   内部有 reset / decay / utilization / recovery 各自的开关与系数，
     #   手填既难懂又容易漏（本会话出现过"配置生效了但功能从不执行"的静默失效）。
     # GUI 与本参数共享 `opacity_cleanup_params()` 的映射，保证两端同构。
+    # ---- 拍摄模式（与 GUI 下拉框**同一套映射**，见 gsdata/capture_mode_params.py）----
+    # 两种拍法的几何假设不同，必须分开处理：
+    #   orbit     —— 相机绕物体行走（现状：抠背景 + 黑底合成）
+    #   turntable —— 物体在转台上转、相机与光源固定 ⇒ **必须保留背景**，
+    #                因为静态背景是"相机没动"的唯一证据；抠掉会逼模型把
+    #                "物体转"当成"相机转" ⇒ 光照/遮挡不自洽 ⇒ 糊、碎。
+    #   auto      —— 按"背景帧间差异"自动判定（实测两类素材相差 34 倍）
+    sp.add_argument("--capture-mode", default="",
+                    choices=["", "auto", "turntable", "orbit"],
+                    help="拍摄模式（与 GUI 下拉框等价）：auto/turntable/orbit")
     sp.add_argument("--opacity-cleanup", default="",
                     choices=["", "none", "reset", "decay", "utilization", "recovery"],
                     help="训练时的不透明度治理方案（与 GUI 下拉框等价）："
@@ -175,6 +185,20 @@ def cmd_run(args) -> int:
               + (f"（数值 {args.opacity_param}）" if args.opacity_param is not None else ""))
         for k, v in oc_sets.items():
             print(f"  {k} = {v}")
+    # 拍摄模式：同样用**单一映射源**，与 GUI 下拉框一致。
+    cm = getattr(args, "capture_mode", "") or ""
+    if cm:
+        from .gsdata.capture_mode_params import capture_mode_params
+        cm_sets = capture_mode_params(cm)
+        for k, v in cm_sets.items():
+            sets.setdefault(k, v)     # 显式 --set 优先
+        print(f"拍摄模式 = {cm}")
+        for k, v in cm_sets.items():
+            print(f"  {k} = {v}")
+        if cm == "turntable":
+            print("  ⇒ 保留原始背景（mask.mode=keep）：静态背景是'相机没动'的唯一证据。")
+        elif cm == "orbit":
+            print("  ⇒ 抠背景 + 黑底合成（相机确实在动，这样做安全）。")
     settings = load_settings(sets)
     spec = JobSpec(
         input_path=args.video or args.images or "",

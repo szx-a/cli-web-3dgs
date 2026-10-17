@@ -33,6 +33,17 @@ DEFAULTS: dict[str, Any] = {
         "colmap": "",
         "magick": "",
     },
+    # ---- 拍摄模式（决定"要不要保留背景"）----
+    # auto（默认）—— 按数据自动判定：**背景区域的帧间差异**。
+    #   转台（相机固定）⇒ 背景几乎不动；相机绕行 ⇒ 背景有明显视差。
+    #   实测：img3-01 比值 0.015（转台）、maskloss-v2 0.489（绕行），相差 34 倍。
+    # turntable —— 物体在转台上转、相机与光源固定 ⇒ **保留背景**（mask.mode=keep），
+    #   让静态背景锚定"相机没动"；导出阶段再按掩码/密度把物体裁出来。
+    # orbit     —— 相机绕物体行走 ⇒ 抠背景 + 黑底合成是安全的（现状）。
+    # 映射只在 gsdata/capture_mode_params.py 一处定义，CLI 与 GUI 共用（避免两端漂移）。
+    "capture": {
+        "mode": "auto",
+    },
     "frames": {
         # 抽帧模式：fps（定帧率）或 count（按目标张数均匀抽）
         "mode": "fps",
@@ -59,7 +70,16 @@ DEFAULTS: dict[str, Any] = {
         # 默认给 fastsam：真实使用场景（手持环绕拍摄）里语义分割更可靠。
         # 若你的素材背景干净（纯色墙、桌面、影棚），换 classical 会明显更快更准。
         "backend": "fastsam",
-        # 清理模式：black（背景填黑，COLMAP 最稳）| inpaint（纹理补全）
+        # 清理模式：
+        #   black   —— 背景填黑（COLMAP 最稳；适合**相机绕行**拍摄）
+        #   inpaint —— 纹理补全
+        #   keep    —— **保留原始背景**（适合**转台**拍摄：物体转、相机固定）
+        # 为什么要 keep：转台拍法里静态背景是"相机确实没动"的唯一证据。
+        # 合成黑底会抹掉它 ⇒ 重建只能靠物体自身的旋转解释像素 ⇒
+        # 把物体转当成相机转 ⇒ 光照/遮挡不自洽 ⇒ 细节糊、网格碎。
+        # 实测（scripts/detect_turntable_capture.py）：img3-01 背景差异 0.34
+        # （比值 0.013）= 转台；maskloss-v2 17.88（比值 0.489）= 相机绕行。
+        # 判定与策略见 gsdata/capture_mode.py 与 scripts/check_capture_mode.py。
         "mode": "black",
         "dilate_px": 4,
         "feather_px": 2,
@@ -119,6 +139,17 @@ DEFAULTS: dict[str, Any] = {
         # 实测分位自适应会导致无界增长，已回退。
         "densify_quantile": 0.0,
         "densify_grad_threshold": 2e-4,
+        # ---- 致密化判据来源（本轮审计的核心修正）----
+        # "grad2d"（默认）= 官方口径：`means2d.grad` 屏幕空间梯度 / 可见次数
+        # "grad3d"        = 旧行为：`means.grad` 世界空间梯度 + 固定阈值
+        # 实测（scripts/probe_densify_criterion.py）：两者量纲差 ~45 倍
+        # （p50 1.60e-4 vs 3.55e-6），且选中的高斯集合 **IoU 仅 0.065**
+        # ⇒ 加密位置几乎完全不同。用 grad3d 时 densify_until=15000
+        # 会让高斯涨 4.3 倍而 PSNR 反降 0.874 dB、近透明高斯 21%→37%。
+        "densify_criterion": "grad2d",
+        # grad2d 口径下的阈值（官方 grow_grad2d 常用值）。
+        # **与 grad3d 的 2e-4 不同量纲，不要混用。**
+        "densify_grad2d_threshold": 2e-4,
         "densify_grad_max": 5e-3,
         # 绝对梯度致密化（AbsGS：https://ty424.github.io/AbsGS.github.io/）。
         # 官方 `DefaultStrategy(absgrad=...)` 支持：开启后栅格化会额外产出
