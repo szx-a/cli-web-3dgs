@@ -880,7 +880,22 @@ def create_app():
             elif low.endswith(".glb"):
                 _add("points", "glb_points", name, desc or "点云 glTF")
             elif low.endswith(".ply"):
-                _add("points", "ply", name, desc or "3DGS 点云 PLY")
+                # ⚠️ 不能只看扩展名：`.ply` 可能是**普通点云**（xyz+rgb，6 维），
+                # 也可能是**完整 3DGS PLY**（59 维含 SH）。两者的观看方式完全相反 ——
+                # 前者只能当点云画，后者必须交给高斯渲染器。
+                # 判据是 PLY 头里有没有 `f_dc_0`（3DGS 的 SH DC 属性）。
+                is_3dgs = False
+                try:
+                    hp = out / name
+                    if hp.exists():
+                        is_3dgs = b"f_dc_0" in hp.read_bytes()[:8192]
+                except Exception:  # noqa: BLE001
+                    is_3dgs = False
+                if is_3dgs:
+                    _add("splat", "gauss3d", name,
+                         desc or "完整 3DGS PLY（59 维含 SH，参考渲染器可直接用）")
+                else:
+                    _add("points", "ply", name, desc or "3DGS 点云 PLY")
             elif low.endswith(".spz"):
                 _add_download("spz", name, desc or "SPZ 压缩点云（查看器不支持）")
             elif low.endswith(".obj"):

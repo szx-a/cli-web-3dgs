@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import struct
 from pathlib import Path
 
@@ -358,6 +359,25 @@ class ExportStage(Stage):
             except Exception as exc:  # noqa: BLE001
                 ctx.warn(f"splat 导出失败（不影响其它产物）：{type(exc).__name__}: {exc}")
 
+        # ---- 完整 59 维 3DGS PLY（供参考渲染器用，含 SH）----
+        #
+        # `.splat` 只有 11 维（丢 SH）⇒ 色彩不随视角变化。要让导出的
+        # `viewer_splat.html` 达到与 preview 一致的观感，必须给它**完整 PLY**。
+        # 代价是 05_export 多一份约 23 MB 的副本；只在显式要求 `ply_full` 时做。
+        if "ply_full" in formats:
+            try:
+                dst = out_dir / "model_gaussians.ply"
+                shutil.copy2(ply, dst)
+                produced.append({
+                    "kind": "ply_full", "path": dst.name,
+                    "size_mb": round(dst.stat().st_size / 1024 / 1024, 2),
+                    "gaussians": int(len(gauss["xyz"])),
+                    "desc": "完整 3DGS PLY（59 维含 SH48，参考渲染器/Blender 3DGS 插件可直接用）",
+                })
+                ctx.success(f"已导出 {dst.name}（完整 59 维，{dst.stat().st_size/1024/1024:.1f} MB）")
+            except Exception as exc:  # noqa: BLE001
+                ctx.warn(f"完整 PLY 导出失败（不影响其它产物）：{type(exc).__name__}: {exc}")
+
         if "spz" in formats:
             try:
                 spz_path = self._write_spz(out_dir / "model.spz", gauss)
@@ -424,8 +444,24 @@ class ExportStage(Stage):
             html = out_dir / "viewer.html"
             self._write_viewer(html, gauss, ctx)
             produced.append({"kind": "html", "path": html.name, "size_mb": round(html.stat().st_size / 1024 / 1024, 2),
-                             "desc": "离线查看器（双击打开）"})
+                             "desc": "离线查看器（6 维点云，双击打开）"})
             ctx.success(f"已生成 {html.name}")
+
+        # ---- 3D 高斯查看器（**参考实现**，含 SH）----
+        #
+        # 为什么单独做一个：`viewer.html` 内嵌的是 `x,y,z,r,g,b`（6 维）点云，
+        # 用它看模型必然"稀疏、扁平" ⇒ 用户会把**渲染差距误判成模型质量差**
+        # （docs/03 G108/G116）。正确做法是用社区验证过的渲染器
+        # `@mkkellogg/gaussian-splats-3d`（MIT，three.js，原生支持 3DGS PLY 59 维含 SH），
+        # 并把依赖一起复制到导出目录，使产物**自包含、可离线双击打开**。
+        if "splat" in formats or "ply_full" in formats:
+            try:
+                ref = self._write_viewer_splat(ctx, gauss, out_dir)
+                if ref:
+                    produced.append(ref)
+            except Exception as exc:  # noqa: BLE001
+                ctx.warn(f"3D 高斯查看器生成失败（不影响其它产物）："
+                         f"{type(exc).__name__}: {exc}")
 
         manifest = {
             "source_ply": str(ply),
@@ -1809,6 +1845,142 @@ class ExportStage(Stage):
         return out
 
     # ------------------------------------------------------------------ 查看器
+    def _write_viewer_splat(self, ctx: StageContext, gauss: dict, out_dir: Path) -> dict | None:
+        """生成**自包含**的 3D 高斯查看器（用社区参考实现渲染）。
+
+        为什么需要它（`docs/03` G108/G116）：
+          `viewer.html` 内嵌 `x,y,z,r,g,b`（6 维）点云，用它看模型必然稀疏扁平；
+          用户会把这**渲染差距误判成模型质量差**。而 3DGS 有 59 维
+          （位置3+尺度3+旋转4+不透明度1+SH48），必须用能吃下这些维度的渲染器。
+
+        做法：把 `@mkkellogg/gaussian-splats-3d`（MIT，three.js，原生支持 3DGS PLY）
+        与 three.js 一起复制到 `05_export/vendor/`，生成 `viewer_splat.html`，
+        于是产物**自包含、可离线双击打开**，且渲染是社区验证过的实现。
+
+        取景参数在这里算好并内嵌（`up` 用训练相机平面法向，理由见 `web/app.py`
+        的 `scene_info`）：COLMAP 世界坐标没有约定哪个轴朝上，硬编码会躺倒。
+        """
+        import shutil
+
+        static = Path(__file__).resolve().parents[1] / "web" / "static"
+        vendor_src = static / "vendor"
+        files = {
+            "vendor/three.module.js": vendor_src / "three.module.js",
+            "vendor/gaussian-splats-3d.module.js":
+                vendor_src / "gaussian-splats-3d.module.js",
+        }
+        missing = [str(p) for p in files.values() if not p.exists()]
+        if missing:
+            ctx.warn(f"缺少 vendored 渲染库，跳过 3D 高斯查看器：{missing[0]}")
+            return None
+
+        vdst = out_dir / "vendor"
+        vdst.mkdir(parents=True, exist_ok=True)
+        for rel, src in files.items():
+            shutil.copy2(src, out_dir / rel)
+
+        # 场景参数：包围盒 + 上方向（相机平面法向）+ 相机位置
+        xyz = np.asarray(gauss["xyz"], dtype=np.float64)
+        mn, mx = xyz.min(0), xyz.max(0)
+        center = (mn + mx) / 2.0
+        radius = max(1e-6, float(np.linalg.norm(mx - mn) / 2.0))
+        up = np.array([0.0, 1.0, 0.0])
+        try:
+            from ..gsdata.colmap_io import read_model
+
+            cands = sorted({p.parent for p in
+                            (Path(ctx.job_dir) / "03_colmap" / "sparse").rglob("cameras.bin")})
+            best = None
+            for c in cands:
+                rec = read_model(c)
+                if best is None or len(rec.images) > len(best.images):
+                    best = rec
+            if best is not None and len(best.images) >= 3:
+                cs = np.array([im.cam_to_world()[1] for im in best.images])
+                d = cs - cs.mean(axis=0)
+                _, _, vt = np.linalg.svd(d, full_matrices=False)
+                n = vt[-1] / max(np.linalg.norm(vt[-1]), 1e-12)
+                up = -n if float(np.dot(n, [0.0, 1.0, 0.0])) < 0 else n
+        except Exception:  # noqa: BLE001
+            pass
+
+        elev = np.radians(12.0)
+        fwd_hint = np.array([0.0, 0.0, 1.0])
+        if abs(float(np.dot(fwd_hint, up))) > 0.9:
+            fwd_hint = np.array([1.0, 0.0, 0.0])
+        side = np.cross(up, fwd_hint)
+        side /= max(float(np.linalg.norm(side)), 1e-12)
+        back = np.cross(side, up)
+        cam = center + (back * np.cos(elev) + up * np.sin(elev)) * radius * 2.8
+
+        # 数据源：优先 PLY（59 维含 SH），没有就退回 .splat（11 维）
+        ply_here = out_dir / "model_gaussians.ply"
+        splat_here = out_dir / "model.splat"
+        if ply_here.exists():
+            data_file, data_kind = "model_gaussians.ply", "59 维（含 SH 视角着色）"
+        elif splat_here.exists():
+            data_file, data_kind = "model.splat", "11 维（无 SH，色彩不随视角变化）"
+        else:
+            ctx.warn("既没有 model_gaussians.ply 也没有 model.splat，跳过 3D 查看器")
+            return None
+
+        info = {
+            "center": [float(v) for v in center],
+            "radius": float(radius),
+            "up": [float(v) for v in up],
+            "cameraPosition": [float(v) for v in cam],
+            "cameraLookAt": [float(v) for v in center],
+            "gaussians": int(len(xyz)),
+            "dataFile": data_file,
+            "dataKind": data_kind,
+        }
+        html = f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>3D 高斯查看器 · gsflow</title>
+<style>
+  html,body{{margin:0;height:100%;background:#05080b;color:#cbd5e1;
+    font:13px/1.5 system-ui,-apple-system,"Microsoft YaHei",sans-serif}}
+  #host{{position:fixed;inset:0}}
+  #hud{{position:fixed;left:12px;top:12px;padding:8px 12px;border-radius:8px;
+    background:#0b1220cc;border:1px solid #1e293b;pointer-events:none}}
+  #hud b{{color:#38bdf8}}
+</style>
+<!-- 参考渲染库（@mkkellogg/gaussian-splats-3d v0.4.7, MIT + three.js r160）：
+     与主程序 GUI 用的是同一套实现，避免"自研渲染器差距被误读成模型质量差"。 -->
+<script type="importmap">
+{{"imports":{{"three":"./vendor/three.module.js"}}}}
+</script>
+</head><body>
+<div id="host"></div>
+<div id="hud">3D 高斯查看器 · 参考实现 gaussian-splats-3d · <b>{info["gaussians"]:,}</b> 高斯
+ · 数据 <b>{data_kind}</b><br>左键旋转 · 滚轮缩放 · 右键平移</div>
+<script type="module">
+import * as GS from './vendor/gaussian-splats-3d.module.js';
+const info = {json.dumps(info, ensure_ascii=False)};
+const viewer = new GS.Viewer({{
+  rootElement: document.getElementById('host'),
+  cameraUp: info.up,
+  initialCameraPosition: info.cameraPosition,
+  initialCameraLookAt: info.cameraLookAt,
+  useBuiltInControls: true,
+  selfDrivenMode: true,
+  sharedMemoryForWorkers: false,
+}});
+await viewer.addSplatScene('./' + info.dataFile, {{
+  showLoadingUI: true, splatAlphaRemovalThreshold: 5, progressiveLoad: true,
+}});
+viewer.start();
+</script>
+</body></html>
+"""
+        p = out_dir / "viewer_splat.html"
+        p.write_text(html, encoding="utf-8")
+        ctx.success(f"已生成 {p.name}（3D 高斯查看器，参考实现，{data_kind}）")
+        return {"kind": "html_splat", "path": p.name,
+                "size_mb": round(p.stat().st_size / 1024 / 1024, 2),
+                "desc": f"3D 高斯查看器（参考实现 gaussian-splats-3d，{data_kind}，"
+                        f"自包含可离线打开）"}
+
     def _write_viewer(self, path: Path, gauss: dict, ctx: StageContext) -> Path:
         """生成离线查看器：把点云内嵌进 HTML，用 Canvas 2D 做交互（无外网 CDN 依赖）。"""
         max_pts = 120000
