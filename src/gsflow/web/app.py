@@ -478,6 +478,7 @@ def create_app():
         try:
             metrics_p = root / "04_train" / "metrics.json"
             gauss_url = ""
+            gauss_ply: Path | None = None
             if metrics_p.exists():
                 _m = json.loads(metrics_p.read_text(encoding="utf-8"))
                 best = str(_m.get("best_ply") or "")
@@ -487,14 +488,33 @@ def create_app():
                         bp = root / bp
                     if bp.exists():
                         gauss_url = f"/api/gauss/{job_id}"
-            else:
+                        gauss_ply = bp
+            if not gauss_url:
                 cands = sorted((root / "04_train" / "point_cloud").glob("*/point_cloud.ply"))
                 if cands:
                     gauss_url = f"/api/gauss/{job_id}"
+                    gauss_ply = cands[-1]
             if gauss_url:
+                # ⚠️ `size_mb` 必须给**真实值**：我之前写死成 None，
+                # 前端模板拼成 `${size_mb} MB`，界面上就成了
+                # 「point_cloud.ply（完整 59 维）  null MB」——
+                # 用户会以为文件不存在。这里是显示 bug，不是缺文件。
+                n_gauss = None
+                size_mb = None
+                if gauss_ply is not None and gauss_ply.exists():
+                    nbytes = gauss_ply.stat().st_size
+                    size_mb = round(nbytes / 1024 / 1024, 2)
+                    try:
+                        from ..gsdata.shio import read_gaussians_full  # noqa: F401
+                        n_gauss = man.get("gaussians") if isinstance(man, dict) else None
+                    except Exception:  # noqa: BLE001
+                        n_gauss = None
                 modes["splat"].append({
                     "kind": "gauss3d", "name": "point_cloud.ply（完整 59 维）",
-                    "url": gauss_url, "size_mb": None,
+                    "url": gauss_url, "size_mb": size_mb,
+                    "bytes": (gauss_ply.stat().st_size
+                              if gauss_ply is not None and gauss_ply.exists() else None),
+                    "gaussians": n_gauss,
                     "desc": "真实高斯：位置+尺度+旋转+不透明度+SH(48)，"
                             "按视线方向做 SH 着色",
                 })

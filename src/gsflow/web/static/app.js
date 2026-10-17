@@ -728,6 +728,29 @@ function renderModeButtons() {
   });
 }
 
+/**
+ * 统一格式化产物大小。
+ *
+ * 为什么需要：后端对"训练产物 PLY"这类**不在 05_export 里**的文件一度把
+ * `size_mb` 写死成 null，而模板直接拼 `${f.size_mb} MB` ⇒ 界面上显示
+ * 「point_cloud.ply（完整 59 维）  null MB」，用户会以为**文件不存在**。
+ * 后端已改成给真实字节数；这里再兜一层，拿不到大小就显示"—"，
+ * 绝不把 `null` / `undefined` 直接印给用户。
+ */
+function fmtSize(f) {
+  if (!f) return '—';
+  const mb = (f.size_mb === null || f.size_mb === undefined) ? null : Number(f.size_mb);
+  if (mb !== null && Number.isFinite(mb)) {
+    if (mb >= 1024) return (mb / 1024).toFixed(2) + ' GB';
+    return mb.toFixed(2) + ' MB';
+  }
+  if (typeof f.bytes === 'number' && f.bytes > 0) {
+    const m = f.bytes / 1024 / 1024;
+    return (m >= 1024 ? (m / 1024).toFixed(2) + ' GB' : m.toFixed(2) + ' MB');
+  }
+  return '—';
+}
+
 function renderModeFiles() {
   const box = $('m-list');
   box.innerHTML = '';
@@ -742,7 +765,7 @@ function renderModeFiles() {
       const el = document.createElement('div');
       el.className = 'item';
       el.innerHTML = `<div class="top"><span class="jid">${f.name}</span>`
-        + `<span class="muted">${f.size_mb} MB</span></div>`
+        + `<span class="muted">${fmtSize(f)}</span></div>`
         + `<div class="meta">${f.desc || f.kind}</div>`;
       el.onclick = () => loadModelFile(f);
       box.appendChild(el);
@@ -764,7 +787,7 @@ function renderModeFiles() {
       const el = document.createElement('div');
       el.className = 'item';
       el.innerHTML = `<div class="top"><span class="jid">${f.name}</span>`
-        + `<span class="muted">${f.size_mb} MB</span></div>`
+        + `<span class="muted">${fmtSize(f)}</span></div>`
         + `<div class="meta">${f.desc || f.kind}</div>`;
       el.onclick = () => window.open(f.url, '_blank');
       box.appendChild(el);

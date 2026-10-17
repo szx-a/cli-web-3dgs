@@ -81,3 +81,56 @@ def test_app_all_model_urls_checker_exists() -> None:
     assert p.exists()
     src = p.read_text(encoding="utf-8")
     assert "manifest" in src, "检查器还应校验 manifest 里的每条产物路径"
+
+
+def test_model_entries_have_real_size() -> None:
+    """每个产物条目都必须有**真实**大小，不能是 null。
+
+    回归：训练产物 PLY（`gauss3d` 条目）此前把 `size_mb` 写死成 None，
+    前端模板直接拼 `${size_mb} MB` ⇒ 界面显示
+    「point_cloud.ply（完整 59 维）  null MB」，用户以为**文件不存在**。
+    """
+    c = _client()
+    jobs = [p.name for p in (ROOT / "workspace").iterdir()
+            if p.is_dir() and (p / "05_export").exists()]
+    assert jobs, "工作区里没有作业，测试无意义"
+    checked = 0
+    for job in sorted(jobs)[:12]:
+        d = c.get(f"/api/models/{job}").json()
+        for mode, files in (d.get("modes") or {}).items():
+            for f in files:
+                size = f.get("size_mb")
+                byt = f.get("bytes")
+                ok = ((isinstance(size, (int, float)) and size > 0)
+                      or (isinstance(byt, (int, float)) and byt > 0))
+                assert ok, (f"作业 {job} 的产物 {f.get('name')} 没有真实大小："
+                            f"size_mb={size!r} bytes={byt!r}")
+                checked += 1
+    assert checked > 0
+
+
+def test_frontend_never_prints_null_size() -> None:
+    """前端不得把 `null`/`undefined` 当大小印出来（必须走 fmtSize 兜底）。"""
+    src = (ROOT / "src" / "gsflow" / "web" / "static" / "app.js").read_text(
+        encoding="utf-8")
+    assert "function fmtSize(" in src, "应有统一的尺寸格式化函数"
+    # ⚠️ 必须排除注释：`fmtSize` 的说明里**引用**了那句错误模板，
+    # 直接 `in src` 会把注释也当成违规（我第一版就这么误判了）。
+    code_lines = []
+    in_block = False
+    for line in src.splitlines():
+        s = line.strip()
+        if in_block:
+            if "*/" in s:
+                in_block = False
+            continue
+        if s.startswith("/*"):
+            in_block = "*/" not in s
+            continue
+        if s.startswith("//"):
+            continue
+        code_lines.append(line)
+    code = "\n".join(code_lines)
+    assert "${f.size_mb}" not in code, "仍在直接拼 size_mb（会印出 null MB）"
+    # 兜底必须是"—"而不是空/0
+    assert "return '—'" in src
