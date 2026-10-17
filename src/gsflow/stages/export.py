@@ -1062,14 +1062,45 @@ class ExportStage(Stage):
             else:
                 ctx.info(f"   UV 展开完成：{uw_sec:.1f}s")
                 images, c2ws, ks, whs = self._load_bake_inputs(ctx, cams)
+                # ---- 找到"与训练图同名"的前景掩码，用于**掩码内采样** ----
+                #
+                # 这是原理正确的做法：用前景掩码判定采样点是否落在物体上。
+                # 之前只有"像素接近纯黑就拒绝"的近似判据，缺陷是
+                #   * 真实物体的暗部（阴影、深色石材）会被误杀；
+                #   * 背景不是纯黑时完全失效。
+                #
+                # ⚠️ 掩码来源必须经过**内容校验**：实测 `final-v1` 有 40+ 个同级作业
+                # 文件名完全一致（都是 00001.jpg…）但其实是不同数据集
+                # （图 58KB vs 104KB、掩码 sha 不同）。只按文件名挑会选错，
+                # **错掩码比没掩码更糟**。校验见 `gsdata/mask_locate.py`。
+                bake_masks = None
+                try:
+                    from ..gsdata.mask_locate import find_mask_dir, load_masks
+
+                    _names = [Path(n).name for n in (cams or []) and
+                              [c[4] for c in cams]]
+                    _mdir = find_mask_dir(
+                        ctx.job_dir, _names,
+                        explicit=str(ctx.cfg("mask_dir", "") or ""),
+                        log=ctx.info)
+                    if _mdir is not None:
+                        bake_masks = load_masks(_mdir, _names)
+                        if bake_masks is None:
+                            ctx.warn(f"掩码目录 {_mdir} 存在但加载失败，退回黑像素判据")
+                except Exception as exc:  # noqa: BLE001
+                    ctx.warn(f"掩码查找失败（{type(exc).__name__}: {exc}），"
+                             f"退回黑像素判据")
                 tex, tinfo = bake_texture_from_views(
                     uv_mesh, uv_tris, uv, images, c2ws, ks, whs, tex_size=tex_size,
                     # 拒绝采到"黑背景"的像素：`mask.mode=black` 的训练图背景是纯黑
                     # （实测 final-v1 训练图 85.4% 像素为黑），轮廓边缘的采样点会采到
                     # (0,0,0) ⇒ 纹理黑斑（实测黑色 texel 35.99%）。
-                    bake_reject_black=bool(ctx.cfg("mesh_texture_reject_black", True)))
+                    bake_reject_black=bool(ctx.cfg("mesh_texture_reject_black", True)),
+                    # 有掩码时**以掩码为准**（原理正确），黑像素判据作为兜底。
+                    masks=bake_masks)
                 ctx.info(f"   贴图覆盖 UV 图集 {tinfo['coverage']*100:.1f}%"
-                         f"，因黑背景拒绝采样 {tinfo.get('samples_rejected_black', 0):,} 次")
+                         f"，采样判据={'掩码内' if tinfo.get('mask_used') else '黑像素'}，"
+                         f"拒绝 {tinfo.get('samples_rejected_black', 0):,} 次")
 
                 o3d.io.write_triangle_mesh(str(out_dir / "model_mesh_uv.obj"), uv_mesh,
                                            write_vertex_colors=True, write_triangle_uvs=True)

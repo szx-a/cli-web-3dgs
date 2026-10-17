@@ -145,6 +145,17 @@ DEFAULTS: dict[str, Any] = {
         # 0 = 关闭"分位自适应阈值"，用固定绝对阈值（与 trainer 默认一致）。
         # 实测分位自适应会导致无界增长，已回退。
         "densify_quantile": 0.0,
+        # ---- 两项**社区标准质量杠杆**（此前都没用上）----
+        # 光栅化模式（Mip-Splatting 思路）：
+        #   "classic"（默认）—— 3DGS 原版。
+        #   "antialiased"    —— 给 2D 投影加低通滤波，抑制采样不足造成的锯齿/闪烁。
+        #     训练分辨率与展示分辨率不同、或视角密集时收益明显。
+        # 保守起见默认 classic；实测见 docs/03 G106。
+        "rasterize_mode": "classic",
+        # AbsGS：用 `means2d.absgrad`（绝对值和）做致密化判据，而不是普通梯度和。
+        # 官方 DefaultStrategy 支持；开启后必须同时给 rasterization 传 absgrad=True
+        # （代码里已连带处理，否则 meta["means2d"].absgrad 会是 None）。
+        "absgrad": False,
         "densify_grad_threshold": 2e-4,
         # ---- 致密化判据来源（本轮审计的核心修正）----
         # "grad2d"（默认）= 官方口径：`means2d.grad` 屏幕空间梯度 / 可见次数

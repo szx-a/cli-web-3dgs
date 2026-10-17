@@ -88,6 +88,13 @@ class TrainConfig:
     # grad2d 口径下的阈值（官方 grow_grad2d 的常用值）。
     # 与 grad3d 的 2e-4 不是同一个量纲，**不要混用**。
     densify_grad2d_threshold: float = 2e-4
+    # 光栅化模式（社区做法）：
+    #   "classic"（默认）—— 3DGS 原版做法。
+    #   "antialiased"    —— Mip-Splatting 的思路：给 2D 投影加低通滤波，
+    #     抑制采样率不足导致的锯齿/闪烁。训练分辨率与展示分辨率不同、
+    #     或视角密集时收益明显。
+    # 保守起见默认 classic；实测对比见 docs/03。
+    rasterize_mode: str = "classic"
     # 可选：>0 时改用"梯度的 (1-q) 分位"作阈值（仅用于实验对比）
     densify_quantile: float = 0.0
     densify_grad_max: float = 5e-3           # 自适应阈值的上限
@@ -1195,6 +1202,12 @@ def train(cfg: TrainConfig, ctx) -> dict:
             gt = gt_full
             kk = k
 
+        # 校验并归一化光栅化模式（非法值回退 classic 并告警，不静默）
+        _rm = str(getattr(cfg, 'rasterize_mode', 'classic') or 'classic').lower()
+        if _rm not in ('classic', 'antialiased'):
+            ctx.warn(f"未知的 rasterize_mode={_rm!r}，回退 classic")
+            _rm = 'classic'
+        _raster_mode = _rm
         colors, alphas, meta = rasterization(
             means=means,
             quats=quats / (quats.norm(dim=-1, keepdim=True) + 1e-8),
@@ -1210,6 +1223,9 @@ def train(cfg: TrainConfig, ctx) -> dict:
             far_plane=1e10,
             packed=False,
             render_mode="RGB",
+            # 社区做法：antialiased 给 2D 投影加低通滤波（Mip-Splatting 思路）。
+            # 非法值在下面统一校验后回退 classic。
+            rasterize_mode=_raster_mode,
             # ⚠️ AbsGS 的绝对梯度**必须同时在这里传 absgrad=True**，否则
             # `meta["means2d"].absgrad` 是 None，官方 strategy 取 `.clone()` 会失败。
             # 官方文档明确写了这一点（"the rasterization function should be called

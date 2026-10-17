@@ -215,6 +215,9 @@ scripts\gsflow_gpu.cmd run --job-id <job> --stages export --force export --set e
 | `export.mesh_texture` | false | 是否烘焙贴图（>8 万面时 xatlas 超线性变慢） |
 | `export.mesh_texture_size` | 2048 | 贴图边长 |
 | `export.mesh_texture_reject_black` | true | 拒绝采到**纯黑背景**的像素（`mask.mode=black` 的训练图背景是 0）。实测 `final-v1` 黑色 texel **35.99% → 2.30%**。阈值是 `6/255`（注意图像在烘焙里是 **0~1 尺度**，写成 `> 6` 会永远为假 —— 我踩过，见 `docs/03` G104）|
+| `export.mask_dir` | （自动） | 纹理烘焙用的**前景掩码**目录。留空=自动查找：本作业 `02_masks` → 同级作业（**必须通过内容校验**）。同级里有 40+ 个作业文件名一致但其实是不同数据集，只按文件名会选错，**错掩码比没掩码更糟**（见 `docs/03` G107）|
+| `train.rasterize_mode` | classic | 光栅化模式：`classic` / `antialiased`（Mip-Splatting 低通滤波）。**实测 `antialiased` 在训练/评估同分辨率时明显更差**（28.79 → 27.72，−1.07 dB），故默认 classic |
+| `train.absgrad` | false | AbsGS 绝对梯度致密化。4 次重复实测 +0.098 dB，95% CI [−0.114, +0.310] **不显著**，故默认关闭（见 `docs/03` G106）|
 | `export.mesh_drop_unseen` | true | **删除"从未被任何相机看到"的网格面**（泊松重建的内部垃圾几何）。实测 25.6% 的面从未被看到且散布在物体内部，它们白占 UV 空间却烘不出颜色 ⇒ **纹理黑洞**。判据是"是否被相机看到过"，**不是**"落在前景掩码内的比例"（后者在转台素材上原理错误，见 `docs/03` G101）|
 | `export.mesh_min_views` | 1 | 保留"被至少这么多视角看到"的面 |
 | `train.lambda_lpips` | 0 | 感知损失权重（自己实现的 VGG16 LPIPS，见 `docs/05` §5.3）。**默认关闭**：3 次重复实测三指标均不显著，且方差约 3 倍 |

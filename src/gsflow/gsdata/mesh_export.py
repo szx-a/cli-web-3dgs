@@ -1040,7 +1040,8 @@ def unwrap_uv(mesh, tex_size: int = 2048):
 def bake_texture_from_views(mesh, uv_tris, uv, images, c2ws, ks, src_whs,
                             tex_size: int = 2048, batch: int = 200,
                             margin_px: int = 2, max_views: int = 60,
-                            bake_reject_black: bool = True):
+                            bake_reject_black: bool = True,
+                            masks: list | None = None):
     """从多视角图像给网格烘焙一张漫反射贴图。
 
     做法（社区常用思路，不依赖可微渲染器）：
@@ -1133,7 +1134,7 @@ def bake_texture_from_views(mesh, uv_tris, uv, images, c2ws, ks, src_whs,
 
         best = np.full(len(P), -1.0)
         col = np.zeros((len(P), 3), dtype=np.float32)
-        for w2c, ctr, K, iw, ih, img in cams:
+        for ci, (w2c, ctr, K, iw, ih, img) in enumerate(cams):
             vc = P @ w2c[:3, :3].T + w2c[:3, 3]
             z = vc[:, 2]
             ok = z > 1e-6
@@ -1167,7 +1168,12 @@ def bake_texture_from_views(mesh, uv_tris, uv, images, c2ws, ks, src_whs,
             # 阈值取 6（接近纯黑）：真实物体上的暗部通常 >10，
             # 而涂黑的背景是**精确的 0**。
             # `bake_reject_black` 可关闭（若素材本身就是深色物体、怕误杀）。
-            if bake_reject_black:
+            # ⚠️ 这里的判据有优先级：**有掩码时以掩码为准**（原理正确），
+            # 无掩码时才退回"像素接近纯黑"的近似判据。
+            # 黑像素判据的缺陷：真实物体的暗部（阴影、深色石材）会被误杀；
+            # 背景不是纯黑时完全失效。掩码没有这两个问题。
+            _mask_arr = masks[ci] if (masks is not None and ci < len(masks)) else None
+            if _mask_arr is not None or bake_reject_black:
                 # ⚠️ 两个踩过的坑：
                 #   1) `vi` / `ui` 的长度是 `take.sum()`（已筛选后的），不是原数组长度。
                 #      用原索引访问会报 `IndexError: index 1259 is out of bounds`。
@@ -1178,7 +1184,27 @@ def bake_texture_from_views(mesh, uv_tris, uv, images, c2ws, ks, src_whs,
                 #      而真实物体的暗部一般 >10/255。
                 idx_take = np.nonzero(take)[0]
                 pix = img[vi, ui]                      # 长度 = len(idx_take)
-                sel = pix.max(axis=1) > (6.0 / 255.0)  # 非黑背景（0~1 尺度）
+                if _mask_arr is not None:
+                    # 掩码可能与图像尺寸不同（去畸变/缩放），先对齐
+                    _m = _mask_arr
+                    if _m.shape[0] != img.shape[0] or _m.shape[1] != img.shape[1]:
+                        from PIL import Image as _PI
+                        _m = np.asarray(
+                            _PI.fromarray((_m.astype(np.uint8) * 255)).resize(
+                                (img.shape[1], img.shape[0]), _PI.NEAREST)) > 127
+                    # ⚠️ **掩码与"非黑"必须同时成立，不能只用掩码。**
+                    #
+                    # 实测教训：只用掩码时 `final-v1` 的黑色 texel 反而从 2.30%
+                    # 涨到 **22.03%**。原因：掩码是在**去畸变之前**生成的，
+                    # 与 `04_train/data/images`（已去畸变）有几像素错位 ⇒
+                    # 被判"在物体内"的像素其实仍是黑背景 ⇒ 复制黑色 ⇒
+                    # 后续扩散把黑色铺开。
+                    #
+                    # 因此：掩码负责"位置对"（原理正确的物体/背景划分），
+                    # 非黑负责"内容对"（防止错位采样到黑背景）。两者取交集。
+                    sel = _m[vi, ui] & (pix.max(axis=1) > (6.0 / 255.0))
+                else:
+                    sel = pix.max(axis=1) > (6.0 / 255.0)  # 非黑背景（0~1 尺度）
                 if not sel.any():
                     continue
                 its = idx_take[sel]
@@ -1244,7 +1270,8 @@ def bake_texture_from_views(mesh, uv_tris, uv, images, c2ws, ks, src_whs,
     return ((np.clip(tex, 0, 1) * 255).astype(np.uint8),
             {"tex_size": tex_size, "coverage": float(filled.mean()),
              "views_used": len(cams),
-             "samples_rejected_black": int(n_rejected)})
+             "samples_rejected_black": int(n_rejected),
+             "mask_used": bool(masks is not None)})
 
 
 def render_mesh_previews(mesh, out_dir, size: int = 512, views=None) -> list[dict]:
