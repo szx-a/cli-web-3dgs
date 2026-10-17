@@ -500,13 +500,19 @@ def create_app():
                 # 「point_cloud.ply（完整 59 维）  null MB」——
                 # 用户会以为文件不存在。这里是显示 bug，不是缺文件。
                 n_gauss = None
-                size_mb = None
                 if gauss_ply is not None and gauss_ply.exists():
                     nbytes = gauss_ply.stat().st_size
                     size_mb = round(nbytes / 1024 / 1024, 2)
+                    # ⚠️ 这里不能读 `man`：manifest 是在**后面**才加载的，
+                    # 早先的版本写成 `man.get("gaussians")` ⇒ NameError 被
+                    # 外层 try/except 静默吞掉 ⇒ 高斯数永远是 None
+                    # （界面只显示 size/count 缺失，看不出是 bug）。
+                    # 改成从训练产物 metrics.json 取，语义上也更直接。
                     try:
-                        from ..gsdata.shio import read_gaussians_full  # noqa: F401
-                        n_gauss = man.get("gaussians") if isinstance(man, dict) else None
+                        _mp = root / "04_train" / "metrics.json"
+                        if _mp.exists():
+                            n_gauss = json.loads(
+                                _mp.read_text(encoding="utf-8")).get("gaussians")
                     except Exception:  # noqa: BLE001
                         n_gauss = None
                 modes["splat"].append({
@@ -518,6 +524,43 @@ def create_app():
                     "desc": "真实高斯：位置+尺度+旋转+不透明度+SH(48)，"
                             "按视线方向做 SH 着色",
                 })
+        except Exception:  # noqa: BLE001
+            pass
+
+        # ---- 服务端渲染预览（**不依赖 WebGL，保证正确**）----
+        #
+        # 为什么必须提供：WebGL 泼溅在部分环境下打不开（用户两次遇到黑屏）。
+        # 而 `preview_*.png` 是**训练用的同一个 gsplat 渲染器**在服务端出的图，
+        # 与 `preview_front.png` 左半完全一致 ⇒ 无论浏览器什么状况，
+        # 用户都能在 GUI 里看到模型的真实外观。
+        #
+        # 这也是验收判据"看到的效果应与预览图一致"的可操作形式：
+        # 不是靠 WebGL 复刻，而是直接看权威渲染结果。
+        try:
+            modes.setdefault("preview", [])
+            pv = []
+            for name in ("preview_front.png", "preview_iso.png",
+                         "preview_side.png", "preview_top.png"):
+                f = out / name
+                if f.exists():
+                    pv.append({
+                        "kind": "image", "name": name,
+                        "url": f"/api/artifacts/{job_id}/05_export/{name}",
+                        "size_mb": round(f.stat().st_size / 1024 / 1024, 2),
+                        "bytes": f.stat().st_size,
+                        "desc": "gsplat 服务端渲染（与训练同一渲染器，左=渲染 右=真值）",
+                    })
+            tex = out / "model_mesh_texture.png"
+            if tex.exists():
+                pv.append({
+                    "kind": "image", "name": "model_mesh_texture.png",
+                    "url": f"/api/artifacts/{job_id}/05_export/model_mesh_texture.png",
+                    "size_mb": round(tex.stat().st_size / 1024 / 1024, 2),
+                    "bytes": tex.stat().st_size,
+                    "desc": "烘焙贴图图集（2048²，UV 展开后）",
+                })
+            if pv:
+                modes["preview"] = pv
         except Exception:  # noqa: BLE001
             pass
 

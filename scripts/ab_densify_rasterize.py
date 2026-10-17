@@ -48,6 +48,13 @@ ARMS: dict[str, dict[str, str]] = {
     # 旧路径：3D 梯度 + 同一个数值阈值（量纲并不匹配，这是要检验的点）
     "g3d": {"train.densify_criterion": "grad3d",
             "train.densify_grad2d_threshold": "2e-4"},
+    # 阈值标定：`img3-final` 的致密化**早期激活率只有 9%**（见
+    # `diag_densify_activation.py`），低于社区典型 20~60% ⇒ 怀疑 2e-4 偏高。
+    # 1e-4 是官方默认的一半，若激活率与最终质量都上升，说明该调低。
+    "g2d1e4": {"train.densify_criterion": "grad2d",
+               "train.densify_grad2d_threshold": "1e-4"},
+    "g2d5e5": {"train.densify_criterion": "grad2d",
+               "train.densify_grad2d_threshold": "5e-5"},
     # Mip-Splatting 抗锯齿光栅化（上次测出 −1.07 dB，需复核）
     "aa": {"train.densify_criterion": "grad2d",
            "train.densify_grad2d_threshold": "2e-4",

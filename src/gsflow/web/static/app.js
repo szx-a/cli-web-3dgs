@@ -645,12 +645,16 @@ async function runMeshExport(dryRun) {
  *   textured 带贴图网格（model_mesh_textured.glb）—— 最终"实感"产物
  */
 const MODE_DEF = [
-  // 高斯泼溅放**第一位**：这是模型的真实形态。
-  // 它读 3DGS PLY 的**全部 59 维**（位置3+尺度3+旋转4+不透明度1+SH48），
-  // 用专用泼溅渲染器画"朝向各异的椭球 + alpha 合成 + 视角相关 SH 着色"，
-  // 效果与 preview_*.png（gsplat 渲染）一致。
-  // 点云模式只有 6 维（xyz+rgb）⇒ 必然稀疏、无起伏、颜色扁平 ——
-  // 这就是此前"查看器里的模型比对照图差很多"的根本原因。
+  // 服务端渲染预览放**第一位**：它不依赖 WebGL。
+  //
+  // 为什么：WebGL 泼溅在用户环境里两次打不开（黑屏），而 `preview_*.png` 是
+  // **训练用的同一个 gsplat 渲染器**在服务端出的图（左=渲染 右=真值）。
+  // 无论浏览器什么状况，用户都能在 GUI 里看到模型的真实外观 ——
+  // 这也是"看到的效果应与预览图一致"这条要求的可操作形式。
+  { key: 'preview',  title: '服务端预览',  desc: 'gsplat 渲染（不依赖 WebGL，最可靠）',
+    prefers: ['image'] },
+  // 高斯泼溅：读 3DGS PLY 的**全部 59 维**（位置3+尺度3+旋转4+不透明度1+SH48），
+  // 专用泼溅渲染器画"朝向各异的椭球 + alpha 合成 + 视角相关 SH 着色"。
   { key: 'splat',    title: '高斯泼溅',    desc: '真实高斯（59 维，含 SH 视角着色）',
     prefers: ['gauss3d', 'splat'] },
   { key: 'points',   title: '点云',        desc: '3DGS 原始形态，最忠实',
@@ -661,7 +665,7 @@ const MODE_DEF = [
     prefers: ['glb_textured'] },
 ];
 let MODELS = null;          // 当前作业的 /api/models 结果
-let ACTIVE_MODE = 'splat';  // 默认显示真实高斯（若产物里没有则自动回退）
+let ACTIVE_MODE = 'preview'; // 默认显示最可靠的视图（没有则自动回退）
 let VIEWER_READY = false;
 
 function initModelsPage() {
@@ -796,6 +800,37 @@ function renderModeFiles() {
 }
 
 async function loadModelFile(f) {
+  // ---- 图片类产物（服务端渲染预览）：不走 WebGL，直接 <img> 显示 ----
+  //
+  // 这条路径是 WebGL 出问题时的**兜底**：`preview_*.png` 由训练用的同一个
+  // gsplat 渲染器在服务端生成，无论浏览器/驱动什么状态都能看到真实外观。
+  if (f.kind === 'image' || /\.(png|jpe?g|webp)$/i.test(String(f.url || ''))) {
+    const img = $('m-image');
+    const cv = $('m-canvas');
+    if (img) {
+      img.style.display = 'block';
+      img.src = f.url;
+      img.onerror = () => {
+        $('m-overlay').classList.remove('hide');
+        $('m-overlay').style.whiteSpace = 'pre-line';
+        $('m-overlay').textContent = '图片加载失败：' + f.url;
+      };
+      img.onload = () => {
+        $('m-overlay').classList.add('hide');
+        $('m-status').textContent = f.name + ' · 服务端渲染 '
+          + img.naturalWidth + '×' + img.naturalHeight
+          + (img.naturalWidth >= 900 ? '（左=渲染 右=真值对比）' : '');
+      };
+    }
+    if (cv) cv.style.display = 'none';
+    return;
+  }
+  // 3D 类产物：确保 canvas 可见、图片隐藏
+  const img0 = $('m-image');
+  if (img0) { img0.style.display = 'none'; img0.removeAttribute('src'); }
+  const cv0 = $('m-canvas');
+  if (cv0) cv0.style.display = 'block';
+
   $('m-overlay').classList.remove('hide');
   $('m-overlay').textContent = '载入 ' + f.name + ' …';
   try {

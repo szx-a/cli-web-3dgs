@@ -191,36 +191,46 @@ window.GsSplatRenderer = (function () {
              shDegree: g.shDegree | 0, bounds, hasSH: !!sh };
   }
 
-  /** 稳健取景：中位数中心 + 95 分位距离（避免离群点把相机拉太远）。 */
+  /** 取景包围球：用**完整包围盒**。
+   *
+   * ## 为什么曾经改错（重要教训）
+   *
+   * 我一度把它改成"中位数中心 + 95 分位距离"，理由是"包围盒被 0.61% 的离群点
+   * 撑大了 5.65 倍 ⇒ 相机被拉太远、模型显得小"。**那个判断是错的**：
+   *
+   *     实测 img3-final（94,598 个高斯）
+   *       包围盒半径（真实尺寸）   4.680
+   *       距中位数 95 分位         0.794   ← 我当时用了这个
+   *       距中位数 99.5 分位       1.496
+   *       距中位数 100%            3.549
+   *
+   * 素材是一座**牌坊**：质量集中在中央的板面与门洞，**屋檐/翼角虽然稀疏，
+   * 却是真实结构**。按分位数裁，会先把真实远处结构当噪点裁掉
+   * ⇒ 半径 0.79 ⇒ 相机距离 2.2，而物体跨 6.4×4.7×5.0 ⇒
+   * **相机钻进模型内部**，网格看起来整片深色/全黑（用户看到的"网络变深色"）。
+   *
+   * 分轴分位数裁剪同样救不了（0.5~99.5% 只剩 1.31）。
+   *
+   * ⇒ 回到完整包围盒。"离群点"的正确判据是**几何上不可能属于物体**
+   * （例如与主簇距离超过物体尺度数倍），而不是"数量少"。
+   * 导出流程里的 `to_largest_component` / `drop_unseen_faces` 已清掉大部分垃圾。
+   */
   function robustBounds(center, n) {
-    const cx = new Float64Array(n), cy = new Float64Array(n), cz = new Float64Array(n);
+    let mnx = Infinity, mny = Infinity, mnz = Infinity;
+    let mxx = -Infinity, mxy = -Infinity, mxz = -Infinity;
     for (let i = 0; i < n; i++) {
-      cx[i] = center[i * 3]; cy[i] = center[i * 3 + 1]; cz[i] = center[i * 3 + 2];
+      const x = center[i * 3], y = center[i * 3 + 1], z = center[i * 3 + 2];
+      if (x < mnx) mnx = x; if (x > mxx) mxx = x;
+      if (y < mny) mny = y; if (y > mxy) mxy = y;
+      if (z < mnz) mnz = z; if (z > mxz) mxz = z;
     }
-    const med = (arr) => {
-      const a = Float64Array.from(arr).sort();
-      const k = a.length >> 1;
-      return a.length % 2 ? a[k] : 0.5 * (a[k - 1] + a[k]);
+    const diag = Math.hypot(mxx - mnx, mxy - mny, mxz - mnz);
+    return {
+      center: [(mnx + mxx) / 2, (mny + mxy) / 2, (mnz + mxz) / 2],
+      radius: Math.max(1e-6, 0.5 * diag),
+      bboxRadius: Math.max(1e-6, 0.5 * diag),
+      robust: false,
     };
-    const mc = [med(cx), med(cy), med(cz)];
-    const dist = new Float64Array(n);
-    for (let i = 0; i < n; i++) {
-      dist[i] = Math.hypot(cx[i] - mc[0], cy[i] - mc[1], cz[i] - mc[2]);
-    }
-    const sorted = Float64Array.from(dist).sort();
-    const q95 = sorted[Math.min(n - 1, Math.max(0, Math.floor(0.95 * (n - 1))))];
-    let radius = q95;
-    if (!(radius > 1e-6)) {
-      let mnx = Infinity, mny = Infinity, mnz = Infinity;
-      let mxx = -Infinity, mxy = -Infinity, mxz = -Infinity;
-      for (let i = 0; i < n; i++) {
-        if (cx[i] < mnx) mnx = cx[i]; if (cx[i] > mxx) mxx = cx[i];
-        if (cy[i] < mny) mny = cy[i]; if (cy[i] > mxy) mxy = cy[i];
-        if (cz[i] < mnz) mnz = cz[i]; if (cz[i] > mxz) mxz = cz[i];
-      }
-      radius = Math.max(1e-6, 0.5 * Math.hypot(mxx - mnx, mxy - mny, mxz - mnz));
-    }
-    return { center: mc, radius, robust: true, q95 };
   }
 
   /** 3DGS 的 SH 基（与官方 `sh_utils.py::eval_sh` 的常数逐项一致）。 */

@@ -691,13 +691,7 @@ function makeMesh(R, model, wireframe) {  const { gl } = R;
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, L, gl.STATIC_DRAW);
     lineIndexCount = L.length;
   }
-  // 取景：**中位数中心 + 95 分位距离**（稳健），而不是包围盒
-  //
-  // ⚠️ 为什么不用包围盒：训练出的点云/高斯常有**远处离群点**。
-  // 实测 img3-crop：包围盒半径 **4.76**，而 95% 的点都在距中位数中心 **0.84** 内
-  // —— 只有 **0.61% 的离群点**就把半径撑大了 **5.65 倍**。
-  // 用包围盒取景会让相机拉太远，物体在画面里变成一小块，
-  // 用户会以为"查看器里的模型比 preview 差很多"，其实只是取景错了。
+  // 取景：用**完整包围盒**（见下方"为什么不用分位数"）。
   let mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
   for (let i = 0; i < model.position.length; i += 3) {
     for (let k = 0; k < 3; k++) {
@@ -709,34 +703,19 @@ function makeMesh(R, model, wireframe) {  const { gl } = R;
   const bboxCenter = [(mn[0]+mx[0])/2, (mn[1]+mx[1])/2, (mn[2]+mx[2])/2];
   const bboxRadius = Math.max(1e-6, 0.5 * Math.hypot(mx[0]-mn[0], mx[1]-mn[1], mx[2]-mn[2]));
 
-  // 稳健中心/半径（点数太多时抽样，保证打开大模型不卡）
-  const nPts = model.position.length / 3;
-  const stride = Math.max(1, Math.floor(nPts / 20000));
-  const subN = Math.ceil(nPts / stride);
-  const px = new Float64Array(subN), py = new Float64Array(subN), pz = new Float64Array(subN);
-  let w = 0;
-  for (let i = 0; i < nPts; i += stride) {
-    px[w] = model.position[i * 3];
-    py[w] = model.position[i * 3 + 1];
-    pz[w] = model.position[i * 3 + 2];
-    w++;
-  }
-  const medOf = (arr, len) => {
-    const a = Array.prototype.slice.call(arr, 0, len).sort((u, v) => u - v);
-    const k = len >> 1;
-    return len % 2 ? a[k] : 0.5 * (a[k - 1] + a[k]);
-  };
-  let center = bboxCenter, radius = bboxRadius, robust = false;
-  if (w >= 16) {
-    const mc = [medOf(px, w), medOf(py, w), medOf(pz, w)];
-    const ds = new Float64Array(w);
-    for (let i = 0; i < w; i++) ds[i] = Math.hypot(px[i]-mc[0], py[i]-mc[1], pz[i]-mc[2]);
-    ds.sort();
-    const q95 = ds[Math.min(w - 1, Math.floor(0.95 * (w - 1)))];
-    if (q95 > 1e-6) {
-      center = mc; radius = q95; robust = true;
-    }
-  }
+  // ⚠️ 这里**曾经**改用"中位数中心 + 95 分位距离"，理由是"包围盒被 0.61% 的
+  // 离群点撑大 5.65 倍、相机会被拉太远"。**那个判断是错的**：
+  //
+  //     实测 img3-final（94,598 个高斯 / 牌坊素材）
+  //       包围盒半径（真实尺寸） 4.680      ← 正确
+  //       距中位数 95 分位       0.794      ← 当时用了这个
+  //
+  // 素材是牌坊：质量集中在中央板面，**屋檐翼角稀疏但真实**。按分位数裁
+  // 会先把真实远处结构裁掉 ⇒ 半径 0.79 ⇒ 相机距离 2.2 ⇒ **钻进模型内部**，
+  // 整片深色/全黑（用户报的"网络变深色"就是这个）。分轴分位数裁剪同样不行。
+  //
+  // "离群点"的正确判据是**几何上不可能属于物体**，不是"数量少"。
+  const center = bboxCenter, radius = bboxRadius, robust = false;
   return { vbuf, cbuf, ubuf, nbuf, ibuf, lineIbuf, indexCount, lineIndexCount, idxType,
            count: model.position.length / 3, mode: model.mode,
            center, radius, bboxCenter, bboxRadius, robust,

@@ -340,6 +340,9 @@
         <h2>三维视图 <span class="muted" id="m-status"></span></h2>
         <div id="m-canvas-wrap">
           <canvas id="m-canvas"></canvas>
+          <!-- 服务端渲染预览图：不依赖 WebGL，保证能看到模型的真实外观。
+               与 canvas 叠在同一区域，用 display 切换（不必维护两套布局）。 -->
+          <img id="m-image" alt="服务端渲染预览" style="display:none">
           <div id="m-overlay" class="muted">选择一个模型…</div>
         </div>
         <p class="hint">左键拖动旋转 · 滚轮缩放 · 右键（或 Shift+左键）平移。

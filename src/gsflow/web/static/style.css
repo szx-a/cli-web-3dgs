@@ -164,6 +164,12 @@ ul { padding-left: 20px; }
 }
 #m-canvas { display: block; width: 100%; height: 100%; cursor: grab; }
 #m-canvas:active { cursor: grabbing; }
+/* 服务端渲染预览图：与 canvas 同区域叠放，靠 display 切换。
+   `object-fit: contain` 保证 1024x512 的预览图不被拉伸变形。 */
+#m-image {
+  display: block; width: 100%; height: 100%; object-fit: contain;
+  background: #05080b;
+}
 #m-overlay {
   position: absolute; inset: 0; display: flex; align-items: center;
   justify-content: center; pointer-events: none; font-size: 13px;

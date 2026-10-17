@@ -242,9 +242,25 @@ def test_models_endpoint_classifies_three_modes(client, workdir: Path, monkeypat
         names = {i["name"] for i in a["modes"]["textured"]}
         assert "model_mesh_textured.glb" in names
         # 列表里绝不能出现查看器不支持的扩展名
+        #
+        # ⚠️ 例外：`preview` 模式放的是**服务端渲染的 PNG**（preview_*.png
+        # 与贴图图集），前端用 `<img>` 显示，不经过 WebGL 查看器，
+        # 所以对图片条目允许 .png/.jpg。
         for mode, items in a["modes"].items():
             for it in items:
-                assert it["name"].lower().endswith((".glb", ".ply")), (mode, it)
+                if mode == "preview" or it.get("kind") == "image":
+                    assert it["name"].lower().endswith(
+                        (".png", ".jpg", ".jpeg", ".webp")), (mode, it)
+                else:
+                    assert it["name"].lower().endswith((".glb", ".ply")), (mode, it)
+
+        # 服务端渲染预览：fixture 里只有贴图图集，没有 preview_*.png，
+        # 所以这里只断言"凡是进 preview 模式的都必须是图片"，
+        # 以及图集确实被收录（真作业里还会包含 preview_front/iso/side/top）。
+        assert all(i.get("kind") == "image" for i in a["modes"]["preview"]), \
+            a["modes"].get("preview")
+        pv = {i["name"] for i in a["modes"]["preview"]}
+        assert "model_mesh_texture.png" in pv, pv
 
         b = c.get("/api/models/jobB").json()
         assert b["manifest"] is False
