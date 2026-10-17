@@ -155,7 +155,8 @@ scripts\gsflow.cmd export <job_id>
 | `train.resolution` | 1600 | 长边；OOM 会自动按 1600→1400→1200→1000→800→600 降档重试 |
 | `train.cap_max` | 600000 | 高斯数量上限（显存守护），8GB 建议 ≤120 万 |
 | `train.densify_until` | **4000** | 密度控制窗口上界。官方默认 15000；实测改 4000 后高斯数**少 68%** 且不再过训练退化（PSNR 基本持平） |
-| `train.mask_loss_until` | **1.0** | 掩码内损失生效的迭代占比。**1.0=全程约束在掩码内**，模型轮廓更干净、网格更准 |
+| `train.mask_loss_until` | **1.0** | 掩码损失生效的迭代占比。**1.0=全程约束在掩码内**，模型轮廓更干净、网格更准 |
+| `train.mask_loss_mode` | composite | `composite`（掩码外把 **GT 合成的背景色**，损失在全图算）/ `inside`（只在掩码内取均值，旧行为）。⚠️ **2026-10 修了一个顺序 bug**：`l1` 曾在"替换 GT"之前算好，导致 `composite` **对 L1 完全无效**（只影响 SSIM），背景被当主体拟合。修复后掩码外渲染亮度 0.904 → **0.005**。**连带后果：全图 PSNR/SSIM 不再是画质指标**（背景被有意压黑），训练器改为同时输出 **`psnr_masked` / `ssim_masked`**（只统计掩码内）。项目里 27~31 dB 那类**历史全图 PSNR 与新指标不可直接比较**（`docs/03` G123）|
 | `train.sh_degree` | 3 | 球谐阶数，降低可省显存 |
 | `train.eval` | true | 是否留出评估集算 PSNR |
 

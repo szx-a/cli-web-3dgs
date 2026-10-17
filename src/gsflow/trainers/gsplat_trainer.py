@@ -1606,12 +1606,15 @@ def train(cfg: TrainConfig, ctx) -> dict:
             )
             cur_psnr = float(eval_res.get("psnr", 0.0))
             _cur_masked = eval_res.get("psnr_masked")
+            _cur_ssim_m = eval_res.get("ssim_masked")
             cur_ssim = float(eval_res.get("ssim", 0.0))
             cur_lpips = eval_res.get("lpips")
             psnr_log.append({"step": step, "psnr": round(cur_psnr, 3),
                          "psnr_masked": (round(float(_cur_masked), 3)
                                           if _cur_masked is not None else None),
                              "ssim": round(cur_ssim, 4),
+                             "ssim_masked": (round(float(_cur_ssim_m), 4)
+                                              if _cur_ssim_m is not None else None),
                              "lpips": (round(float(cur_lpips), 4)
                                        if cur_lpips is not None else None),
                              "views": len(ev_idx_now), "final": is_final})
@@ -1873,6 +1876,7 @@ def train(cfg: TrainConfig, ctx) -> dict:
         # 多指标评估（用户方案第 6 项）：PSNR 高不等于视觉好，
         # 同时记录 SSIM / LPIPS，便于判断"哪个检查点真的更好"。
         "ssim": (psnr_log[-1].get("ssim") if psnr_log else None),
+        "ssim_masked": (psnr_log[-1].get("ssim_masked") if psnr_log else None),
         "lpips": (psnr_log[-1].get("lpips") if psnr_log else None),
         "psnr_curve": psnr_log,
         "loss_curve": loss_log[-200:],
@@ -2063,6 +2067,7 @@ def evaluate(rasterization, means, quats, scales, opacities, shs, imgs, masks, k
         return {"psnr": 0.0, "ssim": 0.0, "lpips": None, "views": 0}
     psnrs: list[float] = []
     psnrs_in: list[float] = []   # 掩码内 PSNR（物体区域画质）
+    ssims_in: list[float] = []   # 掩码内 SSIM（同上）
     ssims: list[float] = []
     lpipss: list[float] = []
     lp = None
@@ -2115,6 +2120,20 @@ def evaluate(rasterization, means, quats, scales, opacities, shs, imgs, masks, k
             try:
                 s = ssim_simple(render.permute(2, 0, 1)[None], gt.permute(2, 0, 1)[None])
                 ssims.append(float(s))
+                # 掩码内 SSIM：掩码生效后全图 SSIM 会被"该黑的背景"主导
+                # （实测 0.952 → 0.368，而目视质量明显更好）⇒ 物体区域要看这个。
+                if masks is not None and i < len(masks):
+                    _m2 = masks[i]
+                    if _m2.shape[0] != gt.shape[0]:
+                        _m2 = torch.nn.functional.interpolate(
+                            _m2[None, None].float(), size=gt.shape[:2], mode="nearest"
+                        )[0, 0] > 0.5
+                    _m2 = _m2.to(device)
+                    if bool(_m2.any()):
+                        s_in = ssim_simple(
+                            (render * _m2[..., None]).permute(2, 0, 1)[None],
+                            (gt * _m2[..., None]).permute(2, 0, 1)[None])
+                        ssims_in.append(float(s_in))
             except Exception:  # noqa: BLE001
                 pass
             if lp is not None:
@@ -2131,6 +2150,7 @@ def evaluate(rasterization, means, quats, scales, opacities, shs, imgs, masks, k
         # 物体区域画质要看这个。
         "psnr_masked": (sum(psnrs_in) / len(psnrs_in)) if psnrs_in else None,
         "ssim": (sum(ssims) / len(ssims)) if ssims else 0.0,
+        "ssim_masked": (sum(ssims_in) / len(ssims_in)) if ssims_in else None,
         "lpips": (sum(lpipss) / len(lpipss)) if lpipss else None,
         "views": len(psnrs),
     }

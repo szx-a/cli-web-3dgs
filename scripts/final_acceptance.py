@@ -163,14 +163,44 @@ def main() -> int:
     mp = train / "metrics.json"
     if mp.exists():
         m = json.loads(mp.read_text(encoding="utf-8"))
+        # ---- 用**掩码内**指标，而不是全图 ----
+        #
+        # 为什么必须改（docs/03 G123）：掩码损失修好之后，训练会把**掩码外压成背景色**，
+        # 于是全图 PSNR/SSIM 主要反映"背景有多黑"而不再是物体画质：
+        #
+        #     同一模型：全图 PSNR 3.41 / SSIM 0.36，
+        #               掩码内 PSNR 19.51 / SSIM 0.939
+        #
+        # 如果还拿全图阈值（≥27 dB）判，每个掩码正常的作业都会 FAIL —— 指标与目标脱节。
+        psnr_use = m.get("psnr_masked", m.get("psnr"))
+        ssim_use = m.get("ssim_masked", m.get("ssim"))
+        masked_ok = m.get("psnr_masked") is not None
         if baseline:
-            # 基线作业只记录数值，不套质量阈值（数据/预算不同，无可比性）
-            print(f"  记录：PSNR {m.get('psnr'):.2f} dB　SSIM {m.get('ssim'):.4f}"
+            print(f"  记录：PSNR {psnr_use:.2f} dB　SSIM {ssim_use:.4f}"
                   f"　高斯 {m.get('gaussians'):,}")
         else:
-            chk(float(m.get("psnr", 0)) >= 27.0, "PSNR >= 27 dB（社区 27~31）",
-                f"{m.get('psnr'):.2f} dB")
-            chk(float(m.get("ssim", 0)) >= 0.93, "SSIM >= 0.93", f"{m.get('ssim'):.4f}")
+            tag = "（掩码内）" if masked_ok else "（全图：该作业没有掩码指标，"
+            tag += "" if masked_ok else "与掩码内数值不可比）"
+            # ⚠️ 阈值**口径变化**：全图 PSNR（旧口径，社区 27~31）与
+            # **掩码内 PSNR**（新口径）不是同一个量，不能沿用 27 dB。
+            # 掩码内只统计物体像素、且掩码外被压成背景色，数值天然更低。
+            # 首次实测（img3-final 30k，掩码生效）：掩码内 PSNR 20.47 / SSIM 0.946。
+            # ⇒ 暂定阈值 18 dB 作为**回归守门**（掉下去说明变差），
+            #    不是社区达标线。真正的质量判据用掩码内 SSIM（≥0.93）。
+            thr = 18.0 if masked_ok else 27.0
+            chk(float(psnr_use or 0) >= thr,
+                f"PSNR >= {thr:.0f} dB{tag}"
+                + ("（**阈值待标定**：首次实测 20.47）" if masked_ok
+                   else "（社区 27~31）"),
+                f"{psnr_use:.2f} dB" if psnr_use else "缺失")
+            chk(float(ssim_use or 0) >= 0.93, f"SSIM >= 0.93{tag}",
+                f"{ssim_use:.4f}" if ssim_use else "缺失")
+        # 一致性自查：掩码生效时掩码内 PSNR 必须显著高于全图 PSNR。
+        # 两者接近 ⇒ 掩码又没生效（G123 的症状），必须报出来而不是静默通过。
+        if masked_ok and m.get("psnr") is not None:
+            gap = float(m["psnr_masked"]) - float(m["psnr"])
+            chk(gap > 3.0, "掩码内 PSNR 明显高于全图（说明掩码真的生效）",
+                f"差 {gap:.2f} dB")
         chk(int(m.get("gaussians", 0)) > 50_000, "高斯数 > 50k",
             f"{m.get('gaussians'):,}")
     else:
@@ -238,27 +268,36 @@ def main() -> int:
     # 这里的无头探针会加载**真实 viewer.js/splat.js**，用 stub GL 跑一遍，
     # 要求 `load()` 返回 `mode=gauss3d`、`hasSH=true`、`shDegree=3`。
     # 任何一环断掉（脚本缺失、解析没认出 f_dc_*、泼溅初始化抛错）都会在这里暴露。
-    ply3d = None
-    for cand in sorted((exp.parent / "04_train" / "point_cloud").glob("*/point_cloud.ply")):
-        ply3d = cand
-    if ply3d is not None:
+    # 高斯显示已交给**社区参考实现**（refviewer.js + vendored
+    # gaussian-splats-3d），iewer.js 对 3DGS PLY 会**明确拒绝**。
+    # 所以这里不再要求 viewer.js 能画高斯，而是分别验证两半：
+    #   a) WebGL1 查看器仍能正常画网格 glb（没被高斯改动带坏）；
+    #   b) 参考渲染器所需的资源与取景参数都在（vendor + scene_info）。
+    mesh_glb = exp / "model_mesh.glb"
+    if mesh_glb.exists():
         try:
             rp = subprocess.run(
-                ["node", str(ROOT / "scripts" / "probe_viewer_runtime.mjs"), str(ply3d)],
+                ["node", str(ROOT / "scripts" / "probe_viewer_runtime.mjs"), str(mesh_glb)],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                 cwd=str(ROOT))
             out = (rp.stdout or "") + (rp.stderr or "")
             flat = out.replace(" ", "").lower()
-            ok_path = ('"mode":"gauss3d"' in flat and '"hassh":true' in flat
-                       and '"shdegree":3' in flat)
-            chk(ok_path, "查看器无头探针走通泼溅路径（59 维 + SH 3 阶）",
-                "" if ok_path else out[-400:])
+            ok_mesh = ("'mode':4" in flat or '"mode":4' in flat)
+            chk(ok_mesh, "WebGL1 查看器仍能画网格 glb（未被高斯改动带坏）",
+                "" if ok_mesh else out[-400:])
         except FileNotFoundError:
-            chk(False, "查看器无头探针", "找不到 node（无法验证泼溅链路）")
-        except Exception as exc:  # noqa: BLE001
-            chk(False, "查看器无头探针", f"{type(exc).__name__}: {exc}")
+            chk(False, "WebGL1 查看器探针", "找不到 node")
     else:
-        chk(False, "查看器无头探针", "没有训练产物 point_cloud.ply")
+        chk(False, "WebGL1 查看器探针", "没有 model_mesh.glb")
+
+    # 参考渲染器的资产：vendored 库 + three.js 必须存在（否则高斯看不了）
+    static = ROOT / "src" / "gsflow" / "web" / "static"
+    need = [static / "refviewer.js",
+            static / "vendor" / "three.module.js",
+            static / "vendor" / "gaussian-splats-3d.module.js"]
+    missing = [p.name for p in need if not p.exists()]
+    chk(not missing, "参考渲染器资产齐全（refviewer + three + gaussian-splats-3d）",
+        "" if not missing else f"缺 {missing}")
 
     # ---------- 4. 网格质量 ----------
     print("\n⑥ 网格质量")
