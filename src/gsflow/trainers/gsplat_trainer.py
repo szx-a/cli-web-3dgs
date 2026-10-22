@@ -238,6 +238,7 @@ class TrainConfig:
     scale_reg: float = 0.0
     max_scale_ratio: float = 0.05   # 每步尺度上限（× scene_scale），0=关闭
     bg_alpha_reg: float = 0.1       # 掩码外 alpha 正则权重（0=关闭）
+    max_aspect: float = 50.0        # 长细比上限（0=关闭）
     # 训练结束时的最小不透明度清理（Faster-GS: MIN_OPACITY_AFTER_TRAINING = 1/255）。
     # 不透明度低于该值的高斯在收尾时直接删掉；0 表示不清理。
     min_opacity_final: float = 0.0
@@ -1562,6 +1563,19 @@ def train(cfg: TrainConfig, ctx) -> dict:
         #
         # 这里按"场景尺度的比例"钳制 log 尺度（与 `prune_scale3d` 同一个量纲），
         # 每步生效、不依赖致密化窗口。默认 0 = 不改变既有行为。
+        # ---- 每步长细比上限（max_aspect，默认 0 = 关闭）----
+        #
+        # max_scale_ratio 只限最长轴；最短轴仍可以趋近 0。
+        # 实测：最细一个高斯 scale=[0.0, 0.0064, 0.0177]、opacity=1.0、
+        # aniso=**7509** —— 一个零厚度、不透明的薄片，从侧面看就是一道丝。
+        # 这里把 smin 抬到 smax/max_aspect（在 log 域里 clamp）。
+        if getattr(cfg, "max_aspect", 0.0) and float(cfg.max_aspect) > 1.0:
+            with torch.no_grad():
+                _s = params["scales"].data
+                _smax = _s.max(dim=1, keepdim=True).values
+                _floor = _smax - float(np.log(float(cfg.max_aspect)))
+                _s.clamp_(min=_floor)
+
         if getattr(cfg, "max_scale_ratio", 0.0) and float(cfg.max_scale_ratio) > 0:
             with torch.no_grad():
                 _cap = float(np.log(float(cfg.max_scale_ratio) * scene_scale))

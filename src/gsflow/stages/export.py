@@ -1152,6 +1152,26 @@ class ExportStage(Stage):
             else:
                 ctx.info(f"   UV 展开完成：{uw_sec:.1f}s")
                 images, c2ws, ks, whs = self._load_bake_inputs(ctx, cams)
+                # ---- 按源图信息量**自动限幅**图集尺寸（2026-10）----
+                #
+                # 实测：img3-final 的训练图只有 **457×289**，而图集默认 2048² ——
+                # 平均每个源像素被放大成 **约 16 个 texel**。图集再大也只是插值放大，
+                # 只会让烘焙更慢、产物更大、看起来更"糊斑"（用户说的"脏"主要就是这个）。
+                # 取 `2×源图长边` 并向上取到 2 的幂：457 → **1024**。
+                try:
+                    import numpy as _np
+
+                    if whs:
+                        _long = float(_np.asarray(whs, dtype=float).max())
+                        _want = 1
+                        while _want < max(256, int(_long * 2)):
+                            _want *= 2
+                        if _want < tex_size:
+                            ctx.info(f"   贴图尺寸按源图信息量限幅：{tex_size} → {_want}"
+                                     f"（源图长边 {int(_long)}；再大只是插值放大）")
+                            tex_size = _want
+                except Exception:  # noqa: BLE001
+                    pass
                 # ---- 找到"与训练图同名"的前景掩码，用于**掩码内采样** ----
                 #
                 # 这是原理正确的做法：用前景掩码判定采样点是否落在物体上。

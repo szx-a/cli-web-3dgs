@@ -286,6 +286,12 @@ DEFAULTS: dict[str, Any] = {
         # "别在那儿画东西"。实测掩码外 alpha 均值 0.70（应≈0）——
         # 模型外面裹着一层不透明黑几何，转视角就是"背面混乱"。
         "bg_alpha_reg": 0.1,
+        # 长细比上限（0=关闭）。
+        # max_scale_ratio 只限了**最长轴**，没限**最短轴**：实测仍有
+        # scale=[0.0, 0.0064, 0.0177]、opacity=1.0、aniso=**7509** 的
+        # "零厚度薄片" —— 转到侧面就是一道丝。
+        # 这里把 smin 抬到 smax/max_aspect（log 域）。
+        "max_aspect": 50.0,
         # 收尾清理：训练结束时删掉不透明度低于此值的高斯。
         # Faster-GS 用 MIN_OPACITY_AFTER_TRAINING = 1/255 ≈ 0.0039。
         "min_opacity_final": 0.0,

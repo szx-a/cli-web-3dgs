@@ -88,6 +88,9 @@ ARMS: dict[str, dict[str, str]] = {
     "clamp05": {"train.max_scale_ratio": "0.05"},
     # 掩码外 alpha 正则：直接惩罚"在物体外面画东西"，针对黑壳
     "bgreg": {"train.bg_alpha_reg": "0.1"},
+    # 长细比上限：直接针对“零厚度薄片”（0.0 就是当前默认）
+    "asp50": {"train.max_aspect": "50"},
+    "asp20": {"train.max_aspect": "20"},
 }
 BASELINE = "g2d"
 

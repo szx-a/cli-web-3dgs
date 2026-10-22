@@ -30,7 +30,7 @@ KEYS = [
     ("export", "mesh_texture"),
     ("train", "iterations"), ("train", "resolution"), ("train", "cap_max"),
     ("train", "densify_until"), ("train", "max_scale_ratio"),
-    ("train", "bg_alpha_reg"),
+    ("train", "bg_alpha_reg"), ("train", "max_aspect"),
     ("train", "lambda_lpips"),
     ("train", "lambda_depth_distortion"),
 ]
