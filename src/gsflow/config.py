@@ -300,6 +300,12 @@ DEFAULTS: dict[str, Any] = {
         # 官方 SH 学习率 = 2.5e-3 / 20 = **1.25e-4**；我们用 2.5e-3（大 20 倍）
         # ⇒ 颜色按视角过拟合，也是各类正则/感知损失测不出效果的可疑来源。
         "lr_shs": 0.0025,
+        # ==== 消除“容量冻结 vs 重置”冲突（2026-10-22）====
+        # 官方 reset_every=3000 与 refine_stop_iter=15000 是联动的：重置剪掉后靠 densify 补回。
+        # 我们密度窗口只到 4000，重置就变成“净删 36% 容量”。
+        # 开启后：发现重置间隔 > densify_until/2 时，自动把窗口
+        # 延长到 min(iterations*0.6, reset*3)，并记一条日志。
+        "auto_extend_densify_when_reset": True,
         # 收尾清理：训练结束时删掉不透明度低于此值的高斯。
         # Faster-GS 用 MIN_OPACITY_AFTER_TRAINING = 1/255 ≈ 0.0039。
         "min_opacity_final": 0.0,

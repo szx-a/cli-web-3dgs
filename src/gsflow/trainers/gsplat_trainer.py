@@ -241,6 +241,7 @@ class TrainConfig:
     max_aspect: float = 50.0        # 长细比上限（0=关闭）
     lr_means_scene_scale: bool = False   # means 学习率乘以 scene_scale（官方做法）
     lr_shs: float = 0.0025               # SH 学习率（官方 = 1.25e-4）
+    auto_extend_densify_when_reset: bool = True   # 重置与密度窗口联动
     # 训练结束时的最小不透明度清理（Faster-GS: MIN_OPACITY_AFTER_TRAINING = 1/255）。
     # 不透明度低于该值的高斯在收尾时直接删掉；0 表示不清理。
     min_opacity_final: float = 0.0
@@ -546,6 +547,38 @@ def two_dgs_regularizers(cfg, means, quats, scales, opacities, shs, kk, vm,
             out["normal"] = None
             out["normal_error"] = f"{type(exc).__name__}: {exc}"
     return out
+
+
+def effective_densify_until(iterations: int, densify_until: int,
+                            reset_interval: int, auto_extend: bool = True) -> int:
+    """把「不透明度重置」与「密度控制窗口」联动起来，返回**实际生效**的窗口上界。
+
+    ## 为什么要联动（实测，2026-10-22）
+
+    官方 3DGS / gsplat 的 `reset_every=3000` 与 `refine_stop_iter=15000` 是**一套机制**：
+    重置把不透明度打回低位并裁掉一批高斯，**后续 densify 再把容量补回**。
+
+    我们的 `densify_until=4000`。4000 之后一旦开启重置，就变成**只删不补**：
+
+        | 配置 | 掩码内 SSIM | 高斯数 |
+        |---|---|---|
+        | 基线（无重置）| **0.9478** | 152,578 |
+        | 重置 3000（窗口 4000，坏）| **0.9429** | **97,594（−36%）** |
+        | 重置 3000（自动延到 9000）| **0.9456** | 207,384 |
+
+    ⇒ 联动能消除"净删容量"，但重置本身在这份数据上仍不优于基线，所以默认仍关闭。
+
+    规则：`reset_interval > 0` 且 `auto_extend` 时，
+    `until = max(until, min(iterations*0.6, reset_interval*3))`；否则原样返回。
+
+    ⚠️ 顺序很重要（单测抓到过一次）：必须先取 `min(cap, need)` 再与外层 `max`，
+    否则"窗口本来就比 cap 长"时会被**缩短** —— 那等于主动减容量，与初衷相反。
+    """
+    if not auto_extend or reset_interval <= 0:
+        return int(densify_until)
+    need = int(reset_interval) * 3
+    cap = int(max(iterations, 1) * 0.6)
+    return int(max(int(densify_until), min(cap, need)))
 
 
 def lr_at(step_idx: int, peak: float, min_ratio: float,
@@ -975,6 +1008,23 @@ def train(cfg: TrainConfig, ctx) -> dict:
            "opacities": float(getattr(cfg, "lr_opacities", 0.025) or 0.025),
            "shs": _lr_shs}
     _gamma = 0.01 ** (1 / max(cfg.iterations, 1))   # 旧策略（纯指数）保留，供 A/B 复现
+
+    # ---- 消除「容量冻结 vs 重置」冲突：重置开启时自动延长密度窗口 ----
+    #
+    # 官方 `reset_every=3000` 与 `refine_stop_iter=15000` 是**联动**的：
+    # 重置把不透明度打回低位并裁掉一批高斯，后续 densify 再把容量补回。
+    # 我们 `densify_until=4000` 时，4000 之后的每次重置都是**净删容量**
+    # （实测 152,578 → 97,594，SSIM 0.9478 → 0.9429）。
+    # 用户要求"有冲突就改"：这里把两个参数联动起来。逻辑抽成纯函数便于单测。
+    _want = effective_densify_until(
+        int(cfg.iterations), int(cfg.densify_until),
+        int(getattr(cfg, "opacity_reset_interval", 0) or 0),
+        bool(getattr(cfg, "auto_extend_densify_when_reset", True)))
+    if _want > int(cfg.densify_until):
+        ctx.warn(
+            f"重置间隔 {cfg.opacity_reset_interval} 与密度窗口 {cfg.densify_until} "
+            f"不匹配（重置后无法补回容量）⇒ 自动把窗口延长到 **{_want}**")
+        cfg.densify_until = _want
 
     # ---- 学习率调度：线性预热 + 余弦退火（用户方案第 1 项）----
     # 曲线本体是模块级的 `lr_at()`（便于用解析端点单测）；
@@ -1576,7 +1626,20 @@ def train(cfg: TrainConfig, ctx) -> dict:
         # 实测：最细一个高斯 scale=[0.0, 0.0064, 0.0177]、opacity=1.0、
         # aniso=**7509** —— 一个零厚度、不透明的薄片，从侧面看就是一道丝。
         # 这里把 smin 抬到 smax/max_aspect（在 log 域里 clamp）。
-        if getattr(cfg, "max_aspect", 0.0) and float(cfg.max_aspect) > 1.0:
+        #
+        # ⚠️ **与 2DGS 压平互斥**（2026-10-22，用户要求"有冲突就改"）：
+        # `flatten_2dgs` 的目标就是把最短轴压到接近 0（变成圆盘），
+        # 而本钳制每步又把最短轴抬回来 —— 两者对撞，压平的收益被完全抵消。
+        # 既然它们语义冲突，就不该同时生效：压平开启时**跳过长细比钳制**
+        # （压平本身已经限制了"针"，而它是沿法线的薄，不是无方向细丝）。
+        _flatten_on = bool(getattr(cfg, "flatten_2dgs", False))
+        if _flatten_on and float(getattr(cfg, "max_aspect", 0.0) or 0.0) > 1.0:
+            if not locals().get("_aspect_conflict_logged"):
+                ctx.warn("flatten_2dgs 与 max_aspect 语义冲突：本次跳过 max_aspect "
+                         "（压平需要最短轴→0）。如需细丝治理请二选一。")
+                _aspect_conflict_logged = True
+        if (not _flatten_on
+                and getattr(cfg, "max_aspect", 0.0) and float(cfg.max_aspect) > 1.0):
             with torch.no_grad():
                 _s = params["scales"].data
                 _smax = _s.max(dim=1, keepdim=True).values

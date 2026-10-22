@@ -105,6 +105,10 @@ ARMS: dict[str, dict[str, str]] = {
     "official": {"train.densify_strategy": "official"},
     # 官方策略 + 官方重置与不透明度学习率
     # 自定义策略 + 官方每 3000 步重置（官方配套：opacity_lr 0.05）
+    # 重评用：AbsGS 绝对梯度（被我们以前判为不显著）
+    "absg": {"train.absgrad": "true"},
+    # 2DGS 压平（已解除与 max_aspect 的冲突：压平开启时跳过长细比钳制）
+    "flat": {"train.flatten_2dgs": "true"},
     "reset3k": {"train.opacity_reset_interval": "3000",
                  "train.lr_opacities": "0.05"},
     "official_rst": {"train.densify_strategy": "official",
