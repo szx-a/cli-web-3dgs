@@ -146,6 +146,20 @@ def mesh_metrics(mesh) -> dict:
         out["surface_area"] = float(mesh.get_surface_area())
     except Exception:  # noqa: BLE001
         out["surface_area"] = None
+    # ---- 褶皱指标：面积 / 凸包面积 ----
+    #
+    # 为什么需要：`自相交 True` 是泊松的常态，靠它分不出"轻微穿插"和"皱成一团"。
+    # 起皱的表面会把大量面积折进同一块空间，于是**面积远超凸包**；
+    # 镂空结构（牌坊、栏杆）则相反，面积应**小于**凸包。
+    # 实测：修复后的 img3-final = 0.460（镂空，正常）；若 > 1.5 应怀疑褶皱。
+    try:
+        hull, _ = mesh.compute_convex_hull()
+        ha = float(hull.get_surface_area())
+        out["hull_area"] = ha
+        out["area_over_hull"] = (float(out["surface_area"]) / ha) if ha > 1e-12 else None
+    except Exception:  # noqa: BLE001
+        out["hull_area"] = None
+        out["area_over_hull"] = None
     return out
 
 
@@ -232,6 +246,10 @@ def main() -> int:
               f"自相交 {r.get('self_intersecting')}")
         if r.get("surface_area"):
             print(f"  表面积  : {r['surface_area']:.4f}，体积 {r.get('volume')}")
+    aoh = r.get("area_over_hull")
+    if aoh is not None:
+        print(f"  面积/凸包: {aoh:.3f}"
+              f"（镂空结构 <1；>1.5 需怀疑皱皱）")
         problems = judge(r)
         bad_list, warn_list = problems
         for x in bad_list:

@@ -326,6 +326,22 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         chk(False, "自由视角检查", f"{type(exc).__name__}: {exc}")
 
+    # 网格皱皱：面积/凸包面积 --- 不依赖渲染的“皱成一团”度量
+    try:
+        import open3d as _o3d
+
+        _mp = exp / "model_mesh.ply"
+        if _mp.exists():
+            _mm = _o3d.io.read_triangle_mesh(str(_mp))
+            _hull, _ = _mm.compute_convex_hull()
+            _ha = float(_hull.get_surface_area())
+            _aoh = float(_mm.get_surface_area()) / _ha if _ha > 1e-12 else None
+            chk(_aoh is not None and _aoh < 1.5,
+                "网格无皱皱（面积/凸包 < 1.5）",
+                f"{_aoh:.3f}" if _aoh is not None else "测不出")
+    except Exception as exc:  # noqa: BLE001
+        chk(False, "网格皱皱指标", f"{type(exc).__name__}: {exc}")
+
     # ---------- 4. 网格质量 ----------
     print("\n⑥ 网格质量")
     try:
