@@ -292,6 +292,14 @@ DEFAULTS: dict[str, Any] = {
         # "零厚度薄片" —— 转到侧面就是一道丝。
         # 这里把 smin 抬到 smax/max_aspect（log 域）。
         "max_aspect": 50.0,
+        # ==== 学习率与官方对齐（2026-10-22）====
+        # 官方 3DGS/gsplat 的 means 学习率是 **1.6e-4 * scene_scale**；
+        # 我们一直用固定 1.6e-4 ⇒ 场景尺度约 5 时**位置几乎不动**，
+        # 只能靠拉长/放大高斯去凑像素（针状高斯的根源之一）。
+        "lr_means_scene_scale": False,
+        # 官方 SH 学习率 = 2.5e-3 / 20 = **1.25e-4**；我们用 2.5e-3（大 20 倍）
+        # ⇒ 颜色按视角过拟合，也是各类正则/感知损失测不出效果的可疑来源。
+        "lr_shs": 0.0025,
         # 收尾清理：训练结束时删掉不透明度低于此值的高斯。
         # Faster-GS 用 MIN_OPACITY_AFTER_TRAINING = 1/255 ≈ 0.0039。
         "min_opacity_final": 0.0,

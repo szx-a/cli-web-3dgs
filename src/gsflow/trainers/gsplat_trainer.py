@@ -239,6 +239,8 @@ class TrainConfig:
     max_scale_ratio: float = 0.05   # 每步尺度上限（× scene_scale），0=关闭
     bg_alpha_reg: float = 0.1       # 掩码外 alpha 正则权重（0=关闭）
     max_aspect: float = 50.0        # 长细比上限（0=关闭）
+    lr_means_scene_scale: bool = False   # means 学习率乘以 scene_scale（官方做法）
+    lr_shs: float = 0.0025               # SH 学习率（官方 = 1.25e-4）
     # 训练结束时的最小不透明度清理（Faster-GS: MIN_OPACITY_AFTER_TRAINING = 1/255）。
     # 不透明度低于该值的高斯在收尾时直接删掉；0 表示不清理。
     min_opacity_final: float = 0.0
@@ -959,14 +961,19 @@ def train(cfg: TrainConfig, ctx) -> dict:
     # 最终 >0.02 的高斯只剩 0.2%。
     # Faster-GS 与 3DGS-MCMC 都用 0.025（见其 Trainer.py 的 LEARNING_RATE_OPACITIES），
     # 这里对齐。
-    _LR = {"means": 1.6e-4, "scales": 5e-3,
+    # 与官方对齐：官方 means 学习率 = 1.6e-4 * scene_scale。
+    # 我们长期用固定 1.6e-4：场景尺度 ~5 时位置每步更新量偏小 5 倍，
+    # 几何难以收敛，只能靠放大/拉长高斯去覆盖像素 ⇒ 针状高斯。
+    _lr_means = 1.6e-4 * (scene_scale if bool(getattr(cfg, "lr_means_scene_scale", False)) else 1.0)
+    _lr_shs = float(getattr(cfg, "lr_shs", 2.5e-3) or 2.5e-3)
+    _LR = {"means": _lr_means, "scales": 5e-3,
            # 四元数学习率：原为 1e-3。按用户方案降到 5e-4 ——
            # Adam 的每步更新量约等于 lr（因为它按二阶矩归一化），而旋转是**流形**参数，
            # 1e-3 偏大：椭球会在空间里反复乱转，连带让法线/朝向类统计量一直抖，
            # 这也是"法线一致性正则不收敛"的一个可疑来源（见 03/G65）。
            "quats": float(getattr(cfg, "lr_quats", 5e-4) or 5e-4),
            "opacities": float(getattr(cfg, "lr_opacities", 0.025) or 0.025),
-           "shs": 2.5e-3}
+           "shs": _lr_shs}
     _gamma = 0.01 ** (1 / max(cfg.iterations, 1))   # 旧策略（纯指数）保留，供 A/B 复现
 
     # ---- 学习率调度：线性预热 + 余弦退火（用户方案第 1 项）----

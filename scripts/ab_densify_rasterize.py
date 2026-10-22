@@ -91,6 +91,24 @@ ARMS: dict[str, dict[str, str]] = {
     # 长细比上限：直接针对“零厚度薄片”（0.0 就是当前默认）
     "asp50": {"train.max_aspect": "50"},
     "asp20": {"train.max_aspect": "20"},
+    # 训练步数：30k 是否欠拟合？（注意：只在 4000 步内密化）
+    "iter50k": {"train.iterations": "50000"},
+    # ==== 学习率与官方对齐（2026-10-22）====
+    # 官方 means LR = 1.6e-4 * scene_scale；我们固定 1.6e-4（小 ~5 倍）
+    "lrmeans": {"train.lr_means_scene_scale": "true"},
+    # 官方 SH LR = 2.5e-3/20 = 1.25e-4；我们 2.5e-3（大 20 倍）
+    "lrsh": {"train.lr_shs": "0.000125"},
+    # 两项同时（最接近官方）
+    "lrboth": {"train.lr_means_scene_scale": "true", "train.lr_shs": "0.000125"},
+    # ==== 直接用**官方策略**（含 2D 尺度判据 / prune_opa / 重置）====
+    # 这是回答“是不是我们自定义策略写错了”的最直接手段。
+    "official": {"train.densify_strategy": "official"},
+    # 官方策略 + 官方重置与不透明度学习率
+    "official_rst": {"train.densify_strategy": "official",
+                      "train.opacity_reset_interval": "3000",
+                      "train.lr_opacities": "0.05",
+                      "train.lr_means_scene_scale": "true",
+                      "train.lr_shs": "0.000125"},
 }
 BASELINE = "g2d"
 
@@ -226,8 +244,11 @@ def main() -> int:
             out_dir.mkdir(parents=True, exist_ok=True)
 
             params = dict(ARMS[arm])
-            params["train.iterations"] = str(args.iters)
-            params["train.eval_interval"] = str(args.iters)
+            # 允许臂自带 	rain.iterations（用来比不同步数），
+            # 否则一律被命令行的 --iters 覆盖。
+            if "train.iterations" not in params:
+                params["train.iterations"] = str(args.iters)
+            params.setdefault("train.eval_interval", params["train.iterations"])
             settings = load_settings(dict(params))
             ctx = StageContext(job_id=job, job_dir=job_dir, settings=settings,
                                events=EventBus(), params=params)
@@ -242,8 +263,11 @@ def main() -> int:
             print("  生效: " + "  ".join(f"{k}={v}" for k, v in eff.items()), flush=True)
 
             t0 = time.time()
+            # ⚠️ 必须从 params 取迭代数：否则臂自带的
+            # 	rain.iterations（如 50000）会被这里的 args.iters 无声覆盖。
+            _iters = int(params.get("train.iterations", args.iters))
             res = GsplatBackend().run(ctx, data_dir=data_dir, out_dir=out_dir,
-                                      iterations=args.iters)
+                                      iterations=_iters)
             res = res if isinstance(res, dict) else {}
             print(f"[{arm} r{rep}] PSNR={res.get('psnr')} dB  "
                   f"高斯={res.get('gaussians')}  {time.time()-t0:.0f}s", flush=True)
