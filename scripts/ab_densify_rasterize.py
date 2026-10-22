@@ -70,6 +70,24 @@ ARMS: dict[str, dict[str, str]] = {
     # 注意：全图 PSNR 会下降（背景故意不拟合），要看**物体区域的画质**与
     # **背景视觉权重占比**，不能只看全图 PSNR。
     "inside": {"train.mask_loss_mode": "inside"},
+
+    # ---- 针状/细丝化专项（2026-10 追加）----
+    #
+    # 现象：img3-final 里 aniso>100 的高斯占**视觉权重 94.8%**，
+    # 训练视角看不出、自由视角全是细丝。怀疑是**容量不足**时优化器
+    # 用极端各向异性去凑残差 —— 而 densify_until=4000 这个值
+    # 是在"掩码失效"时期选出来的，可能不再成立。
+    "densify15k": {"train.densify_until": "15000"},
+    # 尺度正则：直接惩罚尺度过大（0.01 是社区常用量级，需实测校准）
+    "sreg": {"train.scale_reg": "0.01"},
+    # 更早/更严格地裁剪巨大高斯（0.1 → 0.05）
+    "prune05": {"train.prune_scale3d": "0.05"},
+    # 每步尺度上限（新增的 max_scale_ratio，0.1 与官方 prune_scale3d 同量纲）：
+    # 直接针对"针状高斯"，不依赖致密化窗口
+    "clamp10": {"train.max_scale_ratio": "0.1"},
+    "clamp05": {"train.max_scale_ratio": "0.05"},
+    # 掩码外 alpha 正则：直接惩罚"在物体外面画东西"，针对黑壳
+    "bgreg": {"train.bg_alpha_reg": "0.1"},
 }
 BASELINE = "g2d"
 
@@ -107,6 +125,52 @@ def ci95(vals: list[float]) -> tuple[float, float, float]:
     se = float(a.std(ddof=1) / np.sqrt(len(a)))
     h = float(stats.t.ppf(0.975, len(a) - 1) * se)
     return m, m - h, m + h
+
+
+def _model_stats(out_dir: Path) -> dict:
+    """从产物算**诊断指标**：掩码内画质 + 针状结构占比。
+
+    为什么必须在这里算：本项目现在**全图 PSNR 已无意义**（掩码外被压成背景色），
+    而用户真正抱怨的是"自由视角下细丝化" —— 那与**各向异性**直接相关。
+    只比 PSNR 会得出"两个臂一样好"，但其中一个可能全是针。
+    """
+    out: dict = {}
+    ply: Path | None = None
+    mpath = out_dir / "metrics.json"
+    if mpath.exists():
+        try:
+            m = json.loads(mpath.read_text(encoding="utf-8"))
+            out["psnr_masked"] = m.get("psnr_masked")
+            out["ssim_masked"] = m.get("ssim_masked")
+            out["gaussians"] = m.get("gaussians")
+            best = m.get("best_ply")
+            if best:
+                ply = Path(best)
+        except Exception:  # noqa: BLE001
+            pass
+    if ply is None or not ply.exists():
+        cands = sorted((out_dir / "point_cloud").glob("*/point_cloud.ply"))
+        ply = cands[-1] if cands else None
+    if ply is not None and ply.exists():
+        try:
+            import numpy as _np
+
+            from gsflow.gsdata.shio import read_gaussians_full
+
+            g = read_gaussians_full(ply)
+            sc = _np.asarray(g["scales"], dtype=_np.float64)
+            op = _np.asarray(g["opacity"], dtype=_np.float64).reshape(-1)
+            smax = sc.max(1)
+            aniso = smax / _np.maximum(sc.min(1), 1e-12)
+            w = op * smax ** 2
+            w = w / w.sum() if w.sum() > 0 else w
+            out["aniso_median"] = float(_np.median(aniso))
+            out["aniso_p99"] = float(_np.percentile(aniso, 99))
+            out["needle_weight"] = float(w[aniso > 100].sum())
+            out["max_scale"] = float(smax.max())
+        except Exception:  # noqa: BLE001
+            pass
+    return out
 
 
 def main() -> int:
@@ -147,7 +211,8 @@ def main() -> int:
                 try:
                     d = json.loads(res_p.read_text(encoding="utf-8"))
                     results[arm].append({"job": job, "psnr": d.get("psnr"),
-                                         "gaussians": d.get("gaussians")})
+                                         "gaussians": d.get("gaussians"),
+                                         **_model_stats(out_dir)})
                     print(f"[{arm} r{rep}] 复用 {d.get('psnr')} dB / "
                           f"{d.get('gaussians')} 高斯")
                     continue
@@ -180,7 +245,8 @@ def main() -> int:
             print(f"[{arm} r{rep}] PSNR={res.get('psnr')} dB  "
                   f"高斯={res.get('gaussians')}  {time.time()-t0:.0f}s", flush=True)
             results[arm].append({"job": job, "psnr": res.get("psnr"),
-                                 "gaussians": res.get("gaussians")})
+                                 "gaussians": res.get("gaussians"),
+                                 **_model_stats(out_dir)})
 
     # ---------------- 汇总 ----------------
     print("\n=== 汇总（同一份数据，仅被测项不同）===")
@@ -215,8 +281,14 @@ def main() -> int:
             h = float(_st.t.ppf(0.975, df) * se)
             d_s = f"{delta:+.3f}"
             d_ci = f"[{delta-h:+.3f},{delta+h:+.3f}]"
+        ss = [r.get("ssim_masked") for r in results[arm] if r.get("ssim_masked")]
+        nw = [r.get("needle_weight") for r in results[arm] if r.get("needle_weight") is not None]
+        ms = [r.get("max_scale") for r in results[arm] if r.get("max_scale")]
+        extra = (f"  SSIM(m)={sum(ss)/len(ss):.4f}" if ss else "  SSIM(m)=—")
+        extra += (f"  针状权重={sum(nw)/len(nw)*100:.1f}%" if nw else "  针状权重=—")
+        extra += (f"  max_scale={sum(ms)/len(ms):.2f}" if ms else "")
         print(f"{arm:<6}{len(vals):>3}{m:>12.3f}{f'[{lo:.3f},{hi:.3f}]':>22}"
-              f"{d_s:>12}{d_ci:>22}{gm:>12,.0f}")
+              f"{d_s:>12}{d_ci:>22}{gm:>12,.0f}" + extra)
         stats_out[arm] = {"n": len(vals), "mean": m, "ci": [lo, hi],
                           "delta_vs_base": delta,
                           "gaussians": gm,

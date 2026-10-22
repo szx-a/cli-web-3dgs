@@ -275,6 +275,17 @@ DEFAULTS: dict[str, Any] = {
         # 待实测确认收益后再考虑改默认）。
         "opacity_reg": 0.0,
         "scale_reg": 0.0,
+        # 每步钳制 log 尺度上限 = max_scale_ratio × scene_scale（0 = 关闭）。
+        # 存在的理由：`prune_scale3d` **只在致密化窗口内**执行，窗口结束后
+        # 高斯可以无限拉长。实测（img3-final, 30k）：最长高斯 scale=[15.81, 0.0, 0.033]、
+        # opacity=1.0，而模型只有 4.16 米宽；aniso>100 的高斯占数量 10.2% 却承担
+        # **94.8% 的视觉权重** ⇒ 自由视角出现细丝、泊松网格皱成一团（docs/03 待编号）。
+        "max_scale_ratio": 0.05,
+        # 掩码外 alpha 正则（0=关闭）。
+        # 为什么需要：composite 只约束**颜色**（该黑处渲黑），不约束
+        # "别在那儿画东西"。实测掩码外 alpha 均值 0.70（应≈0）——
+        # 模型外面裹着一层不透明黑几何，转视角就是"背面混乱"。
+        "bg_alpha_reg": 0.1,
         # 收尾清理：训练结束时删掉不透明度低于此值的高斯。
         # Faster-GS 用 MIN_OPACITY_AFTER_TRAINING = 1/255 ≈ 0.0039。
         "min_opacity_final": 0.0,

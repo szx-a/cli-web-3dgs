@@ -299,6 +299,33 @@ def main() -> int:
     chk(not missing, "参考渲染器资产齐全（refviewer + three + gaussian-splats-3d）",
         "" if not missing else f"缺 {missing}")
 
+    # ---------- 3.5 自由视角 / 越界雾丝 ----------
+    # 用户报"细丝化 / 背面混乱"时，原验收 32 项全部通过 —— 因为它只看训练视角。
+    # 这一项把"训练视角之外"变成硬判据：掩码外 alpha 必须接近 0
+    # （实测：无 bg 正则 0.73 / 98.8% ⇒ FAIL；修好后 0.049 / 8.7% ⇒ OK）。
+    print("\n⑤b 自由视角 / 越界雾丝")
+    fv_json = ROOT / "workspace" / f"freeview-{args.job}.json"
+    try:
+        rp = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "check_free_view.py"), "--job",
+             args.job, "--views", "4", "--json", str(fv_json)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            cwd=str(ROOT))
+        out = (rp.stdout or "") + (rp.stderr or "")
+        if "本检查跳过" in out:
+            print("  [SKIP] 自由视角检查（gsplat 内核未就绪）")
+        else:
+            # ⚠️ 不要用 `free_ok` 之外的短名 `ok`：`chk()` 内部有同名列表，
+            # 覆盖后会在 chk 里炸 `'bool' object has no attribute 'append'`。
+            free_ok = "判读: 通过" in out
+            m = [ln.strip() for ln in out.splitlines() if "掩码外 alpha:" in ln]
+            chk(free_ok, "掩码外 alpha 接近 0（无黑壳/细丝）",
+                m[0] if m else out[-300:])
+    except FileNotFoundError:
+        chk(False, "自由视角检查", "找不到 python")
+    except Exception as exc:  # noqa: BLE001
+        chk(False, "自由视角检查", f"{type(exc).__name__}: {exc}")
+
     # ---------- 4. 网格质量 ----------
     print("\n⑥ 网格质量")
     try:

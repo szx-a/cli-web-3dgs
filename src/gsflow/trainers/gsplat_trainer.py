@@ -236,6 +236,8 @@ class TrainConfig:
     # 3DGS-MCMC 论文与 Faster-GS 都用 0.01（两者同时开）。
     opacity_reg: float = 0.0
     scale_reg: float = 0.0
+    max_scale_ratio: float = 0.05   # 每步尺度上限（× scene_scale），0=关闭
+    bg_alpha_reg: float = 0.1       # 掩码外 alpha 正则权重（0=关闭）
     # 训练结束时的最小不透明度清理（Faster-GS: MIN_OPACITY_AFTER_TRAINING = 1/255）。
     # 不透明度低于该值的高斯在收尾时直接删掉；0 表示不清理。
     min_opacity_final: float = 0.0
@@ -1337,6 +1339,22 @@ def train(cfg: TrainConfig, ctx) -> dict:
             # 尺度正则：抑制个别高斯长到过大（也是浮点的常见形态）
             loss = loss + float(cfg.scale_reg) * current_scales().mean()
 
+        # ---- 掩码外 alpha 正则（`bg_alpha_reg`，默认 0 = 关闭）----
+        #
+        # 为什么必须补这一项（2026-10 实测）：`composite` 只把**掩码外的 GT 涂成背景色**，
+        # 也就是只约束"那里必须是黑的"，**没有约束"那里不许有几何"**。
+        # 模型于是用**不透明的黑色高斯**把背景填满：
+        #
+        #     实测 img3-final：掩码外 alpha 均值 **0.70**（正确应≈0）、
+        #     且 1,161 个高斯（0.8%）从未进入任何掩码，却占 **14.1% 视觉权重**。
+        #
+        # 在查看器里转一圈，这层黑几何就是用户说的"背面混乱"。
+        # 做法：对掩码外的 alpha 直接加惩罚（掩码内不罚）。
+        if (cfg.bg_alpha_reg > 0 and _mask is not None
+                and bool(_mask.any()) and not bool(_mask.all())):
+            _bg = (~_mask).to(alphas[0].dtype)
+            loss = loss + float(cfg.bg_alpha_reg) * (alphas[0][..., 0] * _bg).mean()
+
         # ---- 感知损失 LPIPS（用户方案第 3 项）----
         # 动机：L1 是逐像素平均、SSIM 是局部结构，两者都偏"平滑"，对纹理细节
         # （石雕纹样、瓦当）不敏感，渲染容易发糊。LPIPS 用预训练 VGG 的深层特征度量差异。
@@ -1527,6 +1545,27 @@ def train(cfg: TrainConfig, ctx) -> dict:
             opt.step()
             opt.zero_grad(set_to_none=True)
         schedule_lrs(step)
+
+        # ---- 每步尺度上限（`max_scale_ratio`，默认 0 = 关闭）----
+        #
+        # 为什么需要（2026-10 实测，docs/03 待编号）：尺度裁剪 `prune_scale3d`
+        # **只在致密化窗口内**执行（见下面的 `densify_from <= step <= densify_until`
+        # 门控）。默认 `densify_until=4000`，于是后 26,000 步**没有任何尺度约束**，
+        # 优化器可以把高斯无限拉长去凑残差：
+        #
+        #     实测 img3-final：最长的一个高斯 scale=[15.806, 0.0, 0.033]、
+        #     opacity=1.0，而整个模型只有 4.16 米宽；
+        #     aniso>100 的高斯只占 10.2% 数量，却承担 **94.8% 的视觉权重**。
+        #
+        # 后果正是用户看到的三件事：训练视角像面、自由视角是**细丝**、
+        # 用这些针跑泊松得到**皱成一团的网格**。
+        #
+        # 这里按"场景尺度的比例"钳制 log 尺度（与 `prune_scale3d` 同一个量纲），
+        # 每步生效、不依赖致密化窗口。默认 0 = 不改变既有行为。
+        if getattr(cfg, "max_scale_ratio", 0.0) and float(cfg.max_scale_ratio) > 0:
+            with torch.no_grad():
+                _cap = float(np.log(float(cfg.max_scale_ratio) * scene_scale))
+                params["scales"].data.clamp_(max=_cap)
 
         # ---- 结构更新（后向之后进行，官方称之为 post-backward step）----
         # 官方 simple_trainer.py 的顺序就是：

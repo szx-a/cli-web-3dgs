@@ -127,6 +127,19 @@ def test_mesh_covers_the_models_opaque_gaussians() -> None:
         f"网格只包住了 {frac*100:.1f}% 的不透明高斯 ⇒ 聚焦框/重建把模型主体切掉了")
 
     area = float(m.get_surface_area())
-    assert area > 8.0, (
-        f"网格表面积只有 {area:.2f}（事故前 1.72、修好后 18.10）⇒ 又退化成碎片了")
+    # 判据演进（2026-10，两次标定）：
+    # ① 最初用"面数/法线/零面积面"，结果一个 0.85% 体积的碎片全过 —— 没用。
+    # ② 改成"表面积 > 8"，但那是在**带黑壳**的模型上标的：黑壳（掩码外 alpha≈0.70）
+    #    给网格贡献了大量虚假表面（15~18 平米）。去掉黑壳后同一物体只剩 1.5~7.7 平米。
+    # ③ 现在改用**相对判据**：网格 bbox 占"不透明高斯 bbox"的比例。
+    #    真正的碎片事故是 0.25 / 0.22 / 0.15（各轴）；正常模型 > 0.6。
+    sel_lo = sel.min(0)
+    sel_ext = np.maximum(sel.max(0) - sel_lo, 1e-9)
+    mesh_ext = np.maximum(v.max(0) - v.min(0), 1e-9)
+    ratio = mesh_ext / sel_ext
+    assert ratio.min() > 0.60, (
+        f"网格只占不透明高斯包围盒的 {np.round(ratio, 2).tolist()}"
+        f"（碎片事故 0.25/0.22/0.15）⇒ 又退化成碎片了")
+    # 绝对下限只防"退化成一个点"，不承担质量判断
+    assert area > 0.5, f"网格表面积 {area:.2f} 已退化"
 
