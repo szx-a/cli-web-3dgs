@@ -177,7 +177,7 @@ def _model_stats(out_dir: Path) -> dict:
         except Exception:  # noqa: BLE001
             pass
     if ply is None or not ply.exists():
-        cands = sorted((out_dir / "point_cloud").glob("*/point_cloud.ply"))
+        cands = sorted((out_dir / "point_cloud").glob("*/point_cloud.ply"), key=lambda p: int(''.join(ch for ch in p.parent.name if ch.isdigit()) or 0))
         ply = cands[-1] if cands else None
     if ply is not None and ply.exists():
         try:

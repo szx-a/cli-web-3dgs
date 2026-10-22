@@ -34,7 +34,7 @@ def main() -> int:
     from gsflow.gsdata.shio import read_gaussians_full
 
     job = ROOT / "workspace" / args.job
-    plys = sorted((job / "04_train" / "point_cloud").glob("*/point_cloud.ply"))
+    plys = sorted((job / "04_train" / "point_cloud").glob("*/point_cloud.ply"), key=lambda p: int(''.join(ch for ch in p.parent.name if ch.isdigit()) or 0))
     if not plys:
         print("找不到点云")
         return 1

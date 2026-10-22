@@ -39,7 +39,7 @@ def main() -> int:
     print("=== 亮背景检查（解释“像曝光一样”的观感）===")
     for job in jobs:
         jd = ROOT / "workspace" / job
-        plys = sorted((jd / "04_train" / "point_cloud").glob("*/point_cloud.ply"))
+        plys = sorted((jd / "04_train" / "point_cloud").glob("*/point_cloud.ply"), key=lambda p: int(''.join(ch for ch in p.parent.name if ch.isdigit()) or 0))
         print(f"\n[{job}]")
         if not plys:
             print("  没有训练产物")

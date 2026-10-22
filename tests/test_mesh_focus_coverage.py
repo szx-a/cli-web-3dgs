@@ -110,7 +110,7 @@ def test_mesh_covers_the_models_opaque_gaussians() -> None:
     from gsflow.gsdata.shio import read_gaussians_full
 
     job = ROOT / "workspace" / "img3-final"
-    plys = sorted((job / "04_train" / "point_cloud").glob("*/point_cloud.ply"))
+    plys = sorted((job / "04_train" / "point_cloud").glob("*/point_cloud.ply"), key=lambda p: int(''.join(ch for ch in p.parent.name if ch.isdigit()) or 0))
     g = read_gaussians_full(plys[-1])
     xyz = np.asarray(g["xyz"], dtype=np.float64)
     op = np.asarray(g["opacity"], dtype=np.float64).reshape(-1)

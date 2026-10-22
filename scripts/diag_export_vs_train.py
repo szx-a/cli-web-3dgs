@@ -61,7 +61,7 @@ def main() -> int:
     from gsflow.gsdata.shio import read_gaussians_full
 
     jd = ROOT / "workspace" / args.job
-    train_plys = sorted((jd / "04_train" / "point_cloud").glob("*/point_cloud.ply"))
+    train_plys = sorted((jd / "04_train" / "point_cloud").glob("*/point_cloud.ply"), key=lambda p: int(''.join(ch for ch in p.parent.name if ch.isdigit()) or 0))
     exp_ply = jd / "05_export" / "model_gaussians.ply"
     if not train_plys or not exp_ply.exists():
         print("缺少训练或导出 PLY")

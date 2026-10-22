@@ -38,7 +38,7 @@ def main() -> int:
     print("=== 亮高斯是「背景壳」还是「物体本体」 ===")
     for job in (args.job or ["img3-final"]):
         jd = ROOT / "workspace" / job
-        plys = sorted((jd / "04_train" / "point_cloud").glob("*/point_cloud.ply"))
+        plys = sorted((jd / "04_train" / "point_cloud").glob("*/point_cloud.ply"), key=lambda p: int(''.join(ch for ch in p.parent.name if ch.isdigit()) or 0))
         print(f"\n[{job}]")
         if not plys:
             print("  没有训练产物")

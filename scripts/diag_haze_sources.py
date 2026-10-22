@@ -36,7 +36,7 @@ def main() -> int:
           f"{'op<0.1占比':>11}{'op<0.1权重':>11}{'针状权重':>10}")
     for job in (args.job or ["img3-final"]):
         jd = ROOT / "workspace" / job
-        plys = sorted((jd / "04_train" / "point_cloud").glob("*/point_cloud.ply"))
+        plys = sorted((jd / "04_train" / "point_cloud").glob("*/point_cloud.ply"), key=lambda p: int(''.join(ch for ch in p.parent.name if ch.isdigit()) or 0))
         if not plys:
             print(f"  {job:<26} 没有产物")
             continue

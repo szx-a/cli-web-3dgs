@@ -64,7 +64,7 @@ def analyze(job: str, mesh: Path | None = None) -> dict:
     from gsflow.gsdata.shio import read_gaussians_full
 
     jd = ROOT / "workspace" / job
-    plys = sorted((jd / "04_train" / "point_cloud").glob("*/point_cloud.ply"))
+    plys = sorted((jd / "04_train" / "point_cloud").glob("*/point_cloud.ply"), key=lambda p: int(''.join(ch for ch in p.parent.name if ch.isdigit()) or 0))
     out: dict = {"job": job, "ok": False}
     if not plys:
         out["note"] = "没有训练产物"

@@ -452,7 +452,7 @@ def create_app():
             except Exception:  # noqa: BLE001
                 ply = None
         if ply is None:
-            cands = sorted((root / "04_train" / "point_cloud").glob("*/point_cloud.ply"))
+            cands = sorted((root / "04_train" / "point_cloud").glob("*/point_cloud.ply"), key=lambda p: int(''.join(ch for ch in p.parent.name if ch.isdigit()) or 0))
             if cands:
                 ply = cands[-1]
         if ply is None:
@@ -665,7 +665,7 @@ def create_app():
             except Exception:  # noqa: BLE001
                 ply = None
         if ply is None:
-            cands = sorted((root / "04_train" / "point_cloud").glob("*/point_cloud.ply"))
+            cands = sorted((root / "04_train" / "point_cloud").glob("*/point_cloud.ply"), key=lambda p: int(''.join(ch for ch in p.parent.name if ch.isdigit()) or 0))
             if cands:
                 c = cands[-1].resolve()
                 if str(c).startswith(str(root)):
@@ -750,7 +750,7 @@ def create_app():
                         gauss_url = f"/api/gauss/{job_id}"
                         gauss_ply = bp
             if not gauss_url:
-                cands = sorted((root / "04_train" / "point_cloud").glob("*/point_cloud.ply"))
+                cands = sorted((root / "04_train" / "point_cloud").glob("*/point_cloud.ply"), key=lambda p: int(''.join(ch for ch in p.parent.name if ch.isdigit()) or 0))
                 if cands:
                     gauss_url = f"/api/gauss/{job_id}"
                     gauss_ply = cands[-1]

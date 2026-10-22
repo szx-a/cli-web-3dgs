@@ -47,7 +47,7 @@ def main() -> int:
     print("=== 高斯各向异性 / 针状结构 / 网格碎片度 ===")
     for job in jobs:
         jd = ROOT / "workspace" / job
-        plys = sorted((jd / "04_train" / "point_cloud").glob("*/point_cloud.ply"))
+        plys = sorted((jd / "04_train" / "point_cloud").glob("*/point_cloud.ply"), key=lambda p: int(''.join(ch for ch in p.parent.name if ch.isdigit()) or 0))
         print(f"\n[{job}]")
         if not plys:
             print("  没有训练产物")

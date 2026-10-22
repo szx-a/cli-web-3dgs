@@ -87,7 +87,7 @@ def main() -> int:
 
     # ---------- 1. 五个必需产物 ----------
     print("\n① 交付产物（5 个必需）")
-    plys = sorted((train / "point_cloud").glob("*/point_cloud.ply"))
+    plys = sorted((train / "point_cloud").glob("*/point_cloud.ply"), key=lambda p: int(''.join(ch for ch in p.parent.name if ch.isdigit()) or 0))
     req = [
         ("点云 ply", plys[-1] if plys else None),
         ("实体模型 ply", exp / "model_mesh.ply"),
