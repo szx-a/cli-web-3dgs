@@ -104,6 +104,9 @@ ARMS: dict[str, dict[str, str]] = {
     # 这是回答“是不是我们自定义策略写错了”的最直接手段。
     "official": {"train.densify_strategy": "official"},
     # 官方策略 + 官方重置与不透明度学习率
+    # 自定义策略 + 官方每 3000 步重置（官方配套：opacity_lr 0.05）
+    "reset3k": {"train.opacity_reset_interval": "3000",
+                 "train.lr_opacities": "0.05"},
     "official_rst": {"train.densify_strategy": "official",
                       "train.opacity_reset_interval": "3000",
                       "train.lr_opacities": "0.05",
