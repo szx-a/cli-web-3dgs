@@ -109,6 +109,8 @@ ARMS: dict[str, dict[str, str]] = {
     "absg": {"train.absgrad": "true"},
     # 2DGS 压平（已解除与 max_aspect 的冲突：压平开启时跳过长细比钳制）
     "flat": {"train.flatten_2dgs": "true"},
+    # 适度延长致密化窗口（当前默认 4000；15000 已证实太滥）
+    "dens8k": {"train.densify_until": "8000"},
     "reset3k": {"train.opacity_reset_interval": "3000",
                  "train.lr_opacities": "0.05"},
     "official_rst": {"train.densify_strategy": "official",
