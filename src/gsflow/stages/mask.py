@@ -187,6 +187,65 @@ class MaskStage(Stage):
                     f"原因：{type(exc).__name__}: {exc}。"
                     "可改用 mask.backend=rembg，或对已裁好的帧跳过 mask 阶段") from exc
 
+        # ---- 掩码自动收紧（2026-10-24，鲁棒性）----
+        #
+        # 实测：分割后端产出的掩码经常“整体偏大”——掩码内靠边那圈实际是背景。
+        #   img3-v2 rim_ratio=**0.70**、img3-v4 rim_ratio=**1.89**（0 为贴合），
+        # 两个作业的掩码都不合格；尤其 v4 掩码把大片空白圈成前景。
+        #
+        # 做法：在采样帧上搜索最小腐蚀 k（0..6），使平均 rim_ratio ≤ 0.30 且前景 ≥ 15%。
+        # 若背景本身很暗（外部亮度 <0.25）则无法用亮度判据，退回配置值。
+        _erode = int(ctx.cfg("erode_px", 0) or 0)
+        auto_erode = 0
+        try:
+            from PIL import Image as _PILImage
+            from scipy import ndimage as _nd2
+
+            _sample_idx = list(range(0, len(images), max(1, len(images) // 12)))[:12]
+            _best = None
+            for _k in range(0, 7):
+                _ratios = []
+                for _i in _sample_idx:
+                    _img_path = images[_i]
+                    _m = masks.get(_img_path.name)
+                    if _m is None or not np.asarray(_m).any():
+                        continue
+                    _mb = np.asarray(_m) > (127 if np.asarray(_m).dtype.kind in "iu" and np.asarray(_m).max() > 1 else 0.5)
+                    if _k:
+                        _mb = _nd2.binary_erosion(_mb, iterations=_k)
+                    if not _mb.any():
+                        break
+                    with _PILImage.open(_img_path) as _im:
+                        _g = np.asarray(_im.convert("L"), dtype=np.float64) / 255.0
+                    if _g.shape != _mb.shape:
+                        continue
+                    _inner = _nd2.binary_erosion(_mb, iterations=4)
+                    _rim = _mb & ~_inner
+                    _outer = _nd2.binary_dilation(_mb, iterations=4) & ~_mb
+                    if not (_inner.any() and _rim.any() and _outer.any()):
+                        continue
+                    _im_v, _rm_v, _ou_v = _g[_inner].mean(), _g[_rim].mean(), _g[_outer].mean()
+                    if abs(_ou_v - _im_v) < 0.05 or _ou_v < 0.25:
+                        # 背景与前景对比不足 / 背景很暗 ⇒ 该帧不可用于判据
+                        continue
+                    _ratios.append((_rm_v - _im_v) / abs(_ou_v - _im_v))
+                if _ratios:
+                    _mean_r = float(np.mean(_ratios))
+                    _fg = float(np.mean([np.asarray(masks[images[_i].name]).astype(bool).mean()
+                                         for _i in _sample_idx if masks.get(images[_i].name) is not None])) if _sample_idx else 0.0
+                    if _mean_r <= 0.30 and _fg >= 0.15:
+                        _best = (_k, _mean_r)
+                        break
+                    if _best is None or _mean_r < _best[1]:
+                        _best = (_k, _mean_r)
+            if _best and _best[0] > 0:
+                auto_erode = _best[0]
+                ctx.warn(f"掩码自动收紧：需腐蚀 **{auto_erode}px**"
+                         f"才能把 rim_ratio 降到 {_best[1]:.2f}（≤ 0.30 为合格）")
+        except Exception as _exc:  # noqa: BLE001
+            ctx.warn(f"掩码自动收紧跳过：{type(_exc).__name__}")
+        _erode = max(_erode, auto_erode)
+
         manifest: list[dict] = []
         failures: list[str] = []
         fallbacks: list[str] = []
@@ -243,7 +302,6 @@ class MaskStage(Stage):
             #
             # 为什么放在**写盘**而不是损失里：训练与评估必须用同一套掩码，
             # 否则等于"训练不管边界、评估却考核边界"（实测会让 SSIM 从 0.948 掉到 0.863）。
-            _erode = int(ctx.cfg("erode_px", 0) or 0)
             if _erode > 0:
                 from scipy import ndimage as _nd
 

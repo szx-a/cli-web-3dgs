@@ -156,6 +156,13 @@ class TrainStage(Stage):
             if isinstance(ctx.params.get("train"), dict):
                 ctx.params["train"]["resolution"] = resolution
             try:
+                # ---- 尺寸一致性守卫（2026-10-24）----
+                #
+                # 实测：`01_images_raw` 是 456x290，而 COLMAP 去畸变后的图是 456x**289**（差 1px）。
+                # 位姿与内参是对去畸变后的尺寸标定的 ⇒ 训练图必须与它一致；
+                # 一旦不一致，整幅画面会整体偏移，薄结构对不齐，掩码内 PSNR 从 ~22 掉到 ~10
+                # （img3-v4/v5 的实测）。这里只做**告警**，不擅自改数据。
+                self._check_size_consistency(ctx, data_dir)
                 metrics = backend.run(ctx, data_dir, out_dir, iterations)
                 break
             except StageError as exc:
@@ -188,6 +195,46 @@ class TrainStage(Stage):
         )
 
     # ------------------------------------------------------------------ 辅助
+    def _check_size_consistency(self, ctx: StageContext, data_dir: Path) -> None:
+        """告警：训练图尺寸与位姿来源图尺寸不一致时，会引入整体偏移。
+
+        实测（2026-10-24）：`01_images_raw` 456×290，而 COLMAP 去畸变输出 456×**289**。
+        位姿/内参是对去畸变尺寸标定的；若训练图与它不同，薄结构会整体错位，
+        掩码内 PSNR 从 ~22 掉到 ~10（img3-v4/v5）。
+        这里**只告警不改数据**：尺寸不一致时优先让训练直接用去畸变图。
+        """
+        try:
+            from PIL import Image as _PI
+
+            imgs = [p for p in (data_dir / "images").iterdir()
+                    if p.suffix.lower() in (".jpg", ".png")]
+            if not imgs:
+                return
+            with _PI.open(sorted(imgs)[0]) as im:
+                train_size = im.size
+            ref = None
+            for cand in (ctx.job_dir / "03_colmap" / "undistorted" / "images",
+                         ctx.job_dir / "02_images_clean",
+                         ctx.job_dir / "01_images_raw"):
+                if not cand.exists():
+                    continue
+                fs = sorted(p for p in cand.iterdir() if p.suffix.lower() in (".jpg", ".png"))
+                if fs:
+                    with _PI.open(fs[0]) as im2:
+                        ref = (cand.name, im2.size)
+                    break
+            if ref is None:
+                return
+            if tuple(ref[1]) != tuple(train_size):
+                ctx.warn(
+                    f"训练图 {train_size[0]}x{train_size[1]} 与位姿来源图"
+                    f"（{ref[0]} {ref[1][0]}x{ref[1][1]}）尺寸不同；会引入整体偏移，"
+                    f"薄结构对齐变差、掩码内 PSNR 可能从 ~22 掉到 ~10")
+            else:
+                ctx.info(f"尺寸一致：训练图 {train_size[0]}x{train_size[1]}（与 {ref[0]}）")
+        except Exception as exc:  # noqa: BLE001
+            ctx.warn(f"尺寸一致性检查跳过：{type(exc).__name__}")
+
     def _pick_images_dir(self, ctx: StageContext) -> Path:
         """与 colmap 阶段一致的取图逻辑：优先清理图，缺失则回退原始图。"""
         clean = ctx.job_dir / "02_images_clean"
