@@ -122,6 +122,8 @@ ARMS: dict[str, dict[str, str]] = {
     "erode5": {"train.mask_erode_px": "5"},
     # 紧掩码 + 降 SH（消除斜视彩虹）
     "tights2": {"train.sh_degree": "2"},
+    # 双掩码 + 更多容量（紧掩码后容量不再花在边界带上）
+    "dm3d8k": {"train.mask_erode_px": "3", "train.densify_until": "8000"},
     "reset3k": {"train.opacity_reset_interval": "3000",
                  "train.lr_opacities": "0.05"},
     "official_rst": {"train.densify_strategy": "official",

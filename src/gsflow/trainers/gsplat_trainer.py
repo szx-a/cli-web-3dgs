@@ -1432,9 +1432,23 @@ def train(cfg: TrainConfig, ctx) -> dict:
         #
         # 在查看器里转一圈，这层黑几何就是用户说的"背面混乱"。
         # 做法：对掩码外的 alpha 直接加惩罚（掩码内不罚）。
+        #
+        # ⚠️ 双掩码（2026-10-24）：**颜色监督**用紧掩码（`masks_loss`，避免把掩码
+        # 外沿的亮背景学成轮廓白边），但**背景 alpha 惩罚**仍用**原掩码**。
+        # 否则模型会在收紧的那一圈里把 alpha 压到 0 ⇒ 几何整体内缩、
+        # 薄结构被削（实测内部 PSNR 26.48 → 24.15 dB，−2.2）。
+        # 默认 `mask_erode_px=0` 时两者相同，行为不变。
         if (cfg.bg_alpha_reg > 0 and _mask is not None
                 and bool(_mask.any()) and not bool(_mask.all())):
-            _bg = (~_mask).to(alphas[0].dtype)
+            _mask_alpha = _mask
+            if _erode > 0 and masks:
+                _ma = masks[idx]
+                if max_side and _ma.shape[0] != gt.shape[0]:
+                    _ma = torch.nn.functional.interpolate(
+                        _ma[None, None].float(), size=gt.shape[:2], mode="nearest"
+                    )[0, 0] > 0.5
+                _mask_alpha = _ma.to(device)
+            _bg = (~_mask_alpha).to(alphas[0].dtype)
             loss = loss + float(cfg.bg_alpha_reg) * (alphas[0][..., 0] * _bg).mean()
 
         # ---- 感知损失 LPIPS（用户方案第 3 项）----
