@@ -111,6 +111,17 @@ ARMS: dict[str, dict[str, str]] = {
     "flat": {"train.flatten_2dgs": "true"},
     # 适度延长致密化窗口（当前默认 4000；15000 已证实太滥）
     "dens8k": {"train.densify_until": "8000"},
+    # SH 阶数：斜视出现彩虹色块，怀疑高阶 SH 在未见角度失控
+    "sh2": {"train.sh_degree": "2"},
+    "sh1": {"train.sh_degree": "1"},
+    # 收尾剪掉最淡的高斯（针对“白边/雾”）
+    "minop05": {"train.min_opacity_final": "0.05"},
+    "minop10": {"train.min_opacity_final": "0.10"},
+    # 训练损失用腐蚀掩码（修轮廓白边）
+    "erode3": {"train.mask_erode_px": "3"},
+    "erode5": {"train.mask_erode_px": "5"},
+    # 紧掩码 + 降 SH（消除斜视彩虹）
+    "tights2": {"train.sh_degree": "2"},
     "reset3k": {"train.opacity_reset_interval": "3000",
                  "train.lr_opacities": "0.05"},
     "official_rst": {"train.densify_strategy": "official",

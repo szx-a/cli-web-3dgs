@@ -96,6 +96,8 @@ DEFAULTS: dict[str, Any] = {
         "mask_black_threshold": 8,
         # 分割失败（未检出前景）时：keep=原图直通（下游仍可用）| skip=丢弃该帧
         "on_failure": "keep",
+        # 掩码收紧像素数（0=不改变）。实测掩码偏大会学出轮廓白边（docs/03 G134）。
+        "erode_px": 0,
     },
     "colmap": {
         "cameras": "SIMPLE_RADIAL",
@@ -306,6 +308,12 @@ DEFAULTS: dict[str, Any] = {
         # 开启后：发现重置间隔 > densify_until/2 时，自动把窗口
         # 延长到 min(iterations*0.6, reset*3)，并记一条日志。
         "auto_extend_densify_when_reset": True,
+        # ==== 掩码腐蚀（修“白边”，2026-10-24）====
+        # 实测：掩码普遍偏大，掩码内部靠边 4px 环的真值亮度 **0.89**，
+        # 而掩码内部只有 0.43~0.51、掩码外 0.91 ⇒ 那一圈实际是**亮背景**。
+        # 训练时把它当物体 ⇒ 学出轮廓高光（白边）。这里在**损失**上腐蚀
+        # N 个像素（评估仍用原掩码，保证可比）。
+        "mask_erode_px": 0,
         # 收尾清理：训练结束时删掉不透明度低于此值的高斯。
         # Faster-GS 用 MIN_OPACITY_AFTER_TRAINING = 1/255 ≈ 0.0039。
         "min_opacity_final": 0.0,

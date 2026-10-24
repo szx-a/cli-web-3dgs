@@ -167,6 +167,23 @@ def main() -> int:
                 out_a = a[~msk]
                 row["alpha_out_mean"] = float(out_a.mean())
                 row["alpha_out_frac_gt10"] = float((out_a > 0.1).mean())
+            # ---- 轮廓亮边：轮廓内 2px 环带的亮度减去内部亮度 ----
+            #
+            # 用户看到的“白边/发光”在 DC 渲染里依然存在（G134），
+            # 成因是轮廓处视线穿过更多半透明高斯 ⇒ alpha 叠加 ⇒ 亮度饱和。
+            # 这个量**不需要真值**，也不依赖视角，适合做回归守门。
+            try:
+                from scipy import ndimage as _nd
+                solid = a > 0.5
+                if solid.any():
+                    inner = _nd.binary_erosion(solid, iterations=2)
+                    rim = solid & ~inner
+                    lum = col.mean(2)
+                    if inner.any() and rim.any():
+                        row["rim_bright"] = float(lum[rim].mean() - lum[inner].mean())
+                        row["rim_frac"] = float(rim.sum() / max(solid.sum(), 1))
+            except Exception:  # noqa: BLE001
+                pass
             rows.append(row)
             oam = row["alpha_out_mean"]
             line = (f"  {im.name:<14}{ang:>5.0f}°  coverage={row['coverage']:.3f}"

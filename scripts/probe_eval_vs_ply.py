@@ -31,6 +31,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--job", default="img3-final")
     ap.add_argument("--views", type=int, default=3)
+    ap.add_argument("--data-dir", default="",
+                    help="含 images/masks/sparse 的目录（默认 jd/04_train/data）")
     args = ap.parse_args()
 
     import torch
@@ -44,7 +46,7 @@ def main() -> int:
     apply_runtime_env()
     dev = "cuda"
     jd = ROOT / "workspace" / args.job
-    data = jd / "04_train" / "data"
+    data = Path(args.data_dir) if args.data_dir else jd / "04_train" / "data"
     ply = sorted((jd / "04_train" / "point_cloud").glob("*/point_cloud.ply"), key=lambda p: int(''.join(ch for ch in p.parent.name if ch.isdigit()) or 0))[-1]
     g = read_gaussians_full(ply)
     rec = max((read_model(c) for c in sorted(

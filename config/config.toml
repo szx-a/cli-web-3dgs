@@ -30,6 +30,7 @@ keep_largest = true
 batch_size = 4
 mask_black_threshold = 8
 on_failure = "keep"
+erode_px = 0
 
 [colmap]
 cameras = "SIMPLE_RADIAL"
@@ -100,6 +101,7 @@ max_aspect = 50.0
 lr_means_scene_scale = false
 lr_shs = 0.0025
 auto_extend_densify_when_reset = true
+mask_erode_px = 0
 min_opacity_final = 0.0
 lr_opacities = 0.025
 lr_schedule = "cosine"

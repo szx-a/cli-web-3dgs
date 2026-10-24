@@ -80,6 +80,7 @@ class MaskStage(Stage):
         overlay_dir.mkdir(exist_ok=True)
 
         backend_name = str(ctx.cfg("backend", "fastsam"))
+        # 掩码收紧（默认 0）：实测本数据掩码整体偏大，会学出轮廓白边（docs/03 G134）
         mode = str(ctx.cfg("mode", "black"))
         # ---- 拍摄模式（capture.mode）在这里**落地** ----
         # 为什么要在此处解析：`capture.mode` 若不参与任何阶段，就只是"配置了但没执行"。
@@ -192,6 +193,23 @@ class MaskStage(Stage):
             from PIL import Image
 
             Image.fromarray(clean).save(out_img, quality=95)
+            # ---- 掩码收紧（`mask.erode_px`，默认 0 = 不改行为）----
+            #
+            # 实测（docs/03 G134）：本数据集的掩码**整体偏大**——掩码内靠边 4px 环的
+            # 真值亮度 0.89，几乎等于掩码外背景 0.91，而掩码内部只有 0.43~0.51。
+            # 训练会把这一圈亮背景当物体 ⇒ 渲染出**轮廓白边/发光**
+            # （`rim_bright` 0.295；收紧到 4px 后 0.037）。
+            #
+            # 为什么放在**写盘**而不是损失里：训练与评估必须用同一套掩码，
+            # 否则等于"训练不管边界、评估却考核边界"（实测会让 SSIM 从 0.948 掉到 0.863）。
+            _erode = int(ctx.cfg("erode_px", 0) or 0)
+            if _erode > 0:
+                from scipy import ndimage as _nd
+
+                m_bool = np.asarray(mask) > 127
+                if m_bool.any():
+                    m_bool = _nd.binary_erosion(m_bool, iterations=_erode)
+                mask = (m_bool.astype(np.uint8) * 255)
             # 两种命名都写：{stem}.png 便于我们自己读写，
             # {image_name}.png 是 COLMAP 的规则（否则报 MASK_ERROR 拒绝该帧）
             imageops.save_mask_png(mask, mask_dir / f"{img.name}.png")

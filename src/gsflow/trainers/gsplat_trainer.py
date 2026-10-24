@@ -242,6 +242,7 @@ class TrainConfig:
     lr_means_scene_scale: bool = False   # means 学习率乘以 scene_scale（官方做法）
     lr_shs: float = 0.0025               # SH 学习率（官方 = 1.25e-4）
     auto_extend_densify_when_reset: bool = True   # 重置与密度窗口联动
+    mask_erode_px: int = 0                  # 损失用掩码腐蚀像素数（修轮廓白边）
     # 训练结束时的最小不透明度清理（Faster-GS: MIN_OPACITY_AFTER_TRAINING = 1/255）。
     # 不透明度低于该值的高斯在收尾时直接删掉；0 表示不清理。
     min_opacity_final: float = 0.0
@@ -884,6 +885,27 @@ def train(cfg: TrainConfig, ctx) -> dict:
     h, w = imgs[0].shape[:2]
     ctx.info(f"训练分辨率：{w}x{h}（原生长边 {native}），共 {len(imgs)} 张")
 
+    # ---- 训练用掩码腐蚀（修"轮廓白边"，2026-10-24）----
+    #
+    # 实测本数据集的掩码**整体偏大**：掩码内靠边 4px 环的真值亮度 **0.89**，
+    # 而掩码内部只有 0.43~0.51、掩码外 0.91 ⇒ 那一圈其实是**亮背景**（墙/天空）。
+    # 训练把它当物体，模型就学出**轮廓高光**（用户反复说的"白边/发光"）。
+    #
+    # 这里只腐蚀**损失用**的掩码；`evaluate()` 仍用原始掩码，保证指标可比。
+    masks_loss = masks
+    _erode = int(getattr(cfg, "mask_erode_px", 0) or 0)
+    if _erode > 0:
+        import torch.nn.functional as _F
+
+        masks_loss = []
+        for _m in masks:
+            k = 2 * _erode + 1
+            e = _F.max_pool2d((~_m).float()[None, None], k, stride=1, padding=_erode)[0, 0]
+            masks_loss.append(~(e > 0.5))
+        kept = float(sum(m.sum() for m in masks_loss)) / max(float(sum(m.sum() for m in masks)), 1)
+        ctx.info(f"损失用掩码腐蚀 {_erode}px：保留 {kept*100:.1f}% 前景像素"
+                 f"（评估仍用原掩码）")
+
     # 相机：按最终图像尺寸重算 K
     ks = torch.from_numpy(data["ks"]).float()
     if max_side:
@@ -1353,7 +1375,9 @@ def train(cfg: TrainConfig, ctx) -> dict:
         # 现在：**先**把 gt 在掩码外合成背景色，**再**算 l1。
         _mask = None
         if masks and step < int(cfg.iterations * cfg.mask_loss_until):
-            _mask = masks[idx]
+            # 损失用腐蚀后的掩码（mask_erode_px>0 时），避免把掩码外沿的亮背景
+            # 学成轮廓高光；评估仍用 masks（见 evaluate）。
+            _mask = masks_loss[idx]
             if max_side and _mask.shape[0] != gt.shape[0]:
                 _mask = torch.nn.functional.interpolate(
                     _mask[None, None].float(), size=gt.shape[:2], mode="nearest"
