@@ -243,6 +243,8 @@ class TrainConfig:
     lr_shs: float = 0.0025               # SH 学习率（官方 = 1.25e-4）
     auto_extend_densify_when_reset: bool = True   # 重置与密度窗口联动
     mask_erode_px: int = 0                  # 损失用掩码腐蚀像素数（修轮廓白边）
+    sh_rest_reg: float = 0.003              # f_rest 的 L2 正则权重（3e-3：彩度 −19%、SSIM −0.0005）
+    sh_rest_max: float = 0.0                # f_rest 逐系数幅度上限（0=关）
     # 训练结束时的最小不透明度清理（Faster-GS: MIN_OPACITY_AFTER_TRAINING = 1/255）。
     # 不透明度低于该值的高斯在收尾时直接删掉；0 表示不清理。
     min_opacity_final: float = 0.0
@@ -1406,6 +1408,17 @@ def train(cfg: TrainConfig, ctx) -> dict:
         ssim_val = ssim_simple(render.permute(2, 0, 1)[None], gt.permute(2, 0, 1)[None],
                                legacy_eps=bool(getattr(cfg, "ssim_legacy_eps", False)))
         loss = (1.0 - cfg.ssim_weight) * l1 + cfg.ssim_weight * (1.0 - ssim_val)
+
+        # ---- SH 正则（治"斜视彩虹"，2026-10-24）----
+        #
+        # 实测：任意轨道视角下出现青/洋红/绿斑块，而 `sh_degree=0`（仅 DC）**完全消失**
+        # ⇒ 高阶 SH 在未见视角过拟合。两种抑制手段：
+        #   * `sh_rest_reg`：对 `f_rest` 加 L2，压住幅值（温和，推荐先试 1e-3~1e-2）；
+        #   * `sh_rest_max`：逐系数硬上限（更直接，但可能让颜色变"平"）。
+        # 只作用在 **f_rest**（DC 决定基色，不能压）。
+        if float(getattr(cfg, "sh_rest_reg", 0.0) or 0.0) > 0 and shs.shape[1] > 1:
+            _rest = shs[:, 1:, :]
+            loss = loss + float(cfg.sh_rest_reg) * (_rest ** 2).mean()
 
         # ---- 正则项（参考 Faster-GS / 3DGS-MCMC 的做法）----
         # 为什么需要：3DGS 在"背景无人约束"或"视图偏少"时会用**大量半透明浮点**

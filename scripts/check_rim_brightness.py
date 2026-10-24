@@ -47,7 +47,7 @@ def main() -> int:
     from gsflow.gsdata.shio import read_gaussians_full, render_view
 
     print(f"=== 轮廓亮边检查（轮廓内 {args.band}px 环 vs 内部）===")
-    print(f"  {'作业':<24}{'rim_bright':>12}{'rim 占比':>10}{'判读':>10}")
+    print(f"  {'作业':<24}{'rim_bright':>12}{'rim 占比':>10}{'彩度':>10}{'判读':>10}")
     for job in [j.strip() for j in args.jobs.split(",") if j.strip()]:
         jd = ROOT / "workspace" / job
         plys = list((jd / "04_train" / "point_cloud").glob("*/point_cloud.ply"))
@@ -65,7 +65,7 @@ def main() -> int:
             key=lambda r: len(r.images))
         imgs = sorted(rec.images, key=lambda im: im.name)
         picks = np.linspace(0, len(imgs) - 1, args.views).astype(int).tolist()
-        vals, fracs = [], []
+        vals, fracs, chromas = [], [], []
         for k in picks:
             im = imgs[k]
             cam = rec.cameras[im.camera_id]
@@ -91,15 +91,22 @@ def main() -> int:
                 continue
             lum = np.clip(col, 0, 1).mean(2)
             vals.append(float(lum[rim].mean() - lum[inner].mean()))
+            # ---- 彩虹度：实心像素的色度（max-min）----
+            # 灰石建筑应很低（<0.08）；出现青/洋红/绿斑块时会明显变大。
+            rgb = np.clip(col, 0, 1)
+            chroma = rgb.max(2) - rgb.min(2)
+            chromas.append(float(chroma[solid].mean()))
             fracs.append(float(rim.sum() / max(solid.sum(), 1)))
         if not vals:
             print(f"  {job:<24}  没有可用视角")
             continue
         v = float(np.mean(vals))
         f = float(np.mean(fracs))
+        ch = float(np.mean(chromas)) if chromas else float("nan")
         verdict = ("**有白边**" if v > 0.10 else "轻微" if v > 0.05 else "正常")
-        print(f"  {job:<24}{v:>12.3f}{f*100:>9.1f}%{verdict:>10}")
+        print(f"  {job:<24}{v:>12.3f}{f*100:>9.1f}%{ch:>10.3f}{verdict:>10}")
     print("\n  判读：rim_bright 应接近 0；>0.10 即肉眼可见的轮廓白边/发光。")
+    print("        色度列：灰石建筑应 <0.08；偏大说明有彩虹斑块（高阶 SH 过拟合）。")
     return 0
 
 

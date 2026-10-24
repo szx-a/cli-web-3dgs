@@ -101,6 +101,7 @@ def main() -> int:
     K = np.array([[f, 0, W / 2], [0, f, H / 2], [0, 0, 1]], dtype=np.float64)
 
     rows = []
+    chroma_all = []
     for elev in (15.0, 40.0, 70.0):
         tiles = []
         for yaw in (0.0, 45.0, 90.0, 135.0, 180.0, 270.0):
@@ -130,6 +131,13 @@ def main() -> int:
             img = img + 0.0
             tile = (np.clip(img, 0, 1) * 255).astype(np.uint8)
             tiles.append(tile)
+            # 彩度（max-min）：灰石建筑应低；轨道视角下偏大 = 彩虹斑块
+            _rgb = np.clip(img, 0, 1)
+            _a = np.asarray(alphas.detach().cpu().numpy()
+                            if hasattr(alphas, "detach") else alphas)[..., 0]
+            _solid = _a > 0.5
+            if _solid.any():
+                chroma_all.append(float((_rgb.max(2) - _rgb.min(2))[_solid].mean()))
         rows.append(np.concatenate(tiles, axis=1))
     sheet = np.concatenate(rows, axis=0)
     out = ROOT / args.out
@@ -138,6 +146,9 @@ def main() -> int:
     print(f"  已写出 {out}（3 个仰角 × 6 个方位，{W}x{H} 每格）")
     print(f"  物体中心 {np.round(center,2).tolist()} 半径 {radius:.2f}，"
           f"相机距离 {radius*args.dist:.2f}")
+    if chroma_all:
+        print(f"  轨道视角平均彩度（max-min）= {np.mean(chroma_all):.3f}"
+              f"（灰石建筑应 <0.08；>0.12 说明有彩虹斑块）")
     print("  判读：看有没有贯穿画面的细丝、半透明雾、或成片的碎屑。")
     return 0
 

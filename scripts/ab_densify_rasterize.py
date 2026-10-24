@@ -124,6 +124,10 @@ ARMS: dict[str, dict[str, str]] = {
     "tights2": {"train.sh_degree": "2"},
     # 双掩码 + 更多容量（紧掩码后容量不再花在边界带上）
     "dm3d8k": {"train.mask_erode_px": "3", "train.densify_until": "8000"},
+    # SH 正则：压住 f_rest 幅度，治斜视彩虹（实测 f_rest rms≈0.094, p99≈0.37）
+    "shreg3": {"train.sh_rest_reg": "0.003"},
+    "shreg1e2": {"train.sh_rest_reg": "0.01"},
+    "shmax03": {"train.sh_rest_max": "0.3"},
     "reset3k": {"train.opacity_reset_interval": "3000",
                  "train.lr_opacities": "0.05"},
     "official_rst": {"train.densify_strategy": "official",
