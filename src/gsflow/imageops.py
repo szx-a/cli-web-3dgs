@@ -197,7 +197,29 @@ def apply_alpha(rgb: np.ndarray, alpha: np.ndarray, background: int = 0) -> np.n
 
 
 def save_mask_png(mask: np.ndarray, path) -> None:
-    Image.fromarray((mask.astype(np.uint8) * 255), mode="L").save(path)
+    """把掩码写成 8 位 PNG（**容错多种 dtype**）。
+
+    坑（2026-10-24）：旧写法 mask.astype(np.uint8) * 255 对 **0~1 浮点掩码**会先截断成 0、
+    再乘 255 还是 0 ⇒ 写出**全黑掩码**。实测：img3-v2 的 812 张掩码前景占比全是 0.000，
+    而日志里只写“平均前景占比 0.0%”，静默一路到 COLMAP。
+
+    现在按 dtype 分支：
+      * bool            → True/False 乘 255；
+      * float（max<=1） → ×255 后取整；
+      * float（max>1）  → 当作已是 0~255 灰度；
+      * 整型（uint8/int）→ 直接用（已是 0~255 时）。
+    """
+    arr = np.asarray(mask)
+    if arr.dtype == np.bool_:
+        out = arr.astype(np.uint8) * 255
+    elif np.issubdtype(arr.dtype, np.floating):
+        mx = float(np.nanmax(arr)) if arr.size else 0.0
+        out = np.clip(arr, 0.0, 1.0 if mx <= 1.0 else 255.0)
+        out = (out * 255.0) if mx <= 1.0 else out
+        out = out.astype(np.uint8)
+    else:
+        out = np.clip(arr, 0, 255).astype(np.uint8)
+    Image.fromarray(out, mode="L").save(path)
 
 
 def mask_paths_for(mask_dir, image_name: str):
@@ -237,6 +259,19 @@ def load_rgb(path) -> np.ndarray:
 
 
 def mask_stats(mask: np.ndarray) -> dict:
-    total = int(mask.size)
-    fg = int(mask.sum())
+    """掩码统计。**容错 0/1、0~255、bool 三种表示**。
+
+    坑（2026-10-24）：旧写法直接 mask.sum()/size，若传入的是 **0~255** 的 uint8，
+    会算出 **10965%** 这种前景占比（实际接近 43%），日志完全不可信。
+    """
+    arr = np.asarray(mask)
+    total = int(arr.size)
+    if arr.dtype == np.bool_:
+        fg = int(arr.sum())
+    elif np.issubdtype(arr.dtype, np.floating) and float(arr.max() if arr.size else 0) <= 1.0:
+        fg = int((arr > 0.5).sum())
+    elif np.issubdtype(arr.dtype, np.integer) and (arr.size and int(arr.max()) > 1):
+        fg = int((arr > 127).sum())
+    else:
+        fg = int((arr > 0.5).sum())
     return {"foreground_px": fg, "ratio": round(fg / max(total, 1), 5)}

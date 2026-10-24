@@ -146,6 +146,45 @@ class MaskStage(Stage):
 
         masks = segmenter.segment(images, on_progress=on_progress)
 
+        # ---- 退化检测 + 自动兜底（2026-10-24，鲁棒性）----
+        #
+        # 事故：在"已经裁好的帧"上跑 fastsam，**每张都返回空掩码**，日志里
+        # "平均前景占比 0.0%" 却继续往下跑，直到 COLMAP 才崩。属于**静默失败**。
+        # 这里在落盘前先算前景比例：若几乎为 0（或几乎全图），换 classical 后端重试一次；
+        # 仍退化就**明确报错**，而不是把空掩码传给下游。
+        _fg_ratios = [float(m.mean()) for m in masks.values() if m is not None and m.size]
+        _mean_fg = float(sum(_fg_ratios) / max(len(_fg_ratios), 1))
+        # ⚠️ mode=keep（转台拍法）时掩码本就是全 1，不能当退化
+        if mode != "keep" and _fg_ratios and (_mean_fg < 0.005 or _mean_fg > 0.995):
+            ctx.warn(f"分割退化：平均前景占比 {_mean_fg*100:.2f}%"
+                     f"（{len(_fg_ratios)} 张）⇒ 换 classical 后端重试一次")
+            try:
+                segmenter2 = create("classical", opts)
+                masks2 = segmenter2.segment(images, on_progress=on_progress)
+                _fg2 = [float(m.mean()) for m in masks2.values() if m is not None and m.size]
+                _mean2 = float(sum(_fg2) / max(len(_fg2), 1)) if _fg2 else 0.0
+                if 0.005 <= _mean2 <= 0.995:
+                    ctx.warn(f"classical 兜底成功：平均前景 {_mean2*100:.1f}%"
+                             f"（{backend_name} 为 {_mean_fg*100:.2f}%）")
+                    masks, backend_name, _mean_fg = masks2, "classical", _mean2
+                else:
+                    # ⚠️ 降级而不是失败（2026-10-24）：两个后端都找不到前景时，
+                    # 说明“这批图本身就不适合做掩码”。硬失败会把整单卡死；
+                    # 更稳当的行为是**降级为 keep**（全图参与）并报得非常响。
+                    ctx.warn(
+                        f"分割两个后端都没找到前景（{backend_name} {_mean_fg*100:.2f}%、"
+                        f"classical {_mean2*100:.2f}%）⇒ **降级为 keep**（全图参与、不做背景处理）")
+                    mode = "keep"
+                    masks = {}
+            except StageError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise StageError(
+                    self.name,
+                    f"分割退化且兜底失败：{backend_name} 前景 {_mean_fg*100:.2f}%",
+                    f"原因：{type(exc).__name__}: {exc}。"
+                    "可改用 mask.backend=rembg，或对已裁好的帧跳过 mask 阶段") from exc
+
         manifest: list[dict] = []
         failures: list[str] = []
         fallbacks: list[str] = []
@@ -206,10 +245,20 @@ class MaskStage(Stage):
             if _erode > 0:
                 from scipy import ndimage as _nd
 
-                m_bool = np.asarray(mask) > 127
+                # ⚠️ dtype 必须分流（2026-10-24 自己踩的坑）：
+                # 分割后端返回的是 **bool**（True=前景），旧写法 > 127 会把
+                # True(=1) 全判成 False ⇒ **掩码全黑**。当时日志只报
+                # “平均前景 0.0%”，直到 COLMAP 才发现。
+                _m_arr = np.asarray(mask)
+                if _m_arr.dtype == np.bool_:
+                    m_bool = _m_arr
+                elif np.issubdtype(_m_arr.dtype, np.floating):
+                    m_bool = _m_arr > (0.5 if float(_m_arr.max()) <= 1.0 else 127.0)
+                else:
+                    m_bool = _m_arr > 127
                 if m_bool.any():
                     m_bool = _nd.binary_erosion(m_bool, iterations=_erode)
-                mask = (m_bool.astype(np.uint8) * 255)
+                mask = m_bool.astype(np.uint8) * 255
             # 两种命名都写：{stem}.png 便于我们自己读写，
             # {image_name}.png 是 COLMAP 的规则（否则报 MASK_ERROR 拒绝该帧）
             imageops.save_mask_png(mask, mask_dir / f"{img.name}.png")

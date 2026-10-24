@@ -110,6 +110,9 @@ DEFAULTS: dict[str, Any] = {
         # （例如 guided_matching 被过滤掉时）会让 max_num_matches 变成 0，
         # 触发 `Check failed: max_num_matches > 0` 直接崩溃。
         "max_num_matches": 32768,
+        # SfM 后端：auto=先探外部 COLMAP，不可用则 pycolmap；
+        # colmap/pycolmap 可强制。（实测本机 COLMAP 3.12 的 matcher 选项绑定坏了，见 docs/03 G138）
+        "sfm_backend": "auto",
         "min_num_matches": 32,
         "multiple_models": False,
         # matcher: auto | sequential | exhaustive | vocab_tree

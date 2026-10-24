@@ -169,6 +169,7 @@ def detect_without_masks(job_dir: Path, max_pairs: int = 24) -> CaptureAnalysis 
     step = max(1, len(files) // max_pairs)
     statics = []
     changes = []
+    static_stds = []
     n_err = 0
     for i in range(0, len(files) - step, step):
         try:
@@ -190,7 +191,10 @@ def detect_without_masks(job_dir: Path, max_pairs: int = 24) -> CaptureAnalysis 
             a, b = a[:h, :w], b[:h, :w]
         d = np.abs(a - b)
         # "几乎不变"：差异 < 8（压缩噪声量级）
-        statics.append(float((d < 8).mean()))
+        _sm = d < 8
+        statics.append(float(_sm.mean()))
+        if _sm.any():
+            static_stds.append(float(a[_sm].std()))
         changes.append(float(d.mean()))
 
     if n_err:
@@ -201,14 +205,31 @@ def detect_without_masks(job_dir: Path, max_pairs: int = 24) -> CaptureAnalysis 
         return None
     st = float(np.mean(statics))
     ch = float(np.mean(changes))
+    static_std = float(np.mean(static_stds)) if static_stds else None
     if st < 0.40:
         mode = "orbit"
         reason = (f"画面静止像素仅 {st*100:.1f}%（< 40%）⇒ 整幅画面都在动 ⇒ "
                   f"相机绕物体行走")
     else:
-        mode = "turntable"
-        reason = (f"画面静止像素 {st*100:.1f}%（≥ 40%）⇒ 背景几乎不动、只有物体在转 ⇒ "
-                  f"转台拍法（相机固定）")
+        # ---- 关键守卫（2026-10-24）：静止区必须是**有结构的真实场景** ----
+        #
+        # 事故：对**已经抠掉背景**的帧（背景是纯白/纯黑），静止像素比例天然很高
+        # （实测 68.2%），旧逻辑据此判成"转台"，进而把 `mask.mode` 设成 keep、
+        # 后续掩码全空、直到 COLMAP 才崩。
+        # 判据：静止区域的**灰度标准差**。真实场景（墙/桌面/杂物）通常 > 10；
+        # 抠图后的纯色背景 < 5。前者才支持"转台"结论。
+        bg_std = float(static_std) if static_std is not None else None
+        if bg_std is not None and bg_std < 6.0:
+            mode = "orbit"
+            reason = (f"静止像素 {st*100:.1f}% 但静止区几乎纯色（σ={bg_std:.1f} <6）"
+                      f"⇒ 这是**已抠除背景**的画面，不是静态场景 ⇒ 按 orbit 处理")
+        else:
+            mode = "turntable"
+            reason = (f"画面静止像素 {st*100:.1f}%（≥ 40%）且静止区有结构"
+                      f"（σ={bg_std:.1f}）⇒ 背景几乎不动、只有物体在转 ⇒ 转台拍法（相机固定）"
+                      if bg_std is not None else
+                      f"画面静止像素 {st*100:.1f}%（≥ 40%）⇒ 背景几乎不动、只有物体在转 ⇒ "
+                      f"转台拍法（相机固定）")
     # 用 change 作为"前景差异"的近似（无掩码时的代理量）
     return CaptureAnalysis(mode=mode, bg_diff=st, fg_diff=ch, ratio=st,
                            n_pairs=len(statics), reason=reason + "〔无掩码判据〕")

@@ -61,6 +61,20 @@ def pick_sparse_model(sparse: Path) -> Path | None:
     return best if score(best) > 0 else None
 
 
+def _pos_int(value, default: int) -> int:
+    """把配置值安全地转成**正整数**。
+
+    为什么需要（2026-10-24 事故）：COLMAP 的 SiftMatching.max_num_matches
+    必须 > 0，否则 sift.cc Check failed: max_num_matches > 0 (0 vs. 0) **直接崩**。
+    而配置值可能是字符串 "0"（真值）、0、负数或 None，
+    旧写法 int(cfg(...) or 32768) 对 "0" 不生效 ⇒ 传了 0 进去。
+    """
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return int(default)
+    return v if v > 0 else int(default)
+
 class ColmapStage(Stage):
     name = "colmap"
     title = "③ COLMAP 稀疏重建"
@@ -100,6 +114,22 @@ class ColmapStage(Stage):
         ctx.info(f"COLMAP: {colmap.path}")
         ctx.info(f"图像目录：{images_dir}" + (f"  mask：{mask_dir_arg}" if mask_dir_arg else "（不使用 mask）"))
 
+        # ---- 先探器：外部 COLMAP 的 matcher 能不能用 ----
+        #
+        # 实测（2026-10-24）：本机 COLMAP 3.12 的 `--SiftMatching.*` **选项绑定损坏** ——
+        # 传合法值（1 / 999999）或不传，检查点都读到 0 并崩 `Check failed: max_num_matches > 0`；
+        # 而传非法值却能正常报"argument invalid"，说明解析通道正常、值没进结构体。
+        # 结论是构建缺陷（不是权限）。与其让整单挂在第③步，这里先用空库探一次，
+        # 探不通就直接走 pycolmap 后端（官方 Python 绑定，同一套引擎）。
+        backend_choice = str(ctx.cfg("sfm_backend", "auto")).lower()
+        if backend_choice == "pycolmap":
+            ctx.info("配置指定 sfm_backend=pycolmap ⇒ 跳过外部 COLMAP")
+            return self._run_pycolmap_backend(ctx, images_dir, base, colmap)
+        if backend_choice in ("auto", "colmap") and not self._matcher_ok(ctx, colmap, base):
+            return self._run_pycolmap_backend(ctx, images_dir, base, colmap)
+        if backend_choice == "colmap":
+            ctx.info("配置指定 sfm_backend=colmap ⇒ 不启用 pycolmap 兜底")
+
         # 1) 特征提取
         self._run_colmap(
             ctx, colmap.path, log,
@@ -133,21 +163,40 @@ class ColmapStage(Stage):
                 "sequential_matcher",
                 "--database_path", str(db),
                 "--SiftMatching.use_gpu", "1" if bool(ctx.cfg("use_gpu", True)) else "0",
-                "--SiftMatching.max_num_matches", str(int(ctx.cfg("max_num_matches", 32768) or 32768)),
-                "--SequentialMatching.overlap", str(int(ctx.cfg("sequential_overlap", 12))),
+                "--SiftMatching.max_num_matches", str(_pos_int(ctx.cfg("max_num_matches", 32768), 32768)),
+                "--SequentialMatching.overlap", str(_pos_int(ctx.cfg("sequential_overlap", 12), 12)),
                 "--SiftMatching.guided_matching", "1" if bool(ctx.cfg("guided_matching", True)) else "0",
             ]
             if use_loop:
                 args += ["--SequentialMatching.loop_detection", "1",
                          "--SequentialMatching.vocab_tree_path", vocab_tree]
                 ctx.info("已启用闭环检测（vocabulary tree 存在）")
-            self._run_colmap(ctx, colmap.path, log, args, "序列匹配")
+            # 序列匹配失败时**自动回退 exhaustive**（2026-10-24，鲁棒性）。
+            # 实测遇到过 sequential 在选项/版本组合下原生崩溃（exit 3221226505），
+            # 而同一份数据用 exhaustive 能顺利匹配。宁可慢一点，也不要整单失败。
+            try:
+                self._run_colmap(ctx, colmap.path, log, args, "序列匹配")
+            except Exception as exc:  # noqa: BLE001
+                ctx.warn(f"序列匹配失败（{type(exc).__name__}）⇒ 自动回退 exhaustive 重试一次")
+                self._run_colmap(
+                    ctx, colmap.path, log,
+                    [
+                        "exhaustive_matcher",
+                        "--database_path", str(db),
+                        "--SiftMatching.use_gpu", "1" if bool(ctx.cfg("use_gpu", True)) else "0",
+                        "--SiftMatching.max_num_matches",
+                        str(_pos_int(ctx.cfg("max_num_matches", 32768), 32768)),
+                        "--SiftMatching.guided_matching",
+                        "1" if bool(ctx.cfg("guided_matching", True)) else "0",
+                    ],
+                    "穷举匹配（回退）",
+                )
         else:
             args = [
                 "exhaustive_matcher" if matcher == "exhaustive" else "vocab_tree_matcher",
                 "--database_path", str(db),
                 "--SiftMatching.use_gpu", "1" if bool(ctx.cfg("use_gpu", True)) else "0",
-                "--SiftMatching.max_num_matches", str(int(ctx.cfg("max_num_matches", 32768) or 32768)),
+                "--SiftMatching.max_num_matches", str(_pos_int(ctx.cfg("max_num_matches", 32768), 32768)),
                 "--SiftMatching.guided_matching", "1" if bool(ctx.cfg("guided_matching", True)) else "0",
             ]
             self._run_colmap(ctx, colmap.path, log, args, "全局匹配")
@@ -212,6 +261,85 @@ class ColmapStage(Stage):
             artifacts=[str(model), str(text_dir), str(base / "report.json")],
             metrics=report,
             message=f"注册 {report['registered']}/{report['total_images']} 张，稀疏点 {report['points3D']}",
+        )
+
+
+    # ------------------------------------------------------------------ pycolmap 兜底
+    def _matcher_ok(self, ctx: StageContext, colmap, base: Path) -> bool:
+        """探测外部 COLMAP 的 SiftMatching 是否可用（实测过 3.12 安装包选项绑定坏了）。
+
+        做法：用一个**空数据库**跑一次 exhaustive_matcher。正常情况下它几秒内正常退出；
+        而坏掉的构建会报 Check failed: max_num_matches > 0 (0 vs. 0)。
+        探测失败（或超时）都当作不可用，宁可走 pycolmap，也不让整单挂在第三步。
+        """
+        probe = base / "probe_matcher"
+        try:
+            if probe.exists():
+                shutil.rmtree(probe, ignore_errors=True)
+            probe.mkdir(parents=True, exist_ok=True)
+            db = probe / "probe.db"
+            self._run_colmap(ctx, colmap.path, base / "probe.log",
+                             ["database_creator", "--database_path", str(db)],
+                             "探测数据库", allow_fail=True)
+            rc = self._run_colmap(
+                ctx, colmap.path, base / "probe.log",
+                ["exhaustive_matcher", "--database_path", str(db),
+                 "--SiftMatching.max_num_matches", "32768"],
+                "探测匹配器", allow_fail=True)
+            text = (base / "probe.log")
+            bad = False
+            if text.exists():
+                tail = text.read_text(encoding="utf-8", errors="ignore")[-4000:]
+                bad = ("max_num_matches > 0" in tail) or ("options_.Check()" in tail)
+            if bad or rc != 0:
+                ctx.warn("外部 COLMAP 的 SiftMatching 不可用（选项绑定损坏），将使用 pycolmap 后端")
+                return False
+            return True
+        except Exception as exc:  # noqa: BLE001
+            ctx.warn(f"有效性探测异常（{type(exc).__name__}），改用 pycolmap 后端")
+            return False
+
+    def _run_pycolmap_backend(self, ctx: StageContext, images_dir: Path, base: Path,
+                              colmap) -> StageResult:
+        """用 pycolmap 跑完 SfM（特征→匹配→建图），并产出与外部 COLMAP 相同的产物布局。"""
+        from ..gsdata.sfm_pycolmap import run_pycolmap_sfm
+
+        sparse = base / "sparse"
+        if sparse.exists():
+            shutil.rmtree(sparse, ignore_errors=True)
+        sparse.mkdir(parents=True, exist_ok=True)
+        meta = run_pycolmap_sfm(
+            images_dir=images_dir,
+            work_dir=base / "pycolmap_work",
+            out_sparse=sparse,
+            max_features=_pos_int(ctx.cfg("max_num_features", 8192), 8192),
+            max_image_size=_pos_int(ctx.cfg("max_image_size", 2048), 2048),
+            camera_model=str(ctx.cfg("cameras", "SIMPLE_RADIAL")),
+            overlap=_pos_int(ctx.cfg("sequential_overlap", 12), 12),
+            use_gpu=bool(ctx.cfg("use_gpu", True)),
+            log=ctx.info,
+        )
+        model = self._find_model(sparse)
+        if model is None:
+            raise StageError(self.name, "pycolmap 也没能建出模型",
+                             "检查图像重叠度（提高抽帧密度）或前景掩码是否把纹理吃掉")
+        text_dir = base / "sparse_txt"
+        text_dir.mkdir(exist_ok=True)
+        try:
+            import pycolmap
+            pycolmap.Reconstruction(str(model)).write_text(str(text_dir))
+        except Exception as exc:  # noqa: BLE001
+            ctx.warn(f"导出文本模型失败（{type(exc).__name__}），不影响下游")
+        report = self._quality_report(ctx, images_dir, text_dir)
+        report["sfm_backend"] = "pycolmap"
+        report.update({k: meta[k] for k in ("num_registered", "num_points3D") if k in meta})
+        (base / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        ctx.info(f"pycolmap 完成：注册 {report['registered']}/{report['total_images']}，"
+                 f"稀疏点 {report['points3D']}、平均重投影 {report['mean_reproj_error']:.3f}px")
+        return StageResult(
+            artifacts=[str(model), str(text_dir), str(base / "report.json")],
+            metrics=report,
+            message=f"注册 {report['registered']}/{report['total_images']} 张（pycolmap），稀疏点 {report['points3D']}",
         )
 
     # ------------------------------------------------------------------ 工具
@@ -279,6 +407,7 @@ class ColmapStage(Stage):
             ctx.warn("未找到掩码文件，跳过 mask 模式")
             return None
         return mask_dir
+
 
     def _choose_matcher(self, ctx: StageContext, images_dir: Path) -> str:
         want = str(ctx.cfg("matcher", "auto")).lower()

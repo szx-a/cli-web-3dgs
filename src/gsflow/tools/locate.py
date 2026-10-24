@@ -27,12 +27,16 @@ CANDIDATES: dict[str, list[str]] = {
         "ffmpeg-*/bin/ffprobe.exe",
     ],
     "colmap": [
+        # ⚠️ 顺序很重要（2026-10-24）：**带版本号的优先**。
+        # 实测本机 	ools\\colmap（3.12）的 --SiftMatching.* 选项绑定坏了，
+        # 任何匹配都报 Check failed: max_num_matches > 0；
+        # 而 	ools\\colmap-4.2.1 完全正常（已验证）。
+        "colmap-*/bin/colmap.exe",
+        "colmap-*/COLMAP.bat",
         "colmap.exe",
         "bin/colmap.exe",
         "COLMAP/colmap.exe",
         "colmap/COLMAP.bat",
-        "colmap-*/bin/colmap.exe",
-        "colmap-*/COLMAP.bat",
         "COLMAP.bat",
     ],
     "magick": ["magick.exe", "ImageMagick*/magick.exe"],

@@ -40,6 +40,7 @@ max_num_features = 8192
 use_gpu = true
 guided_matching = true
 max_num_matches = 32768
+sfm_backend = "auto"
 min_num_matches = 32
 multiple_models = false
 matcher = "auto"
