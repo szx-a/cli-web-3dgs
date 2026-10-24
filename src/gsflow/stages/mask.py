@@ -187,6 +187,25 @@ class MaskStage(Stage):
                     f"原因：{type(exc).__name__}: {exc}。"
                     "可改用 mask.backend=rembg，或对已裁好的帧跳过 mask 阶段") from exc
 
+        # ---- 两条拍摄模式判据的一致性复核（2026-10-24）----
+        #
+        # 实测：同一份输入，**无掩码判据**判成 turntable（保留背景），
+        # **有掩码判据**判成 orbit（抠黑）。两条路径结论不一致，而走哪条取决于执行顺序
+        # ⇒ 同一命令重跑会得到不同结果（img3-v2 掩码内 21.96/0.9267 vs img3-v7 21.00/0.9485）。
+        # 这里在掩码产生后再用掩码判据复核一次；不一致就告警并写进 capture_mode.json。
+        try:
+            from ..gsdata.capture_mode import detect_from_frames as _detect_m
+
+            _alt = _detect_m(ctx.job_dir, max_pairs=20)
+            if _alt is not None and _alt.mode != cap_mode:
+                ctx.warn(
+                    f"拍摄模式两条判据不一致：无掩码={cap_mode}、有掩码={_alt.mode}"
+                    f"（{_alt.reason[:60]}）。建议用 --capture-mode 显式指定，"
+                    f"否则结果会随执行顺序变化")
+                cap_note = (cap_note or "") + f"｜有掩码判据为 {_alt.mode}"
+        except Exception as _exc:  # noqa: BLE001
+            ctx.warn(f"有掩码判据复核跳过：{type(_exc).__name__}")
+
         # ---- 掩码自动收紧（2026-10-24，鲁棒性）----
         #
         # 实测：分割后端产出的掩码经常“整体偏大”——掩码内靠边那圈实际是背景。
