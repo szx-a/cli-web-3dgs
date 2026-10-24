@@ -344,7 +344,22 @@ class ColmapStage(Stage):
 
     # ------------------------------------------------------------------ 工具
     def _pick_images_dir(self, ctx: StageContext) -> Path:
-        """优先用清理后的图；没有就回退到原始图（只清理不重建也能跑）。"""
+        """选择给 COLMAP 用的图像目录（`colmap.images` = auto|raw|clean）。
+
+        ## 为什么要能强制用原图（2026-10-24 实测）
+
+        转台/固定机位素材里，**静态背景是"相机没动"的唯一锚点**。把背景抠成黑会让特征骤减：
+        黑底图下 COLMAP 只注册 **311/406**（保留背景是 406/406），位姿坏掉后掩码内 PSNR 只有 **11.44 dB**。
+
+        而**训练**仍可以用黑底图（掩盖背景、把容量留给物体）。两件事应该分开：
+        `colmap.images=raw` + `mask.mode=black`。
+        """
+        want = str(ctx.cfg("images", "auto") or "auto").lower()
+        raw = ctx.job_dir / "01_images_raw"
+        if (want == "raw" and raw.exists()
+                and any(p.is_file() for p in raw.iterdir())):
+            ctx.info("colmap.images=raw ⇒ 用原始帧（背景作为注册锚点）")
+            return raw
         clean = ctx.job_dir / "02_images_clean"
         if clean.exists() and any(p.is_file() for p in clean.iterdir()):
             return clean

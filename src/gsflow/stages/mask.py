@@ -155,7 +155,9 @@ class MaskStage(Stage):
         _fg_ratios = [float(m.mean()) for m in masks.values() if m is not None and m.size]
         _mean_fg = float(sum(_fg_ratios) / max(len(_fg_ratios), 1))
         # ⚠️ mode=keep（转台拍法）时掩码本就是全 1，不能当退化
-        if mode != "keep" and _fg_ratios and (_mean_fg < 0.005 or _mean_fg > 0.995):
+        # 阈值收紧（2026-10-24）：实测坏掩码往往不是“全 0”而是“大面积包含背景”，
+        # 前景占比会偏大（如 80~95%），而下游不会报错。所以把合理区间收到 2%~90%。
+        if mode != "keep" and _fg_ratios and (_mean_fg < 0.02 or _mean_fg > 0.90):
             ctx.warn(f"分割退化：平均前景占比 {_mean_fg*100:.2f}%"
                      f"（{len(_fg_ratios)} 张）⇒ 换 classical 后端重试一次")
             try:
@@ -163,7 +165,7 @@ class MaskStage(Stage):
                 masks2 = segmenter2.segment(images, on_progress=on_progress)
                 _fg2 = [float(m.mean()) for m in masks2.values() if m is not None and m.size]
                 _mean2 = float(sum(_fg2) / max(len(_fg2), 1)) if _fg2 else 0.0
-                if 0.005 <= _mean2 <= 0.995:
+                if 0.02 <= _mean2 <= 0.90:
                     ctx.warn(f"classical 兜底成功：平均前景 {_mean2*100:.1f}%"
                              f"（{backend_name} 为 {_mean_fg*100:.2f}%）")
                     masks, backend_name, _mean_fg = masks2, "classical", _mean2
