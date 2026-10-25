@@ -1053,7 +1053,9 @@ class ExportStage(Stage):
                          f"（{st['stop']}），采信顶点比例 {st['used_fraction'][-1] * 100:.0f}%")
             return mesh
         except Exception as exc:  # noqa: BLE001
-            ctx.warn(f"网格精修失败（{type(exc).__name__}: {exc}），使用未精修网格")
+            import traceback
+            tb = traceback.format_exc(limit=3)
+            ctx.warn(f"网格精修失败（{type(exc).__name__}: {exc}），使用未精修网格\n{tb}")
             return mesh
 
     def _finish_mesh(self, ctx: StageContext, mesh, info: dict, out_dir: Path,
@@ -1150,6 +1152,24 @@ class ExportStage(Stage):
                 ctx.info("法线统一朝外（写盘前）")
         except Exception as exc:  # noqa: BLE001
             ctx.warn(f"法线定向失败（{type(exc).__name__}: {exc}）")
+
+        # ---- 终态拓扑（唯一可信的"交付判据"，2026-10-25）----
+        #
+        # 为什么在这里再算一次：补洞那一步打印的"封闭"是**中间状态**，之后还有
+        # 焊接/删面/定向会改变拓扑。实测 img5-quality：补洞日志写"封闭=False"，
+        # 而最终写盘的网格其实是 closed=True（边界边 0、非流形 0、顶点流形）。
+        # 报告必须对**交付物**负责，所以统一在写盘前用 `mesh_topology` 出终态。
+        try:
+            from ..gsdata.mesh_export import mesh_topology
+
+            topo = mesh_topology(mesh)
+            info["mesh_topology_final"] = topo
+            ctx.info("网格终态：面 %d / 边界边 %d / 非流形 %d / **封闭=%s** / 自交=%s"
+                     % (topo["triangles"], topo["boundary_edges"],
+                        topo["nonmanifold_edges"], topo["closed"],
+                        topo.get("self_intersecting")))
+        except Exception as exc:  # noqa: BLE001
+            ctx.warn(f"终态拓扑统计失败（{type(exc).__name__}: {exc}）")
 
         out: list[dict] = []
         obj_path = out_dir / "model_mesh.obj"

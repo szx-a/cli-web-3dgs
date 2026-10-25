@@ -102,6 +102,17 @@ def refine_mesh_to_depths(
         if j >= len(rendered):
             break
         _, depth, alpha = rendered[j]
+        # ⚠️ `render_depths` 返回的 alpha 形状是 (H,W,1)（gsplat 输出带通道维）。
+        # 不 squeeze 的话 `_bilinear` 返回 (N,1)，随后
+        # `ok & (a_r > min_alpha) & (d_r > 0)` 会在 (N,) 与 (N,1) 之间广播成 (N,N)，
+        # 再拿它索引法线就报 `IndexError: too many indices for array`
+        # （实测在 img5-quality 的导出里踩到，整个精修因此被降级跳过）。
+        depth = np.asarray(depth, dtype=np.float32)
+        alpha = np.asarray(alpha, dtype=np.float32)
+        if depth.ndim == 3:
+            depth = depth[..., 0]
+        if alpha.ndim == 3:
+            alpha = alpha[..., 0]
         c2w = np.asarray(cams[vi][0], dtype=np.float64)
         w2c = np.linalg.inv(c2w)
         K = scale_intrinsics(np.asarray(ks[vi], dtype=np.float64), src_wh,
@@ -177,18 +188,22 @@ def refine_mesh_to_depths(
         #
         # 只用"固定步长 + 固定上限"会越过表面来回震荡（实测：盒面到球面误差 0.039 →
         # 0.187，越修越糟）。回溯 + 阻尼减半保证每轮都单调不增，这是 ICP 的标准做法。
+        #
+        # ⚠️ 回退后**本轮必须跳过位移**（`continue`）：第一版回退完仍继续施加同一个坏位移，
+        # 结果残差从 0.0643 涨到 0.0789 —— "回退了"但状态又被打坏，等于没回退。
         if med < best * 0.999:
             best = med
             verts_best = verts.copy()
             bad_rounds = 0
         else:
             bad_rounds += 1
-            damp = max(damp * 0.5, 0.02)
+            damp *= 0.5
             verts = verts_best.copy()
             out.vertices = o3d.utility.Vector3dVector(verts)
-            if bad_rounds >= patience:
+            if bad_rounds >= patience or damp < 0.05:
                 stats["stop"] = "converged"
                 break
+            continue
 
         has = disp_cnt > 0
         if has.any():
