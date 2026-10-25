@@ -668,6 +668,123 @@ let MODELS = null;          // 当前作业的 /api/models 结果
 let ACTIVE_MODE = 'preview'; // 默认显示最可靠的视图（没有则自动回退）
 let VIEWER_READY = false;
 
+/* ============================================================================
+ * ViewerHub：**同一时刻只有一个活动渲染器**，按钮只作用于它
+ * ============================================================================
+ *
+ * ## 为什么要这层（2026-10-25，用户反馈"按钮交互会冲突"）
+ *
+ * 页面里存在两套渲染器：
+ *   * `GsRefViewer`（refviewer.js，社区参考库 gaussian-splats-3d）—— 负责 3DGS 的 .ply/.splat；
+ *   * `GsViewer`（viewer.js，自研 WebGL1）—— 负责 glb / 普通 ply / 网格。
+ *
+ * 但按钮（重置视角 / 切换线框 / 旋转模式）以前**无条件打到 `GsViewer`**：
+ *   * 显示 3DGS 时 `GsViewer` 并没有画布在显示 ⇒ 点"重置"看着像没反应；
+ *   * 更糟的是它可能作用在**隐藏的 canvas** 上，而屏幕上是参考渲染器 —— 即"命令打到另一个渲染器"。
+ *
+ * 这层把"活动渲染器 + 能力"显式化：
+ *   * `set(kind)`      —— 切换活动渲染器，并刷新按钮可用性；
+ *   * `supports(cap)`  —— 当前渲染器是否支持某能力；
+ *   * `reset/wire/rot` —— 路由到当前渲染器；不支持就**什么都不做且按钮已禁用**。
+ */
+const ViewerHub = (() => {
+  let active = null;           // 'ref' | 'gs' | null
+  let refInfo = null;          // 参考渲染器的取景信息（resetCamera 需要）
+  const CAPS = {
+    ref: { reset: true, wire: false, rotmode: false },
+    gs: { reset: true, wire: true, rotmode: true },
+  };
+  const WHY = {
+    wire: '线框只对自研 WebGL 查看器（glb / 网格）有效；当前是 3DGS 参考渲染器',
+    rotmode: '旋转模式只对自研 WebGL 查看器有效；当前是 3DGS 参考渲染器',
+  };
+
+  function supports(cap) {
+    return !!(active && CAPS[active] && CAPS[active][cap]);
+  }
+
+  function syncButtons() {
+    const pairs = [
+      ['btn-m-wire', 'wire', '切换线框'],
+      ['btn-m-rotmode', 'rotmode', null],
+      ['btn-m-reset', 'reset', null],
+    ];
+    for (const [id, cap, label] of pairs) {
+      const el = document.getElementById(id);
+      if (!el) continue;
+      const ok = supports(cap);
+      el.disabled = !ok;
+      el.style.opacity = ok ? '' : '0.45';
+      el.style.cursor = ok ? '' : 'not-allowed';
+      if (ok) {
+        if (el.dataset.hubWhy) { delete el.dataset.hubWhy; el.removeAttribute('title'); }
+        if (id === 'btn-m-rotmode') {
+          try {
+            const m = window.GsViewer && window.GsViewer.getRotMode
+              ? window.GsViewer.getRotMode() : 'free';
+            el.textContent = m === 'free' ? '旋转模式：自由翻转' : '旋转模式：到顶底停住';
+          } catch (e) { /* 忽略 */ }
+        } else if (label) {
+          el.textContent = label;
+        }
+      } else {
+        el.dataset.hubWhy = WHY[cap] || '当前查看器不支持该操作';
+        el.title = el.dataset.hubWhy;
+      }
+    }
+  }
+
+  function set(kind) {
+    active = (kind === 'ref' || kind === 'gs') ? kind : null;
+    // 指针事件隔离：只有**活动**渲染器的画布接收鼠标/触摸。
+    // 3DGS 时仅把我们的 canvas 设 display:none 还不够（某些布局下仍可命中），
+    // 这里再显式关掉 pointer-events，避免一次拖拽同时驱动两套控制器 ——
+    // 这正是用户说的"与 webgl 的交互没分开"。
+    try {
+      const cv = document.getElementById('m-canvas');
+      if (cv) cv.style.pointerEvents = (active === 'gs') ? 'auto' : 'none';
+      const stage = document.querySelector('#m-canvas-wrap > .gs-ref-stage');
+      if (stage) stage.style.pointerEvents = (active === 'ref') ? 'auto' : 'none';
+    } catch (e) { /* 忽略 */ }
+    syncButtons();
+    return active;
+  }
+
+  function reset() {
+    if (active === 'ref' && window.GsRefViewer && window.GsRefViewer.resetCamera) {
+      window.GsRefViewer.resetCamera(refInfo || {});
+      return true;
+    }
+    if (active === 'gs' && window.GsViewer && window.GsViewer.reset) {
+      window.GsViewer.reset();
+      return true;
+    }
+    return false;
+  }
+
+  function toggleWire() {
+    if (!supports('wire')) return null;
+    return window.GsViewer.toggleWire();
+  }
+
+  function setRotMode(mode) {
+    if (!supports('rotmode')) return null;
+    window.GsViewer.setRotMode(mode);
+    return window.GsViewer.getRotMode();
+  }
+
+  function rotMode() {
+    if (!supports('rotmode')) return null;
+    return window.GsViewer.getRotMode();
+  }
+
+  return {
+    set, supports, reset, toggleWire, setRotMode, rotMode, syncButtons,
+    setRefInfo(info) { refInfo = info || null; },
+    get active() { return active; },
+  };
+})();
+
 /**
  * 懒创建 WebGL1 查看器（只服务 glb / 普通 ply）。
  * 高斯与预览模式不碰它 —— 见 initModelsPage 里的说明。
@@ -689,6 +806,8 @@ function ensureViewer() {
   try {
     window.GsViewer.init(cv, (s) => { $('m-status').textContent = s || ''; });
     VIEWER_READY = true;
+    // 自研 WebGL 查看器就绪 ⇒ 它是当前活动渲染器（按钮路由到它）
+    try { ViewerHub.set('gs'); } catch (e) { /* 忽略 */ }
     return true;
   } catch (e) {
     const ov = $('m-overlay');
@@ -839,6 +958,8 @@ async function renderCurrentViewOnServer() {
   tmp.onload = () => {
     if (img) { img.style.display = 'block'; img.src = tmp.src; }
     if (cv) cv.style.display = 'none';
+    // 服务端渲染/预览图模式：屏幕上没有可交互的 3D 渲染器
+    try { ViewerHub.set(null); } catch (e) { /* 忽略 */ }
     $('m-overlay').classList.add('hide');
     $('m-status').textContent = `服务端渲染 yaw=${cam.yaw.toFixed(1)}° `
       + `pitch=${cam.pitch.toFixed(1)}° · gsplat 官方光栅化器`;
@@ -936,6 +1057,10 @@ async function loadModelFile(f) {
       const r = await ref.mount(host, url, info || {}, (s) => {
         $('m-status').textContent = s || '';
       });
+      // 参考渲染器就绪 ⇒ 它是当前活动渲染器；线框/旋转模式对它不适用，
+      // 按钮会被禁用并写明原因（避免"点了没反应"或"命令打到隐藏的另一个渲染器"）。
+      ViewerHub.setRefInfo(info || {});
+      ViewerHub.set('ref');
       $('m-overlay').classList.add('hide');
       $('m-status').textContent = `${f.name} · 参考渲染器 `
         + `(${r.renderer}) · ${(r.gaussians || 0).toLocaleString()} 高斯（含 SH）`;
@@ -962,6 +1087,7 @@ async function loadModelFile(f) {
     const cv = $('m-canvas');
     if (img) {
       img.style.display = 'block';
+    try { ViewerHub.set(null); } catch (e) { /* 忽略 */ }
       img.src = f.url;
       img.onerror = () => {
         $('m-overlay').classList.remove('hide');
@@ -1143,27 +1269,35 @@ async function selectModelJob() {
 
 $('btn-m-reload').onclick = loadModelJobs;
 $('m-job').onchange = selectModelJob;
-// 这三个按钮都依赖 WebGL1 查看器已初始化。改成先 ensureViewer()，
-// 否则在"懒初始化"之后它们会静默失效（用户报"重置视角/切换线框/旋转模式没用了"）。
+// 三个按钮统一经 `ViewerHub` 路由（2026-10-25）：
+//   * 显示 3DGS（参考渲染器）时，"重置视角"交给参考库的 resetCamera；
+//     线框/旋转模式对它无意义 ⇒ 按钮**禁用**并在 title 里说明原因；
+//   * 显示 glb/网格（自研 WebGL）时三个按钮照常。
+// 这样不会再出现"命令打到另一个（隐藏的）渲染器"这种交互冲突。
 $('btn-m-reset').onclick = () => {
-  if (ensureViewer()) window.GsViewer.reset();
+  if (!ViewerHub.active && !ensureViewer()) return;
+  ViewerHub.reset();
 };
 $('btn-m-wire').onclick = () => {
+  if (!ViewerHub.supports('wire')) return;          // 按钮此时是禁用的，双保险
   if (!ensureViewer()) return;
-  const on = window.GsViewer.toggleWire();
+  const on = ViewerHub.toggleWire();
   $('btn-m-wire').textContent = on ? '关闭线框' : '切换线框';
 };
 // 旋转模式切换：'free'（可越过顶/底继续翻，默认）| 'clamp'（到顶底停住）
 // 两种都**不会中途反向**（那才是"卡住"）；差别只在极点处停住还是翻过去。
 if ($('btn-m-rotmode')) {
   $('btn-m-rotmode').onclick = () => {
+    if (!ViewerHub.supports('rotmode')) return;     // 同上，双保险
     if (!ensureViewer()) return;
-    const cur = window.GsViewer.getRotMode ? window.GsViewer.getRotMode() : 'clamp';
+    const cur = ViewerHub.rotMode() || 'clamp';
     const next = cur === 'free' ? 'clamp' : 'free';
-    window.GsViewer.setRotMode(next);
+    ViewerHub.setRotMode(next);
     $('btn-m-rotmode').textContent = next === 'free' ? '旋转模式：自由翻转' : '旋转模式：到顶底停住';
   };
 }
+// 首屏（还没加载任何模型）时三个按钮都不该可用
+try { ViewerHub.syncButtons(); } catch (e) { /* 忽略 */ }
 
 /* ------------------------------------------------------------------ 启动 */
 (async function boot() {
