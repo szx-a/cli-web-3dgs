@@ -2182,11 +2182,22 @@ def _update_param_with_optimizer(param_fn, optimizer_fn, params: dict, optimizer
             group["params"] = [new]
 
 
-@torch.no_grad()
 def _apply_keep(params: dict, optimizers: dict, keep) -> None:
-    """按 keep 掩码裁剪高斯（官方 remove 模式）。"""
+    """按 keep 掩码裁剪高斯（官方 remove 模式）。
+
+    ⚠️ 这里**不能**用模块级 `@torch.no_grad()` 装饰器：本模块在没有 torch 的环境里
+    也要能被 import（安装器的 core-only 安装、`gsflow doctor` 的环境自检都会 import 它），
+    而 `torch` 在那种情况下是 None ⇒ 装饰器求值直接
+    `AttributeError: 'NoneType' object has no attribute 'no_grad'`，连 CLI 都起不来。
+    （这个 bug 是安装器在干净目录实测时抓到的。）
+    """
     import torch
 
+    with torch.no_grad():
+        _apply_keep_inner(params, optimizers, keep, torch)
+
+
+def _apply_keep_inner(params: dict, optimizers: dict, keep, torch) -> None:
     sel = torch.where(keep)[0]
 
     def param_fn(name, p):
@@ -2198,10 +2209,23 @@ def _apply_keep(params: dict, optimizers: dict, keep) -> None:
     _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
 
 
-@torch.no_grad()
 def _grow(params: dict, optimizers: dict, duplicate_mask, split_mask,
           revised_opacity: float = 0.1) -> tuple[int, int]:
     """加密：对 duplicate_mask 克隆、对 split_mask 分裂（官方 duplicate/split 模式）。
+
+    同 `_apply_keep`：**不能用模块级装饰器** —— 无 torch 环境下 import 本模块就会崩
+    （安装器的 core-only 路径实测）。
+    """
+    import torch
+
+    with torch.no_grad():
+        return _grow_inner(params, optimizers, duplicate_mask, split_mask,
+                           revised_opacity, torch)
+
+
+def _grow_inner(params: dict, optimizers: dict, duplicate_mask, split_mask,
+                revised_opacity: float, torch) -> tuple[int, int]:
+    """实际执行加密（调用方已进入 `torch.no_grad()`）。
 
     split 的两个细节照官方：
       * 尺度除以 1.6（`split` 的官方系数）；
