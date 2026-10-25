@@ -126,7 +126,20 @@ scripts\web.cmd            :: http://127.0.0.1:8787
 | 预设 | 内容 | 适用 |
 |---|---|---|
 | `balanced` | 当前默认（30k、densify_until 4000、内置密度控制）| 快速验证 |
-| `quality` | 60k、`cap_max` 300k、densify_until 10000、每步 LPIPS 0.1、2DGS 面元正则 0.02、推实正则 0.05（warmup 0.4）| 交付质量 |
+| `quality` | 60k、`cap_max` 300k、densify_until 10000、每步 LPIPS 0.1、2DGS 面元正则 0.02、推实正则 0.05（warmup 0.4）| **画质优先** |
+| `solid` | 在 `quality` 基础上加**单边不透明度下限**（`opacity_floor=0.12`，reg 0.5，warmup 0.3）| **观感优先**（不"朦胧"）|
+
+**实测取舍（img5，8 个留出视角，同一把论文对齐的尺子）**：
+
+| 方案 | `op<0.1` 占比 | 掩码 PSNR | 掩码 SSIM | LPIPS |
+|---|---|---|---|---|
+| `balanced`（30k）| 85.0% | 29.87 | 0.9846 | 0.2370 |
+| `quality`（无 floor）| 100%（更淡）| **30.16** | **0.9868** | **0.2300** |
+| `solid`（带 floor）| **61.8%** | 29.86 | 0.9846 | 0.2363 |
+
+⇒ **"实心度"与"画质"是真实取舍**，没有免费的一边倒：
+要"不像雾"选 `solid`，要"最像原图"选 `quality`。
+注意 `op*(1-op)` 这种**对称**正则实测**完全无效**（op→0 时惩罚与梯度一起趋零），必须用单边下限。
 
 > `train.densify_strategy=official`（gsplat 官方 `DefaultStrategy`）**目前不推荐**：
 > 实测在 step 10000 涨到 251 万高斯（我们已补上漏传的 `cap_max`，但阈值仍需重新标定）。

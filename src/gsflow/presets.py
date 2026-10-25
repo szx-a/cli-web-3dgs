@@ -48,6 +48,37 @@ PRESETS: dict[str, dict[str, Any]] = {
     #   * `lambda_normal` / `lambda_depth_distortion`：2DGS 面元约束，改善网格。
     #   * `opacity_reset_interval=3000` + `auto_extend_densify_when_reset`：
     #     官方"重置后继续致密化"的联动，避免重置把密度窗口提前关死。
+    # ---- 实心优先（v3 实测版，2026-10-25）----
+    #
+    # 实测结论：“实心度”与“画质”是**真实取舍**。
+    #   quality（无 floor）：op<0.1 = 100%，但 LPIPS 0.2300（最好）
+    #   solid（带 floor）：op<0.1 = 61.8%，LPIPS 0.2363（=基线 0.2370）
+    # 两者都合理，取决于交付目的：要“不透”就选 solid，要“最像”就选 quality。
+    "solid": {
+        "train.iterations": 60000,
+        "train.densify_from": 500,
+        "train.densify_until": 10000,
+        "train.densify_interval": 100,
+        "train.cap_max": 300000,
+        "train.densify_strategy": "builtin",
+        "train.rasterize_mode": "classic",
+        "train.lambda_lpips": 0.1,
+        "train.lpips_every": 1,
+        "train.lpips_size": 224,
+        "train.lambda_normal": 0.02,
+        "train.lambda_depth_distortion": 0.02,
+        "train.depth_mode": "expected",
+        "train.depth_distortion_mode": "tv",
+        "train.sh_degree": 3,
+        "train.eval_metrics": True,
+        "train.opacity_crisp_reg": 0.05,
+        "train.opacity_crisp_warmup": 0.4,
+        # 关键：单边下限（对称正则在 op→0 时梯度趋零，实测完全无效）
+        "train.opacity_floor": 0.12,
+        "train.opacity_floor_reg": 0.5,
+        "train.opacity_floor_warmup": 0.3,
+    },
+
     "quality": {
         "train.iterations": 60000,
         "train.densify_from": 500,
@@ -82,6 +113,8 @@ ALIASES = {
     "default": "balanced",
     "q": "quality",
     "hq": "quality",
+    "solid": "solid",
+    "实心": "solid",
     "高质量": "quality",
 }
 

@@ -70,3 +70,24 @@ def test_bool_strings_are_coerced() -> None:
     assert presets._coerce_like("1", False) is True
     assert presets._coerce_like("0.5", 0.0) == 0.5
     assert presets._coerce_like("700", 1) == 700
+
+def test_solid_preset_uses_the_one_sided_floor() -> None:
+    """solid 必须带**单边下限**：对称正则（op*(1-op)）在 op→0 时梯度趋零，实测无效。"""
+    s = load({"preset": "solid"})
+    assert float(s.get("train.opacity_floor")) > 0
+    assert float(s.get("train.opacity_floor_reg")) > 0
+    assert float(s.get("train.opacity_floor_warmup")) > 0
+    assert str(s.get("train.rasterize_mode")) == "classic"
+    assert int(s.get("train.cap_max")) <= 400000
+
+
+def test_quality_and_solid_differ_in_exactly_the_solidity_knobs() -> None:
+    """两个预设的差异要**可解释**：quality 追求画质、solid 追求实心度。"""
+    q = load({"preset": "quality"})
+    d = load({"preset": "solid"})
+    assert float(q.get("train.opacity_floor")) == 0.0, "quality 不应启用地板正则"
+    assert float(d.get("train.opacity_floor")) > 0, "solid 必须启用地板正则"
+    # 共同点：每步 LPIPS 与 ED 深度
+    for s in (q, d):
+        assert int(s.get("train.lpips_every")) == 1
+        assert str(s.get("train.depth_mode")) == "expected"
