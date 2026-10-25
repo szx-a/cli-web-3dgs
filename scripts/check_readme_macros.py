@@ -26,7 +26,7 @@ le ge ne approx sim simeq equiv propto ll gg
 in notin ni subset supset subseteq supseteq cup cap setminus emptyset
 forall exists nexists neg land lor wedge vee oplus otimes
 to rightarrow leftarrow leftrightarrow Rightarrow Leftarrow uparrow downarrow
-mapsto longrightarrow iff implies deg ominus top
+mapsto longrightarrow iff implies deg ominus top lt gt
 partial nabla prime infty aleph hbar ell Re Im wp
 quad qquad space enspace thinspace
 overline underline widehat widetilde vec dot ddot hat bar tilde

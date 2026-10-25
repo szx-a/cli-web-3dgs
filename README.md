@@ -71,8 +71,8 @@
 转台（物体转、背景不动）与环绕（相机绕物体转、背景随视角变化）在数学上是**两类不同的相机模型假设**：
 转台意味着"世界坐标系随手转"，直接把背景当静态会与相机位姿矛盾。用背景的**时间稳定性**判别：
 
-$$s_b=\frac{\mathrm{median}_{u\notin M}\;\mathrm{Var}_t\big(I_t(u)\big)}
-{\mathrm{median}_{u\notin M}\;\big(I_t(u)\big)^2},$$
+$$s_b=\frac{\mathrm{median}_{u\notin M}\;\mathrm{Var}_t(I_t(u))}
+{\mathrm{median}_{u\notin M}\;(I_t(u))^2},$$
 
 $s_b$ 小 ⇒ 背景静止 ⇒ 转台；$s_b$ 大 ⇒ 环绕。本项目要求**判定必须在合成背景之前完成**
 （检测器输入原始帧 + 掩码，采样 12 帧成对比较），否则掩码把背景涂黑后差异被人为抹平，
@@ -83,12 +83,13 @@ $s_b$ 小 ⇒ 背景静止 ⇒ 转台；$s_b$ 大 ⇒ 环绕。本项目要求**
 只在掩码内取均值时，损失量级随前景占比漂移（实测各视角前景 12%~55% ⇒ 同误差下 loss 差 4.6 倍），
 且**掩码外完全无监督**。改成先把 GT 在掩码外合成为已知背景色
 
-$$\tilde I(u)=M(u)\,I(u)+\big(1-M(u)\big)\,b,$$
+$$\tilde I(u)=M(u)\,I(u)+(1-M(u))\,b,$$
 
 再在全图算损失，等价于
 
-$$\mathcal{L}=\frac{1}{|\Omega|}\Big[\underbrace{\sum_{M}\ell\big(C,I\big)}_{\text{前景拟合}}
-+\underbrace{\sum_{\bar M}\ell\big(C,b\big)}_{\text{背景压制}}\Big],$$
+$$\mathcal{L}=\frac{1}{|\Omega|}\left[\sum_{M}\ell(C,I)+\sum_{\bar M}\ell(C,b)\right],$$
+
+其中第一项拟合前景、第二项把背景压成已知色 $b$。
 
 第二项正是"物体外不许生成高斯"的软约束（$\ell$ 取 L1）。配套地，掩码用形态学腐蚀
 $M_\epsilon = M\ominus K_\epsilon$（`mask_erode_px`）收缩，避免把掩码外沿的亮背景学成轮廓高光。
@@ -111,17 +112,17 @@ $$\frac{\partial\mathcal{L}_{\text{crisp}}}{\partial o_j}
 
 **对称正则不够，还需要单边下限。** 只靠 crisp 项，`op<0.1` 的高斯仍占 85%。加上单边下限
 
-$$\mathcal{L}_{\text{floor}}=\lambda_f\,\frac1N\sum_j\mathrm{relu}\big(f-\alpha_j\big),
+$$\mathcal{L}_{\text{floor}}=\lambda_f\,\frac1N\sum_j\mathrm{relu}(f-\alpha_j),
 \qquad
 \frac{\partial \mathcal{L}_{\text{floor}}}{\partial o_j}
-=-\lambda_f\,\alpha_j(1-\alpha_j)\,\mathbf{1}[\alpha_j<f],$$
+=-\lambda_f\,\alpha_j(1-\alpha_j)\,\mathbf{1}[\alpha_j\lt f],$$
 
 （只能靠**抬高** $\alpha$ 来解除）后，在默认设置（30k、`cap_max` 600k）实测：
 
 | 指标 | 无下限 | **下限 0.10、权重 0.5** |
 |---|---|---|
 | `op` 中位 | 0.031 | **0.101** |
-| `op<0.1` 占比 | 85.0% | **4.0%** |
+| `op` 小于 0.1 的占比 | 85.0% | **4.0%** |
 | 掩码 PSNR | 18.840 | **18.849** |
 | 掩码 SSIM | 0.9654 | **0.9657** |
 
@@ -132,18 +133,20 @@ $$\mathcal{L}_{\text{floor}}=\lambda_f\,\frac1N\sum_j\mathrm{relu}\big(f-\alpha_
 
 一条视线的期望深度是**归一化**的加权平均
 
-$$D(u)=\frac{\sum_j w_j z_j}{\sum_j w_j},\qquad w_j=\alpha_j\prod_{k<j}(1-\alpha_k),$$
+$$D(u)=\frac{\sum_j w_j z_j}{\sum_j w_j},\qquad w_j=\alpha_j\prod_{k\lt j}(1-\alpha_k),$$
 
 而 gsplat 的 `render_mode="D"` 返回的是**未归一化**的 $\sum_j w_j z_j$。二者相差 $1/\sum_j w_j$ 倍。
 训练侧若用后者算法线/失真，而导出侧用前者反投影，两段就在优化**不同的量**。
 由 ED 求法线的切向量为
 
-$$\mathbf{P}_u=z_u\,\mathbf{m}+z\,(1/f_x,0,0)^\top,\quad
-\mathbf{P}_v=z_v\,\mathbf{m}+z\,(0,1/f_y,0)^\top,\quad
-\mathbf{n}=\frac{\mathbf{P}_u\times\mathbf{P}_v}{\Vert\mathbf{P}_u\times\mathbf{P}_v\Vert},$$
+$$\mathbf{P}_u=z_u\,\mathbf{m}+z\,(1/f_x,0,0)^{T}$$
 
-其中 $\mathbf{m}=K^{-1}[u,v,1]^\top$。用未归一化深度时，$z_u$ 被 $w$ 的梯度污染，
-正对相机的平面会算出偏离 $26.6^\circ$ 的法线（实测）；用 ED 则给出 $[0,0,-1]$（偏差 <1°，有单测）。
+$$\mathbf{P}_v=z_v\,\mathbf{m}+z\,(0,1/f_y,0)^{T}$$
+
+$$\mathbf{n}=\frac{\mathbf{P}_u\times\mathbf{P}_v}{|\mathbf{P}_u\times\mathbf{P}_v|}$$
+
+其中 $\mathbf{m}=K^{-1}[u,v,1]^{T}$。用未归一化深度时，$z_u$ 被 $w$ 的梯度污染，
+正对相机的平面会算出偏离 $26.6^\circ$ 的法线（实测）；用 ED 则给出 $[0,0,-1]$（偏差小于 1°，有单测）。
 
 ### 3.5 网格封闭性：一条**可证明**的判据
 
@@ -155,7 +158,9 @@ $$\partial_2 F=\emptyset
 $\deg(e)$ 是共享该边的面数；再要求顶点是流形（每个顶点的邻接面构成单一扇区）。
 补洞就是在边界环 $C\subset\partial_2F$ 上贴一张"帽" $H$，使
 
-$$\partial_2(F\cup H)=\emptyset,\qquad\text{且 } H \text{ 与 } F \text{ 共享的边方向相反}.$$
+$$\partial_2(F\cup H)=\emptyset$$
+
+并且新面 $H$ 与原有面 $F$ 在共享边上的**方向相反**。
 
 **逆向绕序**这一步是必要的：若新面与旧面在共享边上同向，则 $\partial$ 不会抵消，
 Open3D 的 `is_watertight()` 仍返回 False（实测边界边已归零却仍判 False，正是朝向不一致）。
@@ -166,39 +171,51 @@ Open3D 的 `is_watertight()` 仍返回 False（实测边界边已归零却仍判
 把网格顶点 $x_v$ 投影到视角 $i$，比较其深度 $z_v$ 与 ED 深度 $D_i(u_v)$，沿法线做**阻尼**位移
 
 $$\Delta x_v=\eta\cdot\frac{1}{|\mathcal{V}(v)|}\sum_{i\in\mathcal{V}(v)}
-\big(D_i(u_v)-z_v\big)\cos\theta_{iv},$$
+(D_i(u_v)-z_v)\cos\theta_{iv},$$
 
 $\cos\theta_{iv}$ 抑制掠射角放大（深度误差在掠射方向被夸大 $1/\cos\theta$）。
 每步之后若中位残差 $r^{(k)}=\mathrm{median}|\Delta|$ 变大，就**回退到最优顶点并把步长减半**：
 
-$$\eta_{k+1}=\tfrac12\eta_k,\qquad x^{(k+1)}=x^{\star}\ \text{（若 } r^{(k+1)}>r^{\star}\text{）},$$
+$$\eta_{k+1}=\tfrac12\eta_k,\qquad x^{(k+1)}=x^{\star}$$
+
+仅在 $r^{(k+1)}$ 大于最优残差 $r^{\star}$ 时执行这次回退。
 
 这是 ICP 的标准 backtracking，保证 $r^{(k)}$ 单调不增。实测：不加回溯时残差 $0.0643\to0.0789$（越修越糟），
 加上之后 $0.0643\to0.0551$（−14%，6 轮收敛）。
 
 ### 3.7 指标族：把"观感"拆成可计算的量
 
-| 指标 | 定义 | 判读 |
-|---|---|---|
-| 掩码内 PSNR/SSIM | $\mathrm{PSNR}=10\log_{10}\frac{1}{\mathrm{MSE}_M}$，SSIM 同式但只在 $M$ 内统计 | 黑底模式下唯一有意义 |
-| 轮廓光晕 $\text{rim}$ | $\overline{L}_{\text{ring}(2\text{px})}-\overline{L}_{\text{interior}}$ | $>0.10$ ⇒ 可见白边 |
-| 轨道彩度 $\chi$ | $\mathrm{mean}_{u}\big(\max_c C_c-\min_c C_c\big)$（轨道视角）| $>0.12$ ⇒ 彩虹斑块 |
-| 实心度 | $\mathrm{median}_j\alpha_j$、$\mathrm{card}\lbrace\alpha_j<0.1\rbrace/N$ | 中位 $<0.1$ 且多数 $<0.1$ ⇒ 观感发雾 |
-| 掩码松紧 $\rho$ | $\vert M\setminus M_{\mathrm{gt}}\vert/\vert M_{\mathrm{gt}}\vert$ | $>0.5$ ⇒ 掩码过松（会把背景学进模型）|
-| 网格封闭 | $\partial_2F=\emptyset$（见 3.5）| 边界边 0、非流形 0、顶点流形 |
+| 指标 | 判读 |
+|---|---|
+| 掩码内 PSNR / SSIM | 黑底模式下唯一有意义（背景是否合成正确不影响它）|
+| 轮廓光晕 rim | 大于 0.10 ⇒ 可见白边 |
+| 轨道彩度 chi | 大于 0.12 ⇒ 彩虹斑块 |
+| 实心度（不透明度中位） | 中位小于 0.1 且多数高斯小于 0.1 ⇒ 观感发雾 |
+| 掩码松紧 rho | 大于 0.5 ⇒ 掩码过松（会把背景学进模型）|
+| 网格封闭 | 边界边 0、非流形 0、顶点流形（见 3.5）|
+
+各量的定义：
+
+$$\mathrm{PSNR}=10\log_{10}\frac{1}{\mathrm{MSE}_M}$$
+
+$$\mathrm{rim}=\bar{L}_{ring}-\bar{L}_{inner}$$
+
+$$\chi=\mathrm{mean}_{u}\left(\max_c C_c-\min_c C_c\right)$$
+
+$$\rho=\frac{|M\setminus M_{gt}|}{|M_{gt}|}$$
 
 ### 3.8 实验性（本地测试中，**未纳入推荐**）：视线级不透明度下限
 
-设每条视线的累计不透明度 $T(u)=1-\prod_j\big(1-\alpha_j(u)\big)$，对其加单边下限
+设每条视线的累计不透明度 $T(u)=1-\prod_j(1-\alpha_j(u))$，对其加单边下限
 
 $$\mathcal{L}_{\text{ray}}=\frac{1}{|\mathcal{M}|}\sum_{u\in\mathcal{M}}
-\mathrm{relu}\big(\tau-T(u)\big),\qquad
+\mathrm{relu}(\tau-T(u)),\qquad
 \frac{\partial\mathcal{L}_{\text{ray}}}{\partial o_j}
-=-\alpha_j\,(1-T)\,\mathbf{1}[T<\tau].$$
+=-\alpha_j\,(1-T)\,\mathbf{1}[T\lt \tau].$$
 
 形式上比逐高斯的 $-\alpha_j(1-\alpha_j)$ 在 $\alpha\to0$ 时强得多（$\alpha=0.01,T=0.1$ 时差约 90 倍）。
 
-**但实测前提不成立**：本项目数据上掩码内 $T$ 的中位数已是 **0.9929**（均值 0.9649，仅 8.84% 像素 $<0.9$），
+**但实测前提不成立**：本项目数据上掩码内 $T$ 的中位数已是 **0.9929**（均值 0.9649，仅 8.84% 像素 $\lt 0.9$），
 于是该惩罚几乎恒为 0 —— 训练后不透明度分布与基线逐位相同。
 机制保留为 `train.ray_opacity_floor` / `ray_opacity_reg` / `ray_opacity_warmup`（**默认 0**），
 数学与梯度性质由 `tests/test_ray_opacity_floor.py` 固定；负结果记录见 docs/03 G160。
@@ -334,9 +351,9 @@ scripts\gsflow.cmd run --video data\x.mp4 --job-id final --preset solid
 
 **实测（img5，8 个留出视角，同一把论文对齐的尺子）**：
 
-> 下表是 **2026-10-26 之前、下限正则尚未默认开启时** 的数据；今后 alanced 也带下限（实测 op<0.1 85%→4%、PSNR +0.01、SSIM +0.0003，见 3.3）。
+> 下表是 **2026-10-26 之前、下限正则尚未默认开启时** 的数据；今后 alanced 也带下限（实测 op<0.1 85%→4%、PSNR +0.01、SSIM +0.0003，见 3.3）。
 
-| 方案 | `op<0.1` 占比 | 掩码 PSNR | 掩码 SSIM | LPIPS |
+| 方案 | `op` 小于 0.1 的占比 | 掩码 PSNR | 掩码 SSIM | LPIPS |
 |---|---|---|---|---|
 | `balanced`（30k）| 85.0% | 29.87 | 0.9846 | 0.2370 |
 | `quality`（无 floor，cap 300k）| 100%（更淡）| 30.16 | **0.9868** | **0.2300** |
@@ -356,12 +373,12 @@ scripts\gsflow.cmd run --video data\x.mp4 --job-id final --preset solid
 
 > 这一节把五个阶段的**核心公式 + 代码里的默认值**逐条列出，便于核对实现、也便于改参数时知道自己在动哪个量。
 > 符号：内参 $K$，外参 $(R_i,t_i)$，像素 $u$，深度 $z$，高斯 $\lbrace(\mu_j,\Sigma_j,\alpha_j,c_j)\rbrace$，
-> 不透明度 $\alpha_j=\sigma(o_j)$，透射率 $T_j=\prod_{k<j}(1-\alpha_k)$。
+> 不透明度 $\alpha_j=\sigma(o_j)$，透射率 $T_j=\prod_{k\lt j}(1-\alpha_k)$。
 
 #### ① 抽帧（frames）
 
 帧率采样：在时间轴上等间隔取 $t_k=t_0+k/f$，$f=$ `frames.fps`（默认 **2.0**），上限 `frames.count`（120）。
-清晰度筛选：$\;s(I)=\mathrm{Var}\big(\nabla^2 I\big)$，$s<$`frames.blur_threshold` 的帧丢弃（默认 **0 = 不过滤**）。
+清晰度筛选：$\;s(I)=\mathrm{Var}(\nabla^2 I)$，$s\lt $`frames.blur_threshold` 的帧丢弃（默认 **0 = 不过滤**）。
 分辨率：长边缩放到 `frames.long_side`（默认 **1920**）。
 自动裁边：对序列求逐像素时间方差 $\mathrm{Var}_t I_t(u)$，保留高方差行/列的包围盒
 （`frames.auto_crop` 逻辑见 3.1；阈值 `auto_crop_threshold` 默认 **0.75**）。
@@ -380,7 +397,7 @@ scripts\gsflow.cmd run --video data\x.mp4 --job-id final --preset solid
 
 相机模型 `colmap.cameras="SIMPLE_RADIAL"`（$f,c_x,c_y,k_1$，`single_camera=true`）：
 
-$$\pi(X)=K\Big[\tfrac{x}{z},\tfrac{y}{z},1\Big]^\top,\quad (x,y,z)=R_iX+t_i,\qquad
+$$\pi(X)=K[\tfrac{x}{z},\tfrac{y}{z},1]^\top,\quad (x,y,z)=R_iX+t_i,\qquad
 r\mapsto r\,(1+k_1 r^2).$$
 
 匹配：`colmap.matcher="auto"` —— 视频/顺序拍摄走 **sequential**（`sequential_overlap=12`），
@@ -388,45 +405,53 @@ r\mapsto r\,(1+k_1 r^2).$$
 `min_num_matches=32`，图像长边 `max_image_size=2048`。
 BA 目标与质量门限：
 
-$$\min_{\lbrace R_i,t_i,X_j\rbrace}\sum_{(i,j)\in\mathcal{O}}\big\Vert\tilde x_{ij}-\pi(R_iX_j+t_i)\big\Vert^2,\qquad
-\text{注册率}\ge\texttt{quality-min-registered-ratio}=0.75,\quad
-\overline{e}\le\texttt{quality-max-reproj-error}=2.0\ \text{px}.$$
+$$\min_{\lbrace R_i,t_i,X_j\rbrace}\sum_{(i,j)\in\mathcal{O}}|\tilde x_{ij}-\pi(R_iX_j+t_i)|^2$$
+
+质量门限：**注册率**不低于 0.75（`quality_min_registered_ratio`），
+**平均重投影误差** $\bar{e}$ 不超过 2.0 px（`quality_max_reproj_error`）。
 
 #### ④ 3DGS 训练（train）
 
 **前向**（$\alpha$-合成，按深度排序）：
 
 $$C(u)=\sum_{j}\alpha_jT_jc_j,\qquad
-D(u)=\frac{\sum_j \alpha_jT_jz_j}{\sum_j\alpha_jT_j}\ \ (\text{ED 期望深度}),\qquad
-T_j=\prod_{k<j}(1-\alpha_k).$$
+D(u)=\frac{\sum_j \alpha_jT_jz_j}{\sum_j\alpha_jT_j},\qquad
+T_j=\prod_{k\lt j}(1-\alpha_k)$$
+
+其中 $D(u)$ 是**期望深度（ED）**，训练与导出统一用它。
 
 **损失组成**（默认值）：
 
-$$\mathcal{L}=(1-\lambda_{s})\Vert C-\tilde I\Vert_1+\lambda_{s}\big(1-\mathrm{SSIM}\big)
-+\lambda_{\text{sh}}\Vert\theta_{\text{rest}}\Vert_2^2
-+\lambda_{\text{lpips}}\mathcal{L}_{\text{LPIPS}}
-+\lambda_{n}\mathcal{L}_{\text{normal}}
-+\lambda_{d}\mathcal{L}_{\text{dist}}
-+\lambda_{f}\frac1N\sum_j\mathrm{relu}(f-\alpha_j)
-+\lambda_{\text{bg}}\frac1{\vert\bar M\vert}\sum_{\bar M}\alpha .$$
+$$\mathcal{L}=\mathcal{L}_{color}+\lambda_{sh}\mathcal{L}_{sh}+\lambda_{lpips}\mathcal{L}_{LPIPS}+\lambda_{n}\mathcal{L}_{normal}+\lambda_{d}\mathcal{L}_{dist}+\mathcal{L}_{floor}+\mathcal{L}_{bg}$$
 
-| 项 | 默认 | 公式/说明 |
+其中各项：
+
+$$\mathcal{L}_{color}=(1-\lambda_s)\left|C-\tilde I\right|_1+\lambda_s\left(1-\mathrm{SSIM}\right)$$
+
+$$\mathcal{L}_{sh}=\left|\theta_{rest}\right|_2^2$$
+
+$$\mathcal{L}_{floor}=\lambda_f\frac{1}{N}\sum_j\mathrm{relu}(f-\alpha_j)$$
+
+$$\mathcal{L}_{bg}=\lambda_{bg}\frac{1}{\left|\bar M\right|}\sum_{\bar M}\alpha$$
+
+| 项 | 默认 | 说明 |
 |---|---|---|
-| $\lambda_s$ (`ssim_weight`) | 0.2 | 结构相似度权重 |
-| $\lambda_{\text{sh}}$ (`sh_rest_reg`) | 0.003 | 抑制斜视彩虹（只压 $f_{\text{rest}}$）|
-| $\lambda_{\text{lpips}},\ \texttt{lpips-every}$ | 0 / **1**（关闭时）| 开启时必须**每步**算（G152）|
-| $\lambda_n,\lambda_d$ (`lambda_normal`, `lambda_depth_distortion`) | 0 / 0 | 2DGS 面元约束（ED 上）|
-| 下限 $f,\lambda_f$ (`opacity_floor`, `opacity_floor_reg`) | **0.10 / 0.5** | 单边下限，实测几乎免费（3.3）|
-| $\lambda_{\text{bg}}$ (`bg_alpha_reg`) | 0.1 | 掩码外 alpha 抑制 |
+| `ssim_weight`（$\lambda_s$）| 0.2 | 结构相似度权重 |
+| $\lambda_{sh}$（`sh_rest_reg`）| 0.003 | 抑制斜视彩虹（只压高阶 SH）|
+| `lambda_lpips` / `lpips_every` | 0 / 1 | 开启时必须**每步**算（G152）|
+| `lambda_normal` / `lambda_depth_distortion` | 0 / 0 | 2DGS 面元约束（在 ED 深度上）|
+| `opacity_floor` / `opacity_floor_reg` | **0.10 / 0.5** | 单边下限，实测几乎免费（3.3）|
+| `bg_alpha_reg`（$\lambda_{bg}$）| 0.1 | 掩码外 alpha 抑制 |
 
 **自适应密度控制**（`densify_*`，默认）：从 `densify_from=500` 开始、到 `densify_until=4000` 结束，
 每 `densify_interval=100` 步一次；判据为屏幕空间梯度
 
-$$g_j=\Big\Vert\frac{\partial\mathcal{L}}{\partial \mu_j^{2D}}\Big\Vert\quad(\texttt{densify-criterion="grad2d"}),\qquad
-\text{克隆/分裂若 } g_j>\tau_g=2\times10^{-4}\ (\texttt{densify-grad2d-threshold}).$$
+$$g_j=\left|\frac{\partial\mathcal{L}}{\partial \mu_j^{2D}}\right|$$
 
-**剪枝**：$\alpha_j<\varepsilon_\alpha$（`prune_opacity=0.005`）或
-$\max_k s_{jk}>\rho_s\cdot\text{scene-scale}$（`prune_scale3d=0.1`）删掉；
+当 $g_j$ 大于阈值 $2\times10^{-4}$（`densify_grad2d_threshold`）时克隆或分裂该高斯。
+
+**剪枝**：$\alpha_j\lt \varepsilon_\alpha$（`prune_opacity=0.005`）或
+$\max_k s_{jk}\gt \rho_s\cdot\text{scene-scale}$（`prune_scale3d=0.1`）删掉；
 另有 `max_scale_ratio=0.05`（每步尺度上限）、`max_aspect=50`（长宽比上限）、`cap_max=600000`。
 
 **不透明度重置**：每 `opacity_reset_interval` 步把 $\sigma(o_j)\leftarrow\min(\sigma(o_j),\rho)$，
@@ -436,7 +461,7 @@ $\rho=2\varepsilon_\alpha=0.01$（官方行为；`revised_opacity=0.1` 是分裂
 **学习率**（`lr_*`，默认）：`lr_means_scene_scale=false` ⇒ $\eta_\mu=1.6\times10^{-4}$ 固定；
 $\eta_{\text{sh DC}}=2.5\times10^{-3}$、$\eta_{\text{sh rest}}$=`lr_shs=0.0025`、$\eta_\alpha=0.025$、
 $\eta_{\text{scale}}=5\times10^{-3}$、$\eta_{\text{quat}}=10^{-3}$；`lr_schedule="cosine"`，
-$\eta(t)=\eta_{\min}+(\eta_0-\eta_{\min})\cdot\frac12\big(1+\cos\frac{\pi t}{T}\big)$，$\eta_{\min}=$\texttt{lr-min-ratio}$\eta_0$（0.1）。
+$\eta(t)=\eta_{\min}+(\eta_0-\eta_{\min})\cdot\frac12(1+\cos\frac{\pi t}{T})$，$\eta_{\min}=$\texttt{lr-min-ratio}$\eta_0$（0.1）。
 
 #### ⑤ 导出（export）
 
@@ -446,7 +471,7 @@ $\eta(t)=\eta_{\min}+(\eta_0-\eta_{\min})\cdot\frac12\big(1+\cos\frac{\pi t}{T}\
 **TSDF 融合**（`mesh_method="tsdf"`，本项目推荐给薄结构）：
 
 $$f(v)=\frac{\sum_i w_i(v)\,d_i(v)}{\sum_i w_i(v)},\qquad
-d_i(v)=\mathrm{clamp}\big(D_i(u_v)-z_v,\,-\delta,\delta\big),$$
+d_i(v)=\mathrm{clamp}(D_i(u_v)-z_v,\,-\delta,\delta),$$
 
 体素 $\delta=$`scene_scale`$/$`mesh_voxel_div`（默认 400 ⇒ 实测 0.008~0.016），
 深度过滤保留率实测 98.9~99.1%，零等值面用 Marching Cubes 提取。
@@ -459,8 +484,9 @@ $\mathbf{V}=\sum_j n_j\delta_{\mu_j}$，等值面 $\chi=\tfrac12$；
 预简化 `mesh_presimplify_ratio=10`、Taubin 平滑 `mesh_smooth_iters=5`、**QEM** 到
 `mesh_target_triangles=400000`：
 
-$$\Delta(v)=\sum_{p\in\mathcal{P}(v)}\Big(n_p^{\top}\,(\bar v-p)\Big)^{2},\qquad
-Q=\sum_{p}K_p,\ K_p=\text{由平面}\ (n_p,p)\ \text{构造的二次型}.$$
+$$\Delta(v)=\sum_{p\in\mathcal{P}(v)}\left(n_p^{T}(\bar v-p)\right)^{2}$$
+
+其中 $Q$ 是各平面二次型 $K_p$ 之和，$K_p$ 由平面 $(n_p,p)$ 构造。
 
 > 这里刻意用**平面距离平方**的等价写法，而不是 $2\times2$ 分块矩阵：矩阵里的换行 `\\` 会被
 > Markdown 当成转义吃掉（变成单个 `\`），矩阵会塌成一行 —— 这是 GitHub 上常见的一类渲染事故。
@@ -469,9 +495,9 @@ Q=\sum_{p}K_p,\ K_p=\text{由平面}\ (n_p,p)\ \text{构造的二次型}.$$
 
 **贴图**（`mesh_texture=false` 默认关闭）：xatlas 展开最小化
 
-$$E_{\text{stretch}}=\sum_t A_t\big(\Vert J_t\Vert_F^2+\Vert J_t^{-1}\Vert_F^2\big),$$
+$$E_{\text{stretch}}=\sum_t A_t(| J_t|_F^2+| J_t^{-1}|_F^2),$$
 
-再按可见性加权采样 $T(x)=\sum_i w_i(x)I_i(\pi_i(x))\big/\sum_i w_i(x)$，
+再按可见性加权采样 $T(x)=\sum_i w_i(x)I_i(\pi_i(x))/\sum_i w_i(x)$，
 `mesh_texture_size=2048`（实测 UV 覆盖 100%、黑 texel 0.00%）。
 
 ## 五之二、参数速查（关键项）
@@ -544,12 +570,12 @@ env\venv\Scripts\python.exe scripts\check_quality_suite.py --job img5 --no-gpu :
 | 工具 | 查什么 | 判读 |
 |---|---|---|
 | `check_mesh_quality.py` | 边界边比例、非流形、**封闭**、自交、面积/凸包 | 封闭=True、边界边=0、非流形=0；自交单独看（泊松固有）|
-| `check_gaussian_solidity.py` | 不透明度中位、`op<0.1` 占比、淡体积份额 | 中位 <0.1 且 `op<0.1`>60% ⇒ 会"朦胧/透明" |
+| `check_gaussian_solidity.py` | 不透明度中位、`op` 小于 0.1 的占比、淡体积份额 | 中位小于 0.1 且六成以上小于 0.1 ⇒ 会"朦胧/透明" |
 | `probe_lpips_new.py` | 用**论文对齐**的 LPIPS 复评多个作业 | 同一把尺子才能横比；旧值不可比 |
-| `check_rim_brightness.py` | 轮廓 2px 环亮度 − 内部亮度 | >0.10 = 可见白边 |
-| `render_orbit_sheet.py` | 3 仰角 × 6 方位出图 + 彩度 | 彩度 >0.12 = 彩虹斑块 |
-| `render_textured_mesh.py` | **带贴图网格**离屏渲染 | 看得见"空壳/飞边"；面数 >6 万会自动简化（渲染器上限）|
-| `check_mask_tightness.py` | `rim_ratio`（掩码松紧）| >0.5 = 掩码太松 |
+| `check_rim_brightness.py` | 轮廓 2px 环亮度 − 内部亮度 | 大于 0.10 = 可见白边 |
+| `render_orbit_sheet.py` | 3 仰角 × 6 方位出图 + 彩度 | 彩度大于 0.12 = 彩虹斑块 |
+| `render_textured_mesh.py` | **带贴图网格**离屏渲染 | 看得见"空壳/飞边"；面数超过 6 万会自动简化（渲染器上限）|
+| `check_mask_tightness.py` | `rim_ratio`（掩码松紧）| 大于 0.5 = 掩码太松 |
 | `final_acceptance.py` | 交付验收清单 | 逐项 PASS/FAIL/SKIP（可选产物按配置跳过）|
 
 > **为什么需要这么一套**：掩码内 PSNR 26.5 dB 的模型看起来可能仍然"朦胧"——
@@ -580,7 +606,7 @@ env\venv\Scripts\python.exe scripts\check_quality_suite.py --job img5 --no-gpu :
 **目录约定**（每个作业一个目录，可整目录打包迁移）：
 
 ```
-workspace/<job>/
+workspace/作业目录/
   01_images_raw/   02_masks/   02_images_clean/
   03_colmap/       sparse/  report.json
   04_train/        data/  point_cloud/iteration_*/point_cloud.ply  metrics.json
@@ -603,7 +629,7 @@ workspace/<job>/
 | 掩码 | 同一素材两次跑出不同拍摄模式 | 拍摄模式判定改为**确定性** |
 | 检查点 | `iteration_5000` 排在 `iteration_30000` 之后 | 词法排序坑，27 处受影响 |
 | COLMAP | 3.12 匹配器在空库上也失败 | 换 **4.2.1** + pycolmap 回退 |
-| 训练 | "淡高斯云"（中位 0.066、67% <0.1）| 退火推实正则；剪枝会掉 7.5 dB |
+| 训练 | "淡高斯云"（中位 0.066、67% 小于 0.1）| 退火推实正则；剪枝会掉 7.5 dB |
 | 感知 | LPIPS 稀疏施加 → 反而更差 | 必须**每步**，且用**论文线性权重** |
 | 网格 | TSDF 网格全黑 = 渲染器面数上限，不是网格坏 | `render_textured_mesh` 自动简化 |
 | 网格 | 边界边 2% 却不封闭 | 补洞 + 自定义封闭判据 |
