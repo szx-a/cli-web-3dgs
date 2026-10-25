@@ -17,6 +17,9 @@ tools/
 .env
 *.part
 
+# 开发者/协作内部文件：不入库（仍保留在本地）
+AGENTS.md
+
 # 生成物：环境自检快照（含本机主机名/路径，不入库）
 docs/env-report.json
 

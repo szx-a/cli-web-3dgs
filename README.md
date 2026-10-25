@@ -59,6 +59,53 @@
    再用 ED 深度做**回溯式**顶点精修（ICP 风格阻尼，残差单调下降）。
 6. **负结果也写进文档**：LPIPS 每 16 步才算是**错的**（梯度与 L1/SSIM 打架，实测 LPIPS 反而变差），
    必须每步算；`opacity_init=0.5` 无效（淡高斯是目标函数的强吸引子）。
+7. **视线级不透明度下限（本项目的核心创新，见下方数学推导）**：不逐个高斯罚 $\alpha$，
+   而是直接约束**每条视线**的累计透射率 $T(u)=1-\prod_j(1-\alpha_j)$；
+   梯度是 $-\alpha_j(1-T)$，比逐高斯的 $-\alpha_j(1-\alpha_j)$ 在 $\alpha\to0$ 时**强两个数量级**。
+
+### 7.1 为什么常规重建会"颜色对、看着透"
+
+常规 3DGS/NeRF 只用**颜色**损失。它不约束"每条视线到底有多不透明"，于是存在一族
+"颜色对得上但几何是空心的"解 —— 本项目的实测数据就是证据：掩码内 PSNR 26.5~30.6 dB 的模型，
+不透明度中位数只有 0.012~0.095，**100% 的高斯低于 0.1**，换到未见视角就"透"。
+
+设第 $j$ 个高斯的不透明度 $\alpha_j=\sigma(o_j)$，一条视线穿过 $N$ 个高斯后的**累计不透明度**
+
+$$T(u) = 1-\prod_{j=1}^{N}\,(1-\alpha_j(u)),$$
+
+它正是光栅化器逐像素返回的 alpha。我们直接对它加**单边下限**
+
+$$\mathcal{L}_{\text{ray}} \;=\; \frac{1}{|\mathcal{M}|}\sum_{u\in\mathcal{M}}
+\operatorname{relu}\!\big(\tau - T(u)\big),\qquad \tau\approx 0.9,$$
+
+$\mathcal{M}$ 为掩码内的像素集合（背景不该被推实，否则会造出"雾墙"）。
+
+### 7.2 梯度条件：为什么它比"逐高斯下限"强得多
+
+对 $\alpha_j$ 求导：
+
+$$\frac{\partial T}{\partial \alpha_j}=\prod_{k\neq j}(1-\alpha_k)
+=\frac{1-T}{1-\alpha_j},\qquad
+\frac{\partial \mathcal{L}_{\text{ray}}}{\partial o_j}
+=-\,\alpha_j\,(1-T)\,\mathbb{1}[T<\tau].$$
+
+对比**逐高斯**下限 $\operatorname{relu}(f-\alpha_j)$：
+
+$$\frac{\partial}{\partial o_j}\operatorname{relu}(f-\alpha_j)
+=-\,\alpha_j(1-\alpha_j)\,\mathbb{1}[\alpha_j<f].$$
+
+$f=0.1,\ \alpha_j=0.01$ 时后者约为 $9.9\times10^{-3}$；而视线级在 $T=0.1$ 时是 $0.9$ —— **相差约 90 倍**，
+且差值随"还缺多少不透明度"$(1-T)$ 单调增大。换句话说：**越透的像素被推得越狠**，
+而逐高斯的梯度在 $\alpha\to0$ 时反而**趋近于 0**（正是要修的状态）。
+这解释了实测：把逐高斯正则权重从 $0.02$ 提到 $0.05$，分布**纹丝不动**；换成视线级约束后才出现可测的移动。
+
+### 7.3 与"后处理剪枝"的区别
+
+剪掉淡高斯会连带删掉承载画质的层（实测训练视角 PSNR 掉 **7.5 dB**）；
+视线级约束是在**优化过程中**把不透明度重新分配到"被看见的射线"上，因此不牺牲颜色精度。
+
+> 实现与单测：`train.ray_opacity_floor / ray_opacity_reg / ray_opacity_warmup`；
+> 数学与梯度性质由 `tests/test_ray_opacity_floor.py` 固定（含"梯度非零"与"$1-T$ 条件数优势"两条）。
 
 ---
 
@@ -207,6 +254,95 @@ scripts\gsflow.cmd run --video data\x.mp4 --job-id final --preset solid
 > 实测在 step 10000 涨到 251 万高斯（我们已补上漏传的 `cap_max`，但阈值仍需重新标定）。
 
 ---
+
+### 5.4 流程里的数学：每一步到底在算什么
+
+> 这一节把五个阶段的**核心公式**列出来，便于核对实现、也便于改参数时知道自己在动哪个量。
+> 符号：相机内参 $K$，外参 $(R_i,t_i)$，像素 $u$，深度 $z$，高斯集合 $\{(\mu_j,\Sigma_j,\alpha_j,c_j)\}$。
+
+**① 抽帧**：按时间等间隔采样 $t_k = k/f$（$f$ 为 `frames.fps`），并对每帧算清晰度
+
+$$s(I)=\operatorname{Var}\big(\nabla^2 I\big),$$
+
+低于 `blur_threshold` 的帧丢弃；需要自动裁边时按行/列的**时间方差**找高方差区（即"真正在动的区域"）。
+
+**② 掩码与背景清理**：分割给出前景指示 $M(u)\in\{0,1\}$，训练图按
+
+$$I'(u)=M(u)\,I(u)+\big(1-M(u)\big)\,b,\qquad b=\text{背景色（黑）}$$
+
+合成。掩码质量用 IoU 与掩码松紧比衡量：$\text{rim\_ratio}=\dfrac{|M\setminus M_{\text{gt}}|}{|M_{\text{gt}}|}$。
+
+**③ COLMAP 稀疏重建**：相机模型 `SIMPLE_RADIAL`（$f,c_x,c_y,k_1$），投影
+
+$$\pi(X)=K\,\big[x/z,\;y/z,\;1\big]^\top,\qquad
+K=\begin{bmatrix} f & 0 & c_x\\ 0 & f & c_y\\ 0&0&1\end{bmatrix},\; (x,y,z)=R_iX+t_i,$$
+
+并在归一化坐标上加径向畸变 $r\mapsto r(1+k_1r^2)$。BA 最小化重投影误差
+
+$$\min_{\{R_i,t_i,X_j\}}\;\sum_{(i,j)\in\mathcal{O}}\big\|\,\tilde{x}_{ij}-\pi(R_iX_j+t_i)\,\big\|^2,$$
+
+报告里的 **0.45~1.08 px** 就是这个量的均值；**注册率** $=|\{i:\text{成功估计位姿}\}|/N$。
+
+**④ 3DGS 训练**：光栅化是沿视线的 $\alpha$-合成（按深度排序，$T_j$ 为透射率）
+
+$$C(u)=\sum_{j\in\mathcal{N}(u)}\alpha_j\,T_j\,c_j,\qquad
+T_j=\prod_{k<j}\big(1-\alpha_k\big),\qquad
+D(u)=\frac{\sum_j \alpha_j T_j z_j}{\sum_j \alpha_j T_j}\;,$$
+
+其中 $D(u)$ 是**期望深度 ED**（本项目训练与导出统一使用的量；`render_mode="RGB+ED"`）。
+优化目标
+
+$$\mathcal{L}=(1-\lambda)\,\|C-\tilde{I}\|_1+\lambda\big(1-\mathrm{SSIM}(C,\tilde{I})\big)
++\sum_k w_k\,\mathcal{R}_k,$$
+
+$\mathcal{R}_k$ 包括：SH 幅值正则 $\|\theta_{\text{rest}}\|_2^2$、不透明度正则、法线一致性、
+深度失真、以及本项目的**视线级不透明度下限** $\operatorname{relu}(\tau-T)$（见第三节 7）。
+
+自适应密度控制：对投影位置梯度大的高斯做克隆/分裂
+$\big(\|\nabla_{\mu_{2D}}\mathcal{L}\|>g_{\text{th}}\big)$，对
+$\alpha<\varepsilon$ 或尺度 $>s_{\max}$ 的做剪枝；每 $K$ 步把不透明度重置为
+$\sigma(o)\leftarrow\min\big(\sigma(o),\rho\big)$（本项目 $\rho=0.01$，用于清除"浮点雾"）。
+
+**⑤ 导出**：
+
+* **TSDF 融合**：每个体素维护截断有符号距离 $f$ 与权重 $w$，
+
+$$f(v)\leftarrow\frac{\sum_i w_i(v)\,d_i(v)}{\sum_i w_i(v)},\qquad
+d_i(v)=\operatorname{clamp}\big(D_i(u_v)-z_v,\;-\delta,\;\delta\big),$$
+
+再对 $f(v)=0$ 做 **Marching Cubes** 提取等值面（`mesh_method=tsdf`）。
+* **泊松重建**（`poisson`/`2dgs` 路线）：解
+
+$$\Delta\chi=\nabla\cdot \mathbf{V},\qquad \mathbf{V}=\sum_j n_j\,\delta_{\mu_j},$$
+
+$\chi$ 是指示函数、$n_j$ 为定向法线；等值面 $\chi=\tfrac12$ 即网格。
+* **QEM 简化**：边收缩代价
+
+$$\Delta(v)=\bar v^\top Q\,\bar v,\qquad Q=\sum_{p\in\mathcal{P}(v)}K_p,\quad
+K_p=\begin{bmatrix}n n^\top & -n\,n^\top p\\ -p^\top n n^\top & p^\top n n^\top p\end{bmatrix},$$
+
+按 $\Delta$ 从小到大收缩直到目标面数（`mesh_target_triangles`）。
+* **UV 展开**（xatlas）：最小化拉伸能量
+
+$$E_{\text{stretch}}=\sum_{t}A_t\Big(\|J_t\|_F^2+\|J_t^{-1}\|_F^2\Big),$$
+
+再按可见性从多视角采样颜色得到贴图：$\;T(x)=\sum_i w_i(x)\,I_i\big(\pi_i(x)\big)/\sum_i w_i(x)$，
+$w_i$ 为可见性×角度权重。
+* **精修**（本项目）：沿顶点法线做位移
+
+$$\Delta x_v=\eta\cdot\frac{1}{|\mathcal{V}(v)|}\sum_{i\in\mathcal{V}(v)}
+\Big(D_i(u_v)-z_v\Big)\cos\theta_{iv},$$
+
+$\mathcal{V}(v)$ 为看到该顶点的视角集合、$\theta$ 为视线与法线夹角（抑制掠射角放大），
+并用回溯式阻尼保证残差单调不增（见 `gsdata/mesh_refine.py`）。
+
+**质量指标**（都按同一口径）：
+
+$$\mathrm{PSNR}=10\log_{10}\frac{1}{\mathrm{MSE}_{M}},\qquad
+\mathrm{SSIM}=\frac{(2\mu_a\mu_b+c_1)(2\sigma_{ab}+c_2)}
+{(\mu_a^2+\mu_b^2+c_1)(\sigma_a^2+\sigma_b^2+c_2)},$$
+
+下标 $M$ 表示**只在掩码内**统计 —— 黑底模式下全图指标会被"背景是否合成正确"污染。
 
 ## 五之二、参数速查（关键项）
 

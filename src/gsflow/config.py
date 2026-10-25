@@ -337,6 +337,11 @@ DEFAULTS: dict[str, Any] = {
         "opacity_floor": 0.0,
         "opacity_floor_reg": 0.0,
         "opacity_floor_warmup": 0.5,
+        # 视线级不透明度下限（本项目创新）：直接约束累计透射率 T=1-∏(1-α)
+        # 梯度为 -α_j(1-T)，比逐高斯的 -α(1-α) 在 α→0 时条件数好得多。
+        "ray_opacity_floor": 0.9,
+        "ray_opacity_reg": 0.0,
+        "ray_opacity_warmup": 0.3,
         # 不透明度初值（官方 0.1）。实测收敛到中位 0.07、op<0.1 占 67%，
         # 提高初值可把优化推向“少而实”的解。
         "opacity_init": 0.1,

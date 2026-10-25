@@ -1449,6 +1449,49 @@ def train(cfg: TrainConfig, ctx) -> dict:
                                legacy_eps=bool(getattr(cfg, "ssim_legacy_eps", False)))
         loss = (1.0 - cfg.ssim_weight) * l1 + cfg.ssim_weight * (1.0 - ssim_val)
 
+        # ---- 视线级不透明度下限（本项目创新项，2026-10-25）----
+        #
+        # ## 与"逐高斯不透明度正则"的根本区别（数学）
+        #
+        # 逐高斯方案（含我们的 `opacity_crisp_reg` / `opacity_floor`）把 α 当作被约束对象，
+        # 但**观感上的"透"是逐像素的累计量**：一条视线穿过 N 个高斯后
+        #
+        #     T(u) = 1 - Π_j (1 - α_j)          # 即 gsplat 返回的 `render_alphas`
+        #
+        # 标准 3DGS 只用颜色损失间接约束 T：只要 Σ α_j c_j 合成出正确颜色，T 可以任意小
+        # —— 这就是"颜色对得上、换视角却透"的根源（实测 op 中位 0.012、100% 高斯 <0.1）。
+        #
+        # 这里**直接约束累计透射率**：
+        #
+        #     L_ray = (1/|M|) Σ_{u∈M} relu(τ - T(u))
+        #
+        # 其梯度（对第 j 个高斯的 logit o_j，α_j = σ(o_j)）：
+        #
+        #     ∂L_ray/∂o_j = -α_j(1-α_j) · Π_{k≠j}(1-α_k) · [T < τ]
+        #                 = -α_j(1-α_j) · (1-T)/(1-α_j) · [T < τ]
+        #                 = -α_j · (1-T) · [T < τ]
+        #
+        # 关键差异：
+        #   * **逐高斯下限** `relu(f - α_j)` 的梯度是 `-α_j(1-α_j)`，在 α→0 时 **趋近 0** ——
+        #     而 α≈0.01 恰恰是要修的状态 ⇒ 梯度条件极差（实测把权重从 0.02 提到 0.05，分布**纹丝不动**）；
+        #   * **视线级** 的梯度是 `-α_j(1-T)`：`(1-T)` 是"当前这条视线还缺多少不透明度"，
+        #     T 越小梯度越大 ⇒ **正是缺得越多、推得越狠**，条件数好得多。
+        #
+        # 另一个好处：它天然只约束**表面像素**（掩码内），不会去推背景里的游离高斯
+        # （那些像素的 T 本来就该接近 0，被掩码排除）。
+        _ray_w = float(getattr(cfg, "ray_opacity_reg", 0.0) or 0.0)
+        if _ray_w > 0:
+            _ray_wu = float(getattr(cfg, "ray_opacity_warmup", 0.0) or 0.0) * float(cfg.iterations)
+            if step >= _ray_wu:
+                _tau = float(getattr(cfg, "ray_opacity_floor", 0.9) or 0.9)
+                _T = alphas[0].reshape(-1)                   # [H*W] 累计不透明度
+                if _mask is not None and bool(_mask.any()):
+                    _wpx = _mask.reshape(-1).to(_T.dtype)
+                else:
+                    _wpx = torch.ones_like(_T)
+                _viol = torch.relu(_tau - _T)
+                loss = loss + _ray_w * (_viol * _wpx).sum() / (_wpx.sum().clamp_min(1.0))
+
         # ---- SH 正则（治"斜视彩虹"，2026-10-24）----
         #
         # 实测：任意轨道视角下出现青/洋红/绿斑块，而 `sh_degree=0`（仅 DC）**完全消失**

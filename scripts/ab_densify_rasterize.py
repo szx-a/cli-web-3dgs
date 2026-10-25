@@ -144,6 +144,9 @@ ARMS: dict[str, dict[str, str]] = {
     # 按论文/社区做法重做的 LPIPS：每步都算 + 官方线性权重
     "lpipsC": {"train.lambda_lpips": "0.1"},
     "lpipsD": {"train.lambda_lpips": "0.2"},
+    # 创新项对比：视线级不透明度下限 vs 逐高斯下限
+    "rayf": {"train.ray_opacity_reg": "0.5", "train.ray_opacity_floor": "0.9"},
+    "gflr": {"train.opacity_floor": "0.10", "train.opacity_floor_reg": "0.5"},
     "floor2": {"train.opacity_floor": "0.2", "train.opacity_floor_reg": "0.5"},
     "reset3k": {"train.opacity_reset_interval": "3000",
                  "train.lr_opacities": "0.05"},
