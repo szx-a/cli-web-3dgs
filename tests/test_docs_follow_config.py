@@ -42,8 +42,12 @@ def test_reverse_check_covers_known_quality_keys() -> None:
                 "rasterize_mode", "mesh_drop_unseen"):
         assert key in src, f"MUST_DOC 里缺少 {key}"
     # README 里确实有这些行
+    #
+    # ⚠️ `frames.auto_crop` 曾被列在这里，但 **DEFAULTS 与 frames 阶段都没有这个键**
+    # （frames 只读 `frames.crop`）—— 一个"检查器要求、代码里不存在"的幽灵键。
+    # 2026-10-25 已从 check_readme_params.KEYS 与本列表一起移除：文档不该写不存在的参数。
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    for row in ("`frames.auto_crop`", "`frames.crop`", "`train.auto_crop`",
+    for row in ("`frames.crop`", "`train.auto_crop`",
                 "`train.auto_crop_in_train`", "`train.densify_grad2d_threshold`"):
         assert row in readme, f"README 缺少 {row}"
 
