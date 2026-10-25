@@ -82,12 +82,18 @@ def test_solid_preset_uses_the_one_sided_floor() -> None:
 
 
 def test_quality_and_solid_differ_in_exactly_the_solidity_knobs() -> None:
-    """两个预设的差异要**可解释**：quality 追求画质、solid 追求实心度。"""
+    """两个预设的差异要**可解释**。
+
+    ⚠️ 2026-10-26 起地板正则已设为**默认开启**（实测几乎免费：
+    op<0.1 85%→4%，PSNR +0.01、SSIM +0.0003），所以 quality 不再是 floor=0；
+    两者的区别改为“容量与推实强度”。"""
     q = load({"preset": "quality"})
     d = load({"preset": "solid"})
-    assert float(q.get("train.opacity_floor")) == 0.0, "quality 不应启用地板正则"
-    assert float(d.get("train.opacity_floor")) > 0, "solid 必须启用地板正则"
-    # 共同点：每步 LPIPS 与 ED 深度
+    # 默认已开启地板；两个预设都不应把它关掉
     for s in (q, d):
+        assert float(s.get("train.opacity_floor")) > 0, "地板正则不应被预设关闭"
         assert int(s.get("train.lpips_every")) == 1
         assert str(s.get("train.depth_mode")) == "expected"
+    # solid 的容量更大（保细节）、推实更强
+    assert int(d.get("train.cap_max")) > int(q.get("train.cap_max"))
+    assert float(d.get("train.opacity_crisp_reg")) >= float(q.get("train.opacity_crisp_reg"))

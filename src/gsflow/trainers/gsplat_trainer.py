@@ -247,8 +247,8 @@ class TrainConfig:
     sh_rest_max: float = 0.0                # f_rest 逐系数幅度上限（0=关）
     opacity_crisp_reg: float = 0.02          # 不透明度清晰度正则（推实；实测 SSIM −0.0003）
     opacity_crisp_warmup: float = 0.7        # 前 N% 迭代不施加清晰度正则（0~1）
-    opacity_floor: float = 0.0               # 不透明度下限（配合 opacity_floor_reg）
-    opacity_floor_reg: float = 0.0           # 下限正则权重：惩罚 relu(floor-op)
+    opacity_floor: float = 0.10              # 不透明度下限（实测几乎免费：op<0.1 85%→4%）
+    opacity_floor_reg: float = 0.5           # 下限正则权重：惩罚 relu(floor-op)
     opacity_floor_warmup: float = 0.5        # 前 N% 迭代不施加
     # 训练结束时的最小不透明度清理（Faster-GS: MIN_OPACITY_AFTER_TRAINING = 1/255）。
     # 不透明度低于该值的高斯在收尾时直接删掉；0 表示不清理。
