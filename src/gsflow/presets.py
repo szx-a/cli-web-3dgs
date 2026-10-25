@@ -31,7 +31,12 @@ PRESETS: dict[str, dict[str, Any]] = {
     # 与默认行为一致（显式给"balanced"时不做任何覆盖）
     "balanced": {},
 
-    # ---- 质量优先 ----
+    # ---- 质量优先（v2，2026-10-25）----
+    #
+    # v1 实测结论：60 万高斯 + 抗铯齿 ⇒ 感知 LPIPS 好 3.4%，
+    # 但 **op>0.9 归零**、op<0.1 占 100%（更“朆朗”），与用户诉求相反。
+    # v2 因此收小容量、关抗铯齿、加强推实正则。
+
     #
     # 依据（均来自本仓库实测，见 docs/03）：
     #   * `densify_strategy="official"` + `absgrad=True`：复用 gsplat 官方
@@ -46,7 +51,8 @@ PRESETS: dict[str, dict[str, Any]] = {
     "quality": {
         "train.iterations": 60000,
         "train.densify_from": 500,
-        "train.densify_until": 20000,
+        "train.densify_until": 10000,
+        "train.cap_max": 300000,
         "train.densify_interval": 100,
         # 实测（2026-10-25）：official + grow_grad2d=2e-4 在本项目数据上致密化失控
         # （step 10000 就涨到 251 万高斯）；已补上 cap_max 但阈值仍需标定。
@@ -56,7 +62,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "train.absgrad": False,
         "train.opacity_reset_interval": 3000,
         "train.auto_extend_densify_when_reset": True,
-        "train.rasterize_mode": "antialiased",
+        "train.rasterize_mode": "classic",
         "train.lambda_lpips": 0.1,
         "train.lpips_every": 1,
         "train.lpips_size": 224,
@@ -66,8 +72,8 @@ PRESETS: dict[str, dict[str, Any]] = {
         "train.depth_distortion_mode": "tv",
         "train.sh_degree": 3,
         "train.eval_metrics": True,
-        "train.opacity_crisp_reg": 0.02,
-        "train.opacity_crisp_warmup": 0.5,
+        "train.opacity_crisp_reg": 0.05,
+        "train.opacity_crisp_warmup": 0.4,
     },
 }
 

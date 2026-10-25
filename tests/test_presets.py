@@ -36,7 +36,12 @@ def test_every_preset_key_exists_in_defaults() -> None:
 def test_quality_preset_is_actually_applied() -> None:
     s = load({"preset": "quality"})
     assert int(s.get("train.iterations")) == 60000
-    assert int(s.get("train.densify_until")) == 20000
+    # v2（2026-10-25 实测后调整）：容量的收窄与"推实"的加强
+    assert int(s.get("train.densify_until")) == 10000
+    assert int(s.get("train.cap_max")) == 300000
+    assert str(s.get("train.rasterize_mode")) == "classic", \
+        "antialiased 会按屏幕足迹压低不透明度，实测让 op>0.9 归零"
+    assert float(s.get("train.opacity_crisp_reg")) >= 0.05
     assert float(s.get("train.lambda_lpips")) > 0
     assert int(s.get("train.lpips_every")) == 1, "LPIPS 必须每步都算（G152：稀疏施加会让梯度打架）"
     assert str(s.get("train.depth_mode")) == "expected", "训练侧深度必须用 ED（与导出统一）"
