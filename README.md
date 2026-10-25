@@ -104,21 +104,82 @@ scripts\gsflow.cmd doctor
 
 ## 五、跑一个作业
 
+> 这一节是**照做就能跑通**的操作流程。原理与参数见 [`docs/05-训练框架.md`](docs/05-训练框架.md)，
+> 完整参数速查见本文件「五之二」。
+
+### 5.1 CLI 全流程（推荐先跑一遍这个）
+
 ```bat
-:: 视频
+:: 0) 进入安装目录，自检一次（应全绿或只有"可选工具缺失"提示）
+cd /d F:\gsflow
+scripts\gsflow.cmd doctor
+
+:: 1) 放数据：视频或照片目录，路径尽量不含中文与空格
+::    F:\gsflow\data\IMG5.mp4      或      F:\gsflow\data\photos\
+
+:: 2) 一条命令跑完五个阶段（进度实时打印，可随时 Ctrl+C 中断）
 scripts\gsflow.cmd run --video data\IMG5.mp4 --job-id img5 --stages frames,mask,colmap,train,export
 
-:: 照片
-scripts\gsflow.cmd run --images D:\photos\object --stages frames,mask,colmap,train,export
+::    想用"画质+实心度"都更好的配置（约 60~75 分钟）：
+scripts\gsflow.cmd run --video data\IMG5.mp4 --job-id img5 --preset solid
 
-:: 质量优先（官方密度控制参数已校准，见"预设"）
-scripts\gsflow.cmd run --video data\IMG5.mp4 --preset quality
+:: 3) 中途看进度（另开一个终端）
+scripts\gsflow.cmd jobs
+scripts\gsflow.cmd status img5
 
-:: 只重跑训练+导出（复用已有帧/掩码/位姿）
+:: 4) 断了/想改参数：**只重跑某个阶段**，前面已完成的产物会复用
 scripts\gsflow.cmd run --job-id img5 --stages train,export --force train,export
+::    例如只重试 COLMAP：
+scripts\gsflow.cmd run --job-id img5 --stages colmap --force colmap
 
-:: Web GUI
-scripts\web.cmd            :: http://127.0.0.1:8787
+:: 5) 看产物
+dir workspace\img5\05_export
+
+:: 6) 质量体检（一条命令跑完全部检查；训练占卡时加 --no-gpu）
+env\venv\Scripts\python.exe scripts\check_quality_suite.py --job img5
+```
+
+**产物在哪**（每个作业一个目录，可整目录打包搬走）：
+
+```
+workspace\img5\
+  01_images_raw\        抽出的原始帧
+  02_masks\             前景掩码       02_images_clean\  掩码合成后的训练图
+  03_colmap\sparse\     相机位姿       03_colmap\report.json  注册率/重投影
+  04_train\point_cloud\iteration_*\point_cloud.ply   3DGS 模型（59 维，含 SH）
+  04_train\metrics.json 训练指标
+  05_export\            model*.glb / model.splat / model_mesh*.obj|ply|glb / viewer*.html
+  logs\events.jsonl     全部事件（进度、告警、失败原因）
+```
+
+### 5.2 Web GUI 全流程（同一套流程核心，等价于上面的命令）
+
+```bat
+scripts\web.cmd            :: 启动后打开 http://127.0.0.1:8787
+```
+
+界面有六个页签，按顺序用：
+
+| 页签 | 做什么 | 关键操作 |
+|---|---|---|
+| **① 新建作业** | 填输入与参数 | 「输入」填视频/照片路径 → 「作业 ID」留空则自动生成 → 「阶段」默认五个全跑（也可只勾某几个）→ 「关键参数」里选**训练预设**（`balanced` / `quality` / `solid`）→ 需要网格就把「3.5 网格导出」的 `mesh_method` 设 `tsdf`、格式加 `mesh` → 点 **开始重建** |
+| **② 作业与进度** | 看实时日志 | 进度条 + 逐行事件；失败会显示原因；**取消当前作业**按钮随时停止 |
+| **③ 模型查看** | 看 3D 结果 | 选作业 → 选模式（**服务端预览**=不依赖 WebGL，最可靠 / **高斯泼溅**=59 维含 SH 的真实高斯 / **点云**=3DGS 原始形态 / **网格** / **带贴图网格**）；左键拖拽旋转、右键/Shift 平移、滚轮缩放；「服务端渲染当前视角」用 gsplat 官方光栅化器出图（与对照图同一渲染器）|
+| **④ 网格导出** | 从已有作业再导一次网格 | 选作业 + 方法 + 目标面数 → 开始（复用同一模型的位姿与深度，不必重训）|
+| **⑤ 环境自检** | 软硬件与依赖 | 与 `gsflow doctor` 同一份报告；缺什么会给出处理建议 |
+| **⑥ 设置 / API Key** | 密钥与路径 | 填 HuggingFace token（下载权重用）；保存后写入 `config/config.toml`（不入库）|
+
+> **GUI 与 CLI 完全等价**：界面提交的参数会拍平成 `--set a.b=c`，等价命令显示在「新建作业」下方，
+> 可以直接复制到终端执行或写进脚本。
+
+### 5.3 两种常见用法
+
+```bat
+:: A. 快速试水（先确认能出东西：15k 迭代、约 8~10 分钟）
+scripts\gsflow.cmd run --video data\x.mp4 --job-id try1 --set train.iterations=15000
+
+:: B. 正式交付（solid 预设 = 60k + 每步 LPIPS + 单边不透明度下限）
+scripts\gsflow.cmd run --video data\x.mp4 --job-id final --preset solid
 ```
 
 **预设**（单一映射源 `src/gsflow/presets.py`，CLI 与 GUI 共用）：
@@ -144,9 +205,6 @@ scripts\web.cmd            :: http://127.0.0.1:8787
 
 > `train.densify_strategy=official`（gsplat 官方 `DefaultStrategy`）**目前不推荐**：
 > 实测在 step 10000 涨到 251 万高斯（我们已补上漏传的 `cap_max`，但阈值仍需重新标定）。
-
----
-
 
 ---
 
