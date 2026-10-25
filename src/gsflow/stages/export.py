@@ -907,7 +907,13 @@ class ExportStage(Stage):
             return self._finish_mesh(ctx, mesh, info, out_dir, cams=cams)
 
         # ---------------- 路线二：TSDF 融合 ----------------
-        from ..gsdata.mesh_export import fuse_tsdf
+        # ⚠️ 必须在这里**单独 import** `select_views_by_distance`（2026-10-25 实测）：
+        # 它原先只在上面 poisson/2dgs 分支里被 import，而本分支在 line ~926 也要用，
+        # 于是 `mesh_method=tsdf` 会直接抛
+        #     UnboundLocalError: cannot access local variable 'select_views_by_distance'
+        # 整个 TSDF 路线**从来没跑通过**（错误被外层 try 吞成一条 WARN，容易漏看）。
+        from ..gsdata.mesh_export import (fuse_tsdf, render_depths,
+                                          select_views_by_distance)
 
         # 网格融合需要尽量多的视角覆盖表面（预览才只需要 4 个）
         cams = self._training_cameras(ctx, out_dir, limit=int(ctx.cfg("mesh_max_views", 80) or 80))

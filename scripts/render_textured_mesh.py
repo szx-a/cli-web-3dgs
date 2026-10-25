@@ -26,6 +26,8 @@ def main() -> int:
     ap.add_argument("--views", type=int, default=3)
     ap.add_argument("--size", type=int, default=512)
     ap.add_argument("--out", default="env/tmp/textured_mesh.png")
+    ap.add_argument("--unlit", action="store_true",
+                    help="用无照明着色器（排查“法线朝内导致全黑”）")
     args = ap.parse_args()
 
     import open3d as o3d
@@ -60,7 +62,7 @@ def main() -> int:
         return 1
 
     mat = o3d.visualization.rendering.MaterialRecord()
-    mat.shader = "defaultLit" if tex.exists() else "defaultLit"
+    mat.shader = "defaultUnlit" if args.unlit else "defaultLit"
     mat.base_color = [0.85, 0.85, 0.85, 1.0]
     renderer.scene.add_geometry("mesh", mesh, mat)
     renderer.scene.set_background([0.08, 0.08, 0.10, 1.0])
