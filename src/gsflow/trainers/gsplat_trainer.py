@@ -1150,6 +1150,11 @@ def train(cfg: TrainConfig, ctx) -> dict:
                 grow_grad2d=cfg.densify_grad_threshold,
                 grow_scale3d=cfg.grow_scale3d,
                 prune_scale3d=cfg.prune_scale3d,
+                # ⚠️ **必须显式传 cap_max**（2026-10-25 实测）：不传时 gsplat 用自己的默认上限，
+                # 而我们的 `train.cap_max`（默认 60 万）根本没生效 ——
+                # 质量预设实测在 step 10000 就涨到 **251 万高斯**、显存 7.5GB、ETA 124 分钟，
+                # 是一次典型的"参数没接上导致致密化失控"。
+                cap_max=int(cfg.cap_max),
                 refine_start_iter=cfg.densify_from,
                 refine_stop_iter=cfg.densify_until,
                 reset_every=(cfg.opacity_reset_interval or 3000),

@@ -483,6 +483,8 @@ DEFAULTS: dict[str, Any] = {
         # ⚠️ 依赖 xatlas UV 展开，而它在大网格上可能极慢（实测 10 万面级别会卡住），
         #    所以默认关闭 + 带超时保护（超时即跳过，不影响其它产物）。
         # 水密化：写盘前补孔洞（实测 IMG5 边界边仅 2.2% 但仍不封闭）
+        # 网格精修迭代数（按 ED 深度拉回真实表面）；0=关闭
+        "mesh_refine_iters": 100,
         "mesh_watertight": True,
         "mesh_texture": False,
         "mesh_texture_size": 2048,

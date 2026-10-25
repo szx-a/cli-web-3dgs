@@ -1,6 +1,9 @@
+# gsflow 示例配置：复制为 config.toml 后按本机情况修改。
+# 注意：config.toml 不入库（它含本机绝对路径）。
+
 [project]
 name = "gsflow"
-workspace_dir = "F:\\3dgs-and-ai\\workspace"
+workspace_dir = ""
 
 [tools]
 ffmpeg = ""
@@ -146,6 +149,7 @@ mesh_target_triangles = 400000
 mesh_presimplify_ratio = 10.0
 mesh_smooth_iters = 5
 mesh_largest_only = true
+mesh_refine_iters = 100
 mesh_watertight = true
 mesh_texture = false
 mesh_texture_size = 2048

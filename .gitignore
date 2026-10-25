@@ -1,4 +1,6 @@
 # ---- 敏感与个人数据（绝不提交）----
+# 本机配置（含绝对路径）：回归仓库只保留 example
+config/config.toml
 config/credentials.json
 config/credentials.example.json
 

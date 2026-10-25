@@ -992,6 +992,13 @@ class ExportStage(Stage):
                      "或体素过大。可试 --set export.mesh_voxel_div=800")
             return []
 
+        # ---- 网格精修：按 ED 深度把薄壳拉回真实表面（2026-10-25）----
+        #
+        # 为什么放在这里：TSDF 得到的网格是"深度的零等值面"，但薄结构（屋檐、墙板）
+        # 会被并成一片、屋顶塌陷。精修直接用**同一批 ED 深度**做拟合，
+        # 不需要 GPU、失败也不影响后续导出（外层 try 包住并降级为"用未精修网格"）。
+        mesh = self._maybe_refine_mesh(ctx, mesh, cams, rendered, used_idx, ks, src_wh)
+
         return self._finish_mesh(ctx, mesh, info, out_dir, cams=cams)
 
     def _load_bake_inputs(self, ctx: StageContext, cams):
@@ -1022,6 +1029,32 @@ class ExportStage(Stage):
             ks.append(np.asarray(K, dtype=np.float64))
             whs.append((int(w), int(h)))
         return images, np.stack(c2ws), np.stack(ks), whs
+
+    def _maybe_refine_mesh(self, ctx: StageContext, mesh, cams, rendered, used_idx,
+                           ks, src_wh):
+        """按 ED 深度精修网格（可选，见 `gsdata/mesh_refine.py`）。
+
+        放在 `_finish_mesh` **之前**：精修只移动顶点、不改拓扑，所以后面的
+        水密化/清退化面/定向仍作用在最终几何上。
+        失败时**降级为未精修网格**并告警 —— 精修不能把导出搞崩。
+        """
+        iters = int(ctx.cfg("mesh_refine_iters", 0) or 0)
+        if iters <= 0 or not rendered or not cams:
+            return mesh
+        try:
+            from ..gsdata.mesh_refine import refine_mesh_to_depths
+
+            mesh, st = refine_mesh_to_depths(
+                mesh, cams, rendered, used_idx, ks, src_wh,
+                iters=iters, log=ctx.info)
+            rs = st.get("residual_median") or []
+            if rs:
+                ctx.info(f"网格精修：{st['iters']} 轮，中位深度残差 {rs[0]:.5f} → {rs[-1]:.5f}"
+                         f"（{st['stop']}），采信顶点比例 {st['used_fraction'][-1] * 100:.0f}%")
+            return mesh
+        except Exception as exc:  # noqa: BLE001
+            ctx.warn(f"网格精修失败（{type(exc).__name__}: {exc}），使用未精修网格")
+            return mesh
 
     def _finish_mesh(self, ctx: StageContext, mesh, info: dict, out_dir: Path,
                      cams=None) -> list[dict]:

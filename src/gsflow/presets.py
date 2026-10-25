@@ -48,8 +48,12 @@ PRESETS: dict[str, dict[str, Any]] = {
         "train.densify_from": 500,
         "train.densify_until": 20000,
         "train.densify_interval": 100,
-        "train.densify_strategy": "official",
-        "train.absgrad": True,
+        # 实测（2026-10-25）：official + grow_grad2d=2e-4 在本项目数据上致密化失控
+        # （step 10000 就涨到 251 万高斯）；已补上 cap_max 但阈值仍需标定。
+        # 预设先用**已校准的内置策略**，official 作为实验项（--set train.densify_strategy=official）。
+        "train.densify_strategy": "builtin",
+        # absgrad 只对 official 策略生效；内置策略下保留开关不起作用，写 False 避免误解
+        "train.absgrad": False,
         "train.opacity_reset_interval": 3000,
         "train.auto_extend_densify_when_reset": True,
         "train.rasterize_mode": "antialiased",
