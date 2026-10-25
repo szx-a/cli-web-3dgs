@@ -17,6 +17,9 @@ tools/
 .env
 *.part
 
+# 生成物：环境自检快照（含本机主机名/路径，不入库）
+docs/env-report.json
+
 # ---- Python ----
 __pycache__/
 *.py[cod]
