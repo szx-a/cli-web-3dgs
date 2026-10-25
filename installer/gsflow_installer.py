@@ -182,8 +182,10 @@ def _ensure_uv(runner: Runner, root: Path, env: dict, python_exe: str) -> str:
 
 def _copy_reuse(src: Path, dst: Path, runner: Runner) -> None:
     """复用已有安装的缓存与模型（省流量、省时间）。"""
-    pairs = [("env/uv-cache", "env/uv-cache"), ("env/pip-cache", "env/pip-cache"),
-             ("models", "models"), ("tools", "tools")]
+    # 只复制**纯数据**目录（模型权重、外部工具）；
+    # uv/pip 缓存含锁文件与 .tmp* 临时目录，复制会报 WinError 5，
+    # 且半截缓存会让后续安装仍需联网（实测）。缓存改为直接指向源。
+    pairs = [("models", "models"), ("tools", "tools")]
     for a, b in pairs:
         s, d = src / a, dst / b
         if not s.exists():
@@ -246,6 +248,14 @@ def install(plan: Plan, runner: Runner) -> bool:
         return False
 
     if plan.reuse_from and plan.reuse_from.exists():
+        # ⚠️ **不要复制 uv/pip 缓存**（2026-10-25 实测）：
+        #   * 缓存目录里有 `.tmp*` 临时目录与锁定文件，`copytree` 会因 `WinError 5` 中断，
+        #     半截的缓存反而导致后续 `uv pip install` 仍要联网并失败；
+        #   * 直接把 `UV_CACHE_DIR` / `PIP_CACHE_DIR` **指向源缓存**，零拷贝、零风险。
+        # 只复制"纯数据"目录（models/tools），它们没有锁文件。
+        env["UV_CACHE_DIR"] = str(plan.reuse_from / "env" / "uv-cache")
+        env["PIP_CACHE_DIR"] = str(plan.reuse_from / "env" / "pip-cache")
+        log(f"复用缓存（直接指向）：{env['UV_CACHE_DIR']}")
         _copy_reuse(plan.reuse_from, root, runner)
 
     if plan.dry_run:
@@ -278,8 +288,15 @@ def install(plan: Plan, runner: Runner) -> bool:
 
     req = root / "requirements.txt"
     if req.exists():
-        if pipi(["-r", str(req)]) != 0:
-            log("核心依赖安装失败")
+        # 本机网络会间歇性失败（error sending request for url）⇒ 重试 3 次
+        ok = False
+        for attempt in range(1, 4):
+            if pipi(["-r", str(req)]) == 0:
+                ok = True
+                break
+            log(f"依赖安装第 {attempt} 次失败，重试…")
+        if not ok:
+            log("核心依赖安装失败（已重试 3 次）")
             return False
     else:
         log("警告：未找到 requirements.txt（安装包不完整？）")
