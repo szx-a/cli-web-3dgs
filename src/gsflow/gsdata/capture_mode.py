@@ -60,7 +60,8 @@ class CaptureAnalysis:
         }
 
 
-def detect_from_frames(job_dir: Path, max_pairs: int = 40) -> CaptureAnalysis | None:
+def detect_from_frames(job_dir: Path, max_pairs: int = 40,
+                       masks: dict | None = None) -> CaptureAnalysis | None:
     """从抽帧 + 掩码估计拍摄模式。
 
     判据：**背景区域的帧间差异**。
@@ -81,6 +82,13 @@ def detect_from_frames(job_dir: Path, max_pairs: int = 40) -> CaptureAnalysis | 
         return None
 
     def mask_of(p: Path):
+        # 优先用传入的掩码（确定性判定用），否则读磁盘
+        if masks:
+            _m = masks.get(p.name)
+            if _m is None:
+                _m = masks.get(p.stem)
+            if _m is not None:
+                return np.asarray(_m) > (127 if np.asarray(_m).dtype.kind in "iu" and np.asarray(_m).max() > 1 else 0.5)
         if not mask_dir.exists():
             return None
         for c in (mask_dir / (p.stem + ".png"), mask_dir / (p.name + ".png")):

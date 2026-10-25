@@ -85,16 +85,26 @@ def main() -> int:
     print(f"最终验收：{args.job}")
     print("=" * 74)
 
-    # ---------- 1. 五个必需产物 ----------
-    print("\n① 交付产物（5 个必需）")
+    # ---------- 1. 必需产物 ----------
+    # 纹理烘焙是**可选项**（`export.mesh_texture` 默认 false）。
+    # 实测：img4-v1 没开纹理，旧验收却无条件要求 `model_mesh_textured.glb`
+    # ⇒ 报 3 个"缺失"失败，而实际产物完好。这里按作业配置决定是否要求它。
+    want_tex = False
+    try:
+        snap = json.loads((jd / "job.json").read_text(encoding="utf-8")).get("settings_snapshot") or {}
+        want_tex = bool((snap.get("export") or {}).get("mesh_texture", False))
+    except Exception:  # noqa: BLE001
+        want_tex = (exp / "model_mesh_textured.glb").exists()
+    print("\n① 交付产物" + ("（含带纹理 glb）" if want_tex else "（纹理烘焙未开启，不要求 textured glb）"))
     plys = sorted((train / "point_cloud").glob("*/point_cloud.ply"), key=lambda p: int(''.join(ch for ch in p.parent.name if ch.isdigit()) or 0))
     req = [
         ("点云 ply", plys[-1] if plys else None),
         ("实体模型 ply", exp / "model_mesh.ply"),
         ("点云 glb", exp / "model.glb"),
         ("网络(网格) glb", exp / "model_mesh.glb"),
-        ("带纹理最终 glb", exp / "model_mesh_textured.glb"),
     ]
+    if want_tex:
+        req.append(("带纹理最终 glb", exp / "model_mesh_textured.glb"))
     for label, p in req:
         if p is None or not p.exists():
             chk(False, label, "缺失")
@@ -106,7 +116,7 @@ def main() -> int:
     print("\n② GLB 结构")
     for label, p, want_mode in (("点云 glb", exp / "model.glb", 0),
                                 ("网格 glb", exp / "model_mesh.glb", 4),
-                                ("带纹理 glb", exp / "model_mesh_textured.glb", 4)):
+                                *((("带纹理 glb", exp / "model_mesh_textured.glb", 4),) if want_tex else ())):
         if not p.exists():
             chk(False, f"{label} 结构", "文件不存在")
             continue
@@ -227,7 +237,12 @@ def main() -> int:
         detail = float(np.hypot(gx, gy).mean())
         chk(detail > 3.0, "纹理细节量 > 3（不糊）", f"{detail:.2f}")
     else:
-        chk(False, "贴图", "缺失")
+        # 纹理烘焙未开启属于**合法配置**（export.mesh_texture 默认 false），
+        # 不应记成失败；只有"开了却没产物"才是问题。
+        if want_tex:
+            chk(False, "贴图", "缺失（已开启 mesh_texture 但未生成）")
+        else:
+            print("  [SKIP] 贴图（export.mesh_texture=false，未烘焙纹理）")
 
     # ---------- 3.5 高斯泼溅可用性（**不许用"降级为点云"糊过去**）----------
     #

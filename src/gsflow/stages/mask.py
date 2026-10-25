@@ -135,6 +135,34 @@ class MaskStage(Stage):
         t0 = time.time()
         segmenter = create(backend_name, opts)
 
+        # ---- 用"有掩码判据"做确定性判定（2026-10-24）----
+        #
+        # 背景：拍摄模式有两条判据（无掩码 / 有掩码），走哪条取决于掩码是否已存在
+        # ⇒ 同一条命令重跑会因为执行顺序落到不同结论（img3-v2 orbit vs img3-v7 turntable，
+        #   掩码内 SSIM 差 0.022，见 docs/03 G143）。
+        # 修法：这里先用**少量样本**跑一次分割，拿真掩码去做有掩码判据；
+        # 与先前无掩码判据不同则**以有掩码判据为准**，并把两个结论都记下来。
+        if str(ctx.cfg("capture_mode", "auto") or "auto").lower() == "auto":
+            try:
+                from ..gsdata.capture_mode import detect_from_frames as _detect_m
+
+                _sample = images[:: max(1, len(images) // 12)][:12]
+                _seg = segmenter.segment(_sample)
+                _alt = _detect_m(ctx.job_dir, max_pairs=12, masks=_seg)
+                if _alt is not None:
+                    if _alt.mode != cap_mode:
+                        ctx.warn(
+                            f"拍摄模式判定以**有掩码判据**为准：无掩码判据={cap_mode} → "
+                            f"有掩码判据={_alt.mode}（{_alt.reason[:70]}）。"
+                            f"如需固定请用 --capture-mode 显式指定")
+                    else:
+                        ctx.info(f"拍摄模式两条判据一致：{cap_mode}")
+                    cap_mode, cap_note = _alt.mode, _alt.reason
+                    mode = "keep" if cap_mode == "turntable" else "black"
+                    ctx.info(f"拍摄模式 = {cap_mode}（确定性判定，清理模式={mode}）")
+            except Exception as _exc:  # noqa: BLE001
+                ctx.warn(f"有掩码判据预判失败（{type(_exc).__name__}），沿用无掩码判据 {cap_mode}")
+
         last_report = {"t": 0.0}
 
         def on_progress(i: int, total: int, fname: str) -> None:
