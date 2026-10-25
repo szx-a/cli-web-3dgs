@@ -226,8 +226,13 @@ def refine_mesh_to_depths(
 
     if not stats["stop"]:
         stats["stop"] = "max_iters"
+    # 收尾：几何**一定是最好那一版**（回溯时已恢复），但残差列表的最后一个样本
+    # 可能是"触发回退的那次坏测量"。所以单独记 best，报告用 best，避免看起来"越修越差"。
+    stats["residual_best"] = float(best) if best != float("inf") else None
+    if verts_best is not None:
+        out.vertices = o3d.utility.Vector3dVector(verts_best)
     out.compute_vertex_normals()
-    if log:
-        log(f"网格精修结束：{stats['iters']} 轮，残差 {stats['residual_median'][:1]} → "
-            f"{stats['residual_median'][-1:]}，停止原因={stats['stop']}")
+    if log and stats["residual_median"]:
+        log(f"网格精修结束：{stats['iters']} 轮，中位深度残差 "
+            f"{stats['residual_median'][0]:.5f} → {best:.5f}，停止原因={stats['stop']}")
     return out, stats

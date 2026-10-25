@@ -1049,7 +1049,8 @@ class ExportStage(Stage):
                 iters=iters, log=ctx.info)
             rs = st.get("residual_median") or []
             if rs:
-                ctx.info(f"网格精修：{st['iters']} 轮，中位深度残差 {rs[0]:.5f} → {rs[-1]:.5f}"
+                best_res = st.get("residual_best", rs[-1])
+                ctx.info(f"网格精修：{st['iters']} 轮，中位深度残差 {rs[0]:.5f} → {best_res:.5f}"
                          f"（{st['stop']}），采信顶点比例 {st['used_fraction'][-1] * 100:.0f}%")
             return mesh
         except Exception as exc:  # noqa: BLE001
