@@ -99,7 +99,7 @@ $M_\epsilon = M\ominus K_\epsilon$（`mask_erode_px`）收缩，避免把掩码�
 
 $$\mathcal{L}_{\text{crisp}}=\lambda\,\frac{1}{N}\sum_j \alpha_j\,(1-\alpha_j),$$
 
-它在 $\alpha\in\{0,1\}$ 处最小。其梯度
+它在 $\alpha\in\lbrace 0,1\rbrace$ 处最小。其梯度
 
 $$\frac{\partial\mathcal{L}_{\text{crisp}}}{\partial o_j}
 =-\lambda\,\alpha_j(1-\alpha_j)(1-2\alpha_j)$$
@@ -140,7 +140,7 @@ $$D(u)=\frac{\sum_j w_j z_j}{\sum_j w_j},\qquad w_j=\alpha_j\prod_{k<j}(1-\alpha
 
 $$\mathbf{P}_u=z_u\,\mathbf{m}+z\,(1/f_x,0,0)^\top,\quad
 \mathbf{P}_v=z_v\,\mathbf{m}+z\,(0,1/f_y,0)^\top,\quad
-\mathbf{n}=\frac{\mathbf{P}_u\times\mathbf{P}_v}{\|\mathbf{P}_u\times\mathbf{P}_v\|},$$
+\mathbf{n}=\frac{\mathbf{P}_u\times\mathbf{P}_v}{\Vert\mathbf{P}_u\times\mathbf{P}_v\Vert},$$
 
 其中 $\mathbf{m}=K^{-1}[u,v,1]^\top$。用未归一化深度时，$z_u$ 被 $w$ 的梯度污染，
 正对相机的平面会算出偏离 $26.6^\circ$ 的法线（实测）；用 ED 则给出 $[0,0,-1]$（偏差 <1°，有单测）。
@@ -150,7 +150,7 @@ $$\mathbf{P}_u=z_u\,\mathbf{m}+z\,(1/f_x,0,0)^\top,\quad
 网格是二维复形，其边界算子 $\partial$ 作用在面集合上。**封闭**（无水密性漏洞）等价于
 
 $$\partial_2 F=\emptyset
-\iff \#\{e:\,\deg(e)=1\}=0\;\wedge\;\#\{e:\,\deg(e)\ge3\}=0,$$
+\iff \mathrm{card}\lbrace e:\,\deg(e)=1\rbrace=0\;\wedge\;\mathrm{card}\lbrace e:\,\deg(e)\ge3\rbrace=0,$$
 
 $\deg(e)$ 是共享该边的面数；再要求顶点是流形（每个顶点的邻接面构成单一扇区）。
 补洞就是在边界环 $C\subset\partial_2F$ 上贴一张"帽" $H$，使
@@ -183,8 +183,8 @@ $$\eta_{k+1}=\tfrac12\eta_k,\qquad x^{(k+1)}=x^{\star}\ \text{（若 } r^{(k+1)}
 | 掩码内 PSNR/SSIM | $\mathrm{PSNR}=10\log_{10}\frac{1}{\mathrm{MSE}_M}$，SSIM 同式但只在 $M$ 内统计 | 黑底模式下唯一有意义 |
 | 轮廓光晕 $\text{rim}$ | $\overline{L}_{\text{ring}(2\text{px})}-\overline{L}_{\text{interior}}$ | $>0.10$ ⇒ 可见白边 |
 | 轨道彩度 $\chi$ | $\mathrm{mean}_{u}\big(\max_c C_c-\min_c C_c\big)$（轨道视角）| $>0.12$ ⇒ 彩虹斑块 |
-| 实心度 | $\mathrm{median}_j\alpha_j$、$\#\{\alpha_j<0.1\}/N$ | 中位 $<0.1$ 且多数 $<0.1$ ⇒ 观感发雾 |
-| 掩码松紧 $\rho$ | $|M\setminus M_{\text{gt}}|/|M_{\text{gt}}|$ | $>0.5$ ⇒ 掩码过松（会把背景学进模型）|
+| 实心度 | $\mathrm{median}_j\alpha_j$、$\mathrm{card}\lbrace\alpha_j<0.1\rbrace/N$ | 中位 $<0.1$ 且多数 $<0.1$ ⇒ 观感发雾 |
+| 掩码松紧 $\rho$ | $\vert M\setminus M_{\mathrm{gt}}\vert/\vert M_{\mathrm{gt}}\vert$ | $>0.5$ ⇒ 掩码过松（会把背景学进模型）|
 | 网格封闭 | $\partial_2F=\emptyset$（见 3.5）| 边界边 0、非流形 0、顶点流形 |
 
 ### 3.8 实验性（本地测试中，**未纳入推荐**）：视线级不透明度下限
@@ -355,7 +355,7 @@ scripts\gsflow.cmd run --video data\x.mp4 --job-id final --preset solid
 ### 5.4 流程逻辑（数学）：每一步的公式与默认值
 
 > 这一节把五个阶段的**核心公式 + 代码里的默认值**逐条列出，便于核对实现、也便于改参数时知道自己在动哪个量。
-> 符号：内参 $K$，外参 $(R_i,t_i)$，像素 $u$，深度 $z$，高斯 $\{(\mu_j,\Sigma_j,\alpha_j,c_j)\}$，
+> 符号：内参 $K$，外参 $(R_i,t_i)$，像素 $u$，深度 $z$，高斯 $\lbrace(\mu_j,\Sigma_j,\alpha_j,c_j)\rbrace$，
 > 不透明度 $\alpha_j=\sigma(o_j)$，透射率 $T_j=\prod_{k<j}(1-\alpha_k)$。
 
 #### ① 抽帧（frames）
@@ -368,7 +368,7 @@ scripts\gsflow.cmd run --video data\x.mp4 --job-id final --preset solid
 
 #### ② 掩码与背景清理（mask）
 
-分割给出 $M(u)\in\{0,1\}$（`mask.backend`：`rembg` / `fastsam` / `classical`），
+分割给出 $M(u)\in\lbrace 0,1\rbrace$（`mask.backend`：`rembg` / `fastsam` / `classical`），
 训练图按 $\;I'(u)=M(u)I(u)+(1-M(u))b\;$ 合成，$b$ 由 `mask.mode` 决定：
 `black` ⇒ $b=0$（默认），`keep` ⇒ 保留原背景（转台拍摄必须用这个，见 3.1）。
 
@@ -388,9 +388,9 @@ r\mapsto r\,(1+k_1 r^2).$$
 `min_num_matches=32`，图像长边 `max_image_size=2048`。
 BA 目标与质量门限：
 
-$$\min_{\{R_i,t_i,X_j\}}\sum_{(i,j)\in\mathcal{O}}\big\|\tilde x_{ij}-\pi(R_iX_j+t_i)\big\|^2,\qquad
-\text{注册率}\ge\texttt{quality\_min\_registered\_ratio}=0.75,\quad
-\overline{e}\le\texttt{quality\_max\_reproj\_error}=2.0\ \text{px}.$$
+$$\min_{\lbrace R_i,t_i,X_j\rbrace}\sum_{(i,j)\in\mathcal{O}}\big\Vert\tilde x_{ij}-\pi(R_iX_j+t_i)\big\Vert^2,\qquad
+\text{注册率}\ge\texttt{quality-min-registered-ratio}=0.75,\quad
+\overline{e}\le\texttt{quality-max-reproj-error}=2.0\ \text{px}.$$
 
 #### ④ 3DGS 训练（train）
 
@@ -401,8 +401,8 @@ D(u)=\frac{\sum_j \alpha_jT_jz_j}{\sum_j\alpha_jT_j}\ \ (\text{ED 期望深度})
 T_j=\prod_{k<j}(1-\alpha_k).$$
 
 **损失组成**（默认值）：
-$\mathcal{L}=(1-\lambda_{s})\|C-\tilde I\|_1+\lambda_{s}\big(1-\mathrm{SSIM}\big)
-+\lambda_{\text{sh}}\|\theta_{\text{rest}}\|_2^2
+$\mathcal{L}=(1-\lambda_{s})\VertC-\tilde I\Vert_1+\lambda_{s}\big(1-\mathrm{SSIM}\big)
++\lambda_{\text{sh}}\Vert\theta_{\text{rest}}\Vert_2^2
 +\lambda_{\text{lpips}}\mathcal{L}_{\text{LPIPS}}
 +\lambda_{n}\mathcal{L}_{\text{normal}}
 +\lambda_{d}\mathcal{L}_{\text{dist}}
@@ -413,7 +413,7 @@ $\mathcal{L}=(1-\lambda_{s})\|C-\tilde I\|_1+\lambda_{s}\big(1-\mathrm{SSIM}\big
 |---|---|---|
 | $\lambda_s$ (`ssim_weight`) | 0.2 | 结构相似度权重 |
 | $\lambda_{\text{sh}}$ (`sh_rest_reg`) | 0.003 | 抑制斜视彩虹（只压 $f_{\text{rest}}$）|
-| $\lambda_{\text{lpips}},\ \texttt{lpips\_every}$ | 0 / **1**（关闭时）| 开启时必须**每步**算（G152）|
+| $\lambda_{\text{lpips}},\ \texttt{lpips-every}$ | 0 / **1**（关闭时）| 开启时必须**每步**算（G152）|
 | $\lambda_n,\lambda_d$ (`lambda_normal`, `lambda_depth_distortion`) | 0 / 0 | 2DGS 面元约束（ED 上）|
 | 下限 $f,\lambda_f$ (`opacity_floor`, `opacity_floor_reg`) | **0.10 / 0.5** | 单边下限，实测几乎免费（3.3）|
 | $\lambda_{\text{bg}}$ (`bg_alpha_reg`) | 0.1 | 掩码外 alpha 抑制 |
@@ -421,11 +421,11 @@ $\mathcal{L}=(1-\lambda_{s})\|C-\tilde I\|_1+\lambda_{s}\big(1-\mathrm{SSIM}\big
 **自适应密度控制**（`densify_*`，默认）：从 `densify_from=500` 开始、到 `densify_until=4000` 结束，
 每 `densify_interval=100` 步一次；判据为屏幕空间梯度
 
-$$g_j=\Big\|\frac{\partial\mathcal{L}}{\partial \mu_j^{2D}}\Big\|\quad(\texttt{densify\_criterion="grad2d"}),\qquad
-\text{克隆/分裂若 } g_j>\tau_g=2\times10^{-4}\ (\texttt{densify\_grad2d\_threshold}).$$
+$$g_j=\Big\Vert\frac{\partial\mathcal{L}}{\partial \mu_j^{2D}}\Big\Vert\quad(\texttt{densify-criterion="grad2d"}),\qquad
+\text{克隆/分裂若 } g_j>\tau_g=2\times10^{-4}\ (\texttt{densify-grad2d-threshold}).$$
 
 **剪枝**：$\alpha_j<\varepsilon_\alpha$（`prune_opacity=0.005`）或
-$\max_k s_{jk}>\rho_s\cdot\text{scene\_scale}$（`prune_scale3d=0.1`）删掉；
+$\max_k s_{jk}>\rho_s\cdot\text{scene-scale}$（`prune_scale3d=0.1`）删掉；
 另有 `max_scale_ratio=0.05`（每步尺度上限）、`max_aspect=50`（长宽比上限）、`cap_max=600000`。
 
 **不透明度重置**：每 `opacity_reset_interval` 步把 $\sigma(o_j)\leftarrow\min(\sigma(o_j),\rho)$，
@@ -435,7 +435,7 @@ $\rho=2\varepsilon_\alpha=0.01$（官方行为；`revised_opacity=0.1` 是分裂
 **学习率**（`lr_*`，默认）：`lr_means_scene_scale=false` ⇒ $\eta_\mu=1.6\times10^{-4}$ 固定；
 $\eta_{\text{sh DC}}=2.5\times10^{-3}$、$\eta_{\text{sh rest}}$=`lr_shs=0.0025`、$\eta_\alpha=0.025$、
 $\eta_{\text{scale}}=5\times10^{-3}$、$\eta_{\text{quat}}=10^{-3}$；`lr_schedule="cosine"`，
-$\eta(t)=\eta_{\min}+(\eta_0-\eta_{\min})\cdot\frac12\big(1+\cos\frac{\pi t}{T}\big)$，$\eta_{\min}=$\texttt{lr\_min\_ratio}$\eta_0$（0.1）。
+$\eta(t)=\eta_{\min}+(\eta_0-\eta_{\min})\cdot\frac12\big(1+\cos\frac{\pi t}{T}\big)$，$\eta_{\min}=$\texttt{lr-min-ratio}$\eta_0$（0.1）。
 
 #### ⑤ 导出（export）
 
@@ -465,7 +465,7 @@ K_p=\begin{bmatrix}nn^\top & -nn^\top p\\ -p^\top nn^\top & p^\top nn^\top p\end
 
 **贴图**（`mesh_texture=false` 默认关闭）：xatlas 展开最小化
 
-$$E_{\text{stretch}}=\sum_t A_t\big(\|J_t\|_F^2+\|J_t^{-1}\|_F^2\big),$$
+$$E_{\text{stretch}}=\sum_t A_t\big(\VertJ_t\Vert_F^2+\VertJ_t^{-1}\Vert_F^2\big),$$
 
 再按可见性加权采样 $T(x)=\sum_i w_i(x)I_i(\pi_i(x))\big/\sum_i w_i(x)$，
 `mesh_texture_size=2048`（实测 UV 覆盖 100%、黑 texel 0.00%）。
