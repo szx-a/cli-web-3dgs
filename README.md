@@ -458,8 +458,11 @@ $\mathbf{V}=\sum_j n_j\delta_{\mu_j}$，等值面 $\chi=\tfrac12$；
 预简化 `mesh_presimplify_ratio=10`、Taubin 平滑 `mesh_smooth_iters=5`、**QEM** 到
 `mesh_target_triangles=400000`：
 
-$$\Delta(v)=\bar v^\top Q\bar v,\qquad Q=\sum_{p\in\mathcal{P}(v)}K_p,\quad
-K_p=\begin{bmatrix}nn^\top & -nn^\top p\\ -p^\top nn^\top & p^\top nn^\top p\end{bmatrix}.$$
+$$\Delta(v)=\sum_{p\in\mathcal{P}(v)}\Big(n_p^{\top}\,(\bar v-p)\Big)^{2},\qquad
+Q=\sum_{p}K_p,\ K_p=\text{由平面}\ (n_p,p)\ \text{构造的二次型}.$$
+
+> 这里刻意用**平面距离平方**的等价写法，而不是 $2\times2$ 分块矩阵：矩阵里的换行 `\\` 会被
+> Markdown 当成转义吃掉（变成单个 `\`），矩阵会塌成一行 —— 这是 GitHub 上常见的一类渲染事故。
 
 **水密化**（`mesh_watertight=true`）：补洞使 $\partial_2(F\cup H)=\emptyset$ 且新面与旧面**反向共享边**（3.5）。
 

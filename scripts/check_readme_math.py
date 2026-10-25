@@ -80,6 +80,9 @@ def _check(seg: str) -> list[str]:
     import re as _re
     if _re.search(r"\\\\[lr]brace[A-Za-z0-9]", seg):
         problems.append("\\lbrace/\\rbrace \u540e\u7f3a\u7a7a\u683c\uff08\u4f1a\u88ab\u5f53\u6210\u672a\u77e5\u5b8f\uff09")
+    # 矩阵环境里的换行 \\\\ 会被 Markdown 吐成单个 \\，矩阵塔成一行
+    if ("\\\\begin{" in seg) or ("\\\\end{" in seg):
+        problems.append("含矩阵环境（\\\\begin/​end）：换行会被 Markdown 吃掉，建议改等价无矩阵写法")
     for macro, alt in BAD_MACROS.items():
         if macro in seg:
             problems.append(f"含不可靠宏 {macro}（改用 {alt}）")
