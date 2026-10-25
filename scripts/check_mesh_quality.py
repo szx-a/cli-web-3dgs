@@ -61,7 +61,18 @@ def _metrics(path: Path) -> dict:
     nonman = sum(1 for v in cnt.values() if v > 2)
     out["boundary_edge_ratio"] = boundary / total_e
     out["non_manifold_ratio"] = nonman / total_e
-    out["watertight"] = bool(m.is_watertight()) if hasattr(m, "is_watertight") else None
+
+    # 封闭判据用**我们自己的定义**（无边界边 + 无非流形边 + 顶点流形）。
+    # Open3D 的 `is_watertight()` 额外要求"无自交"，而泊松/TSDF 结果几乎必然自交
+    # ⇒ 它几乎恒为 False，没有区分度（2026-10-25 实测并写入 docs/03）。
+    from gsflow.gsdata.mesh_export import mesh_topology
+
+    topo = mesh_topology(m)
+    out["boundary_edges"] = topo["boundary_edges"]
+    out["closed"] = topo["closed"]
+    out["open3d_watertight"] = topo["open3d_watertight"]
+    out["self_intersecting"] = topo["self_intersecting"]
+    out.pop("watertight", None) if "watertight" in out else None
 
     try:
         labels = np.asarray(m.cluster_connected_triangles()[0])
@@ -116,9 +127,10 @@ def main() -> int:
     if len(rows) > 1:
         print("\n  横比（越小越好：boundary / non_manifold；越接近 1 越好：volume_over_hull）")
         for r in rows:
-            print("    %-22s boundary=%.4f nonman=%.4f watertight=%s vol/hull=%s" % (
+            print("    %-22s boundary=%.4f nonman=%.4f closed=%s selfint=%s vol/hull=%s" % (
                 r["file"], r.get("boundary_edge_ratio", float("nan")),
-                r.get("non_manifold_ratio", float("nan")), r.get("watertight"),
+                r.get("non_manifold_ratio", float("nan")), r.get("closed"),
+                r.get("self_intersecting"),
                 ("%.3f" % r["volume_over_hull"]) if "volume_over_hull" in r else "-"))
     return 0
 

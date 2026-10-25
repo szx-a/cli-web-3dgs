@@ -78,6 +78,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--capture-mode", default="",
                     choices=["", "auto", "turntable", "orbit"],
                     help="拍摄模式（与 GUI 下拉框等价）：auto/turntable/orbit")
+    sp.add_argument("--preset", default="",
+                    choices=["", "balanced", "quality", "q", "hq"],
+                    help="训练预设（与 GUI 下拉框等价）：balanced（当前默认）/ quality（质量优先，"
+                         "官方密度控制+AbsGS+每步 LPIPS+2DGS 面元正则，约 60~75 分钟/作业）")
     sp.add_argument("--opacity-cleanup", default="",
                     choices=["", "none", "reset", "decay", "utilization", "recovery"],
                     help="训练时的不透明度治理方案（与 GUI 下拉框等价）："
@@ -172,6 +176,22 @@ def cmd_run(args) -> int:
 
     paths.ensure_dirs()
     sets = _parse_sets(args.set)
+    # 预设：与 GUI 下拉框**同一套映射**（见 gsflow.presets），显式 --set 优先。
+    # 放在最前面展开，让后面所有"方案类"覆盖（不透明度治理、拍摄模式）也能压过它。
+    preset = (getattr(args, "preset", "") or "").strip()
+    if preset:
+        from . import presets as _presets
+        from .config import DEFAULTS
+        try:
+            preset_sets = _presets.resolve(preset, DEFAULTS)
+        except KeyError as exc:
+            print(f"预设无效：{exc}")
+            return 2
+        for k, v in preset_sets.items():
+            sets.setdefault(k, v)
+        print(f"训练预设 = {preset}（{len(preset_sets)} 项）")
+        for k, v in preset_sets.items():
+            print(f"  {k} = {v}")
     # 不透明度治理方案：与 GUI 下拉框**同一套映射**（见 opacity_cleanup_params），
     # 保证"界面能选的，命令行也能选"，反之亦然（架构红线：两端同构）。
     oc = getattr(args, "opacity_cleanup", "") or ""

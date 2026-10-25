@@ -140,6 +140,11 @@ ARMS: dict[str, dict[str, str]] = {
     "lpips2": {"train.lambda_lpips": "0.2"},
     # 实用档：感知损失 λ=0.1，每 16 步算一次（控制开销）
     "lpips16": {"train.lambda_lpips": "0.1", "train.lpips_every": "16"},
+    # 不透明度下限（直接压掉 op<0.1 的淡层）
+    # 按论文/社区做法重做的 LPIPS：每步都算 + 官方线性权重
+    "lpipsC": {"train.lambda_lpips": "0.1"},
+    "lpipsD": {"train.lambda_lpips": "0.2"},
+    "floor2": {"train.opacity_floor": "0.2", "train.opacity_floor_reg": "0.5"},
     "reset3k": {"train.opacity_reset_interval": "3000",
                  "train.lr_opacities": "0.05"},
     "official_rst": {"train.densify_strategy": "official",

@@ -146,10 +146,14 @@ def _fake_rasterization_factory(depth_map, normal_map):
     这也是必要的：真实 gsplat 需要 CUDA，而这两个正则的**数学**是纯张量运算，
     没有理由必须上 GPU 才能验证。
 
-    计数约定：`render_mode="D"` 记到 `depth`；**只有当 colors 是逐高斯 3 通道法线**
-    （形如 [N,1,3]）时才算 `normal` —— 主渲染传的是 SH（[N,1,3] 也是 3 通道，
-    但维度是 [N,K,3]，K 是 SH 系数个数，通常为 16）。
+    计数约定：`render_mode` 含 **ED**（`RGB+ED`，训练默认）或 `D`（仅对照）都记到 `depth`；
+    **只有当 colors 是逐高斯 3 通道法线**（形如 [N,1,3]）时才算 `normal` ——
+    主渲染传的是 SH（[N,1,3] 也是 3 通道，但维度是 [N,K,3]，K 是 SH 系数个数，通常为 16）。
     这里按"N 与传入的 quats 一致且第二维为 1"来区分，避免把主渲染误计。
+
+    ⚠️ 2026-10-25：深度语义改为 **ED（期望深度，与导出统一）**，所以 `RGB+ED` 的返回值是
+    **[1,H,W,4]**（RGB + 深度通道），不是旧的 [1,H,W,1]。这个假实现必须跟着契约走 ——
+    否则测试会掩盖真实的调用契约变化。
     """
     calls = {"depth": 0, "normal": 0}
 
@@ -157,10 +161,15 @@ def _fake_rasterization_factory(depth_map, normal_map):
              viewmats=None, Ks=None, width=None, height=None, sh_degree=None,
              render_mode="RGB", **kw):
         H, W = depth_map.shape
-        if render_mode == "D":
+        if render_mode in ("D", "RGB+ED", "RGB+D"):
             calls["depth"] += 1
-            out = torch.zeros(1, H, W, 1)
-            out[0, ..., 0] = depth_map
+            if render_mode == "RGB+ED":
+                out = torch.zeros(1, H, W, 4)
+                out[0, ..., 0:3] = 0.5          # RGB 占位
+                out[0, ..., 3] = depth_map      # ED 通道
+            else:
+                out = torch.zeros(1, H, W, 1)
+                out[0, ..., 0] = depth_map
             return out, torch.ones(1, H, W, 1), {}
         # 判断这是不是"渲染法线"那一趟：colors 形如 [N,1,3]（第二维为 1）
         is_normal_pass = (colors is not None and colors.dim() == 3

@@ -247,6 +247,9 @@ class TrainConfig:
     sh_rest_max: float = 0.0                # f_rest 逐系数幅度上限（0=关）
     opacity_crisp_reg: float = 0.02          # 不透明度清晰度正则（推实；实测 SSIM −0.0003）
     opacity_crisp_warmup: float = 0.7        # 前 N% 迭代不施加清晰度正则（0~1）
+    opacity_floor: float = 0.0               # 不透明度下限（配合 opacity_floor_reg）
+    opacity_floor_reg: float = 0.0           # 下限正则权重：惩罚 relu(floor-op)
+    opacity_floor_warmup: float = 0.5        # 前 N% 迭代不施加
     # 训练结束时的最小不透明度清理（Faster-GS: MIN_OPACITY_AFTER_TRAINING = 1/255）。
     # 不透明度低于该值的高斯在收尾时直接删掉；0 表示不清理。
     min_opacity_final: float = 0.0
@@ -274,7 +277,7 @@ class TrainConfig:
     # （丢高阶 SH ⇒ 低估 1.91 dB，且恰好抹掉感知损失要改善的视角相关细节）⇒ 假阴性。
     lambda_lpips: float = 0.0
     # 每 N 步计算一次（VGG 前向开销与显存都不小）
-    lpips_every: int = 4
+    lpips_every: int = 1                    # 社区做法：每步都算（见 03/G152）
     # ---- 多指标评估（用户方案第 6 项）----
     # 在 metrics.json 里同时记录 PSNR / SSIM / LPIPS，并额外保存 best_ssim / best_lpips
     # 的检查点。理由：PSNR 高但 SSIM/LPIPS 差的模型视觉上往往是模糊的，
@@ -306,6 +309,8 @@ class TrainConfig:
     #   "tv"   -> |Δ_x D| + |Δ_y D|（一阶差分，惩罚深度图不平滑；实现简单、必收敛）
     #   "lap"  -> |Δ²D|（二阶，更接近 2DGS 的"深度应分段恒定"意图）
     depth_distortion_mode: str = "tv"
+    # 训练侧深度语义："expected"=期望深度 ED（与导出一致）；"accum"=Σwz（仅对照）
+    depth_mode: str = "expected"
     seed: int = 42
     log_every: int = 200
 
@@ -502,15 +507,38 @@ def two_dgs_regularizers(cfg, means, quats, scales, opacities, shs, kk, vm,
         # 虽然不大但纯属浪费；实测单测也会因此误判"触发了额外渲染"）。
         return out
 
-    # 1) 额外渲染一次累计深度：render_mode="D" 给出 Σwᵢzᵢ（官方文档）
-    colors_d, _, _ = rasterization(
-        means=means, quats=quats, scales=scales, opacities=opacities,
-        colors=shs, viewmats=vm[None], Ks=kk[None], width=width, height=height,
-        sh_degree=sh_degree, near_plane=0.01, far_plane=1e10, packed=False,
-        render_mode="D",
-    )
-    depth = colors_d[0][..., 0]                    # [H,W]
-    alpha = alphas[0][..., 0].detach()             # [H,W]
+    # 1) 额外渲染一次深度。
+    #
+    # ⚠️ **这里以前用 `render_mode="D"`，那是个真实的自洽性缺陷（2026-10-25 修）**：
+    #   * `D` 返回的是 `Σ wᵢ zᵢ`（**未除以 alpha**，gsplat 文档明确），它不是"深度"，
+    #     而是"深度×不透明度"；alpha 低的地方数值被同比压低。
+    #   * 而导出阶段（`gsdata/mesh_export.py`）用的是 **`RGB+ED`（期望深度 `Σwz/Σw`）**。
+    #   于是训练时优化法线/失真用的深度，和导出时反投影用的深度**不是同一个量**，
+    #   两者相差 1/alpha 倍 —— 这正是"逻辑没写自洽"的典型：各段都"能跑"，但语义不一致。
+    #
+    # 现在统一到 ED（与导出、与 2DGS/GOF 的做法一致）；`depth_mode="accum"` 仅保留做对照。
+    depth_mode = str(getattr(cfg, "depth_mode", "expected") or "expected").lower()
+    if depth_mode == "accum":
+        colors_d, alphas_d, _ = rasterization(
+            means=means, quats=quats, scales=scales, opacities=opacities,
+            colors=shs, viewmats=vm[None], Ks=kk[None], width=width, height=height,
+            sh_degree=sh_degree, near_plane=0.01, far_plane=1e10, packed=False,
+            render_mode="D",
+        )
+        depth = colors_d[0][..., 0]                # Σwᵢzᵢ（未归一化，仅对照用）
+        alpha = alphas_d[0][..., 0].detach()
+    else:
+        colors_ed, alphas_d, _ = rasterization(
+            means=means, quats=quats, scales=scales, opacities=opacities,
+            colors=shs, viewmats=vm[None], Ks=kk[None], width=width, height=height,
+            sh_degree=sh_degree, near_plane=0.01, far_plane=1e10, packed=False,
+            render_mode="RGB+ED",
+        )
+        depth = colors_ed[0][..., 3]               # 期望深度 Σwᵢzᵢ / Σwᵢ
+        alpha = alphas_d[0][..., 0].detach()
+
+    # 低 alpha 区域（背景/边缘）没有可信深度：置 0，让下游用法线的 valid 掩码排除。
+    depth = torch.where(alpha > 0.1, depth, torch.zeros_like(depth))
 
     # 2) 深度失真抑制
     if want_depth:
@@ -1443,6 +1471,20 @@ def train(cfg: TrainConfig, ctx) -> dict:
                 _op_now = current_opacities().reshape(-1)
                 loss = loss + _crisp_w * (_op_now * (1.0 - _op_now)).mean()
 
+        # ---- 不透明度**下限**正则（2026-10-25）----
+        #
+        # 与上面的 `op*(1-op)` 互补，且更对症：
+        #   * `op*(1-op)` 在 op→0 时**也变小** ⇒ 优化器可以"把高斯推到更淡"来满足它；
+        #   * 实测 img5-v1 **85% 的高斯 op<0.1**（中位 0.031）⇒ 需要的正是"别再淡下去"。
+        # 所以这里用单边惩罚 `relu(floor - op)`：只有低于下限才罚，且只能靠**抬高**来解除。
+        _floor = float(getattr(cfg, "opacity_floor", 0.0) or 0.0)
+        _floor_w = float(getattr(cfg, "opacity_floor_reg", 0.0) or 0.0)
+        if _floor > 0 and _floor_w > 0:
+            _fwu = float(getattr(cfg, "opacity_floor_warmup", 0.0) or 0.0) * float(cfg.iterations)
+            if step >= _fwu:
+                _op_f = current_opacities().reshape(-1)
+                loss = loss + _floor_w * torch.relu(_floor - _op_f).mean()
+
         # ---- 正则项（参考 Faster-GS / 3DGS-MCMC 的做法）----
         # 为什么需要：3DGS 在"背景无人约束"或"视图偏少"时会用**大量半透明浮点**
         # 去凑像素 —— 表现为点云/网格周围一圈雾状杂点（用户反馈的"杂乱"）。
@@ -1501,7 +1543,8 @@ def train(cfg: TrainConfig, ctx) -> dict:
             if _lpips_fn is None:
                 try:
                     from .perceptual import get_lpips
-                    _lpips_fn = get_lpips(str(device))
+                    _lpips_fn = get_lpips(str(device),
+                                          input_size=int(getattr(cfg, "lpips_size", 224) or 224))
                     ctx.info(f"感知损失已启用：λ_lpips={float(cfg.lambda_lpips)} "
                              f"每 {int(cfg.lpips_every)} 步计算一次")
                 except Exception as exc:  # noqa: BLE001

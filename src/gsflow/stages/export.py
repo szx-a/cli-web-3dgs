@@ -1078,6 +1078,29 @@ class ExportStage(Stage):
             ctx.warn("网格后处理后为空，放弃导出")
             return []
 
+        # ---- 水密化：补孔洞（2026-10-25）----
+        #
+        # 为什么放在"最大连通块 / 退化面清理"之后、"法线定向"之前：
+        #   * 补洞会**新增顶点与面**，也会改动边界拓扑 ⇒ 必须在连通块/清理之后；
+        #   * 补洞会引入新的面，绕序必须一并被定向（定向是写盘前最后一步）。
+        # 实测 IMG5：`boundary_edge_ratio` 只有 0.0225，但 `is_watertight()` 为 False，
+        # 贴图/实体交付都不合格 —— 边界边少 ≠ 封闭。
+        _wt = ctx.cfg("mesh_watertight", True)
+        if isinstance(_wt, str):
+            _wt = _wt.strip().lower() in ("1", "true", "yes", "on")
+        if _wt:
+            try:
+                from ..gsdata.mesh_export import fill_holes
+
+                mesh, hole_stats = fill_holes(mesh, log=ctx.info)
+                info["mesh_watertight"] = hole_stats
+                ctx.info(
+                    "水密化：补 %d/%d 个孔洞（+%d 面），封闭=%s"
+                    % (hole_stats["filled_loops"], hole_stats["loops"],
+                       hole_stats["added_triangles"], mesh.is_watertight()))
+            except Exception as exc:  # noqa: BLE001
+                ctx.warn(f"补孔洞失败（{type(exc).__name__}: {exc}），继续用未补洞网格")
+
         # ---- 法线统一朝外（必须在**任何写盘之前**）----
         #
         # 踩过的坑（两次）：

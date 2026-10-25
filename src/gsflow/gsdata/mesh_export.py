@@ -806,6 +806,248 @@ def voxel_downsample(points, colors=None, normals=None, voxel: float = 0.01):
     return out, _avg(colors), _avg(normals)
 
 
+def mesh_topology(mesh) -> dict:
+    """网格拓扑体检：边界边 / 非流形边 / **封闭判据** / 自交。
+
+    为什么不用 Open3D 的 `is_watertight()` 作为唯一判据：
+    它**还要求无自交**，而泊松/TSDF 结果几乎必然自交 ⇒ 永远 False，失去区分度。
+    本项目把"封闭"定义为：**无边界边 + 无非流形边 + 顶点流形**；自交单独报告。
+    """
+    import numpy as np
+
+    from collections import defaultdict
+
+    tris = np.asarray(mesh.triangles, dtype=np.int64)
+    cnt: dict[tuple[int, int], int] = defaultdict(int)
+    for a, b, c in tris:
+        for e in ((a, b), (b, c), (c, a)):
+            cnt[(min(e), max(e))] += 1
+    boundary = sum(1 for n in cnt.values() if n == 1)
+    nonman = sum(1 for n in cnt.values() if n > 2)
+    try:
+        vman = bool(mesh.is_vertex_manifold())
+    except Exception:  # noqa: BLE001
+        vman = True
+    out = {
+        "triangles": int(len(tris)),
+        "vertices": int(len(np.asarray(mesh.vertices))),
+        "boundary_edges": int(boundary),
+        "nonmanifold_edges": int(nonman),
+        "vertex_manifold": vman,
+        "closed": bool(boundary == 0 and nonman == 0 and vman),
+    }
+    try:
+        out["open3d_watertight"] = bool(mesh.is_watertight())
+    except Exception:  # noqa: BLE001
+        out["open3d_watertight"] = None
+    try:
+        out["self_intersecting"] = bool(mesh.is_self_intersecting())
+    except Exception:  # noqa: BLE001
+        out["self_intersecting"] = None
+    return out
+
+
+def fill_holes(mesh, max_loop_edges: int = 4000, log=None):
+    """闭合网格上的孔洞（**水密化的关键一步**）。
+
+    ## 为什么需要（2026-10-25）
+
+    实测 IMG5 的 TSDF 网格 `boundary_edge_ratio` 只有 0.0225，但**视觉上仍是"空壳"**：
+    边界边少 ≠ 封闭。真正判据是 `is_watertight()`，它要求**每条边恰好被两个面共享**。
+    薄壳结构（屋檐/墙板）在 TSDF 里常常留下长条状缺口 —— 面积占比很小，
+    但让网格无法作为实体交付（3D 打印、游戏引擎碰撞、体积计算全部失败）。
+
+    Open3D 的 legacy `TriangleMesh` **没有** `fill_holes`（只有张量网格才有），
+    所以这里自己实现：
+
+      1. 统计每条边被多少个面使用；**只被 1 个面使用**的是边界边；
+      2. 把边界边串成闭环（每个边界顶点通常恰好两条边界边）；
+      3. 每个闭环用**以质心为扇心**的三角扇封闭（新增 1 个顶点 + k 个三角形）——
+         对"近似平面的小孔"足够好，且能保证拓扑闭合；
+      4. 超过 `max_loop_edges` 的巨环**不补**（那通常不是孔洞而是模型边界，
+         强行补会糊上一大片假面），只统计并在日志里说明。
+
+    返回 `(mesh, stats)`；stats 记录补了多少环/多少面，便于验收与横向比较。
+    """
+    import numpy as np
+    import open3d as o3d
+
+    stats = {"loops": 0, "filled_loops": 0, "skipped_loops": 0,
+             "added_triangles": 0, "boundary_edges_before": 0, "watertight_before": False}
+    if len(mesh.triangles) == 0:
+        return mesh, stats
+
+    topo_before = mesh_topology(mesh)
+    tris = np.asarray(mesh.triangles, dtype=np.int64)
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    stats["watertight_before"] = bool(topo_before.get("closed"))
+    stats["boundary_edges_before"] = int(topo_before["boundary_edges"])
+
+    # ---- 1) 边界边 ----
+    from collections import defaultdict
+
+    cnt: dict[tuple[int, int], int] = defaultdict(int)
+    for a, b, c in tris:
+        for e in ((a, b), (b, c), (c, a)):
+            cnt[(min(e), max(e))] += 1
+    boundary = [e for e, n in cnt.items() if n == 1]
+    stats["boundary_edges_before"] = len(boundary)
+    if not boundary:
+        # 没有洞 ⇒ 补洞前后拓扑相同（不能直接 return，否则调用方拿不到 closed 字段）
+        stats.update({"boundary_edges_after": 0,
+                      "nonmanifold_edges_after": int(topo_before["nonmanifold_edges"]),
+                      "closed_after": bool(topo_before["closed"]),
+                      "open3d_watertight": topo_before.get("open3d_watertight"),
+                      "self_intersecting": topo_before.get("self_intersecting")})
+        return mesh, stats
+
+    # 记录每条边界边在**原面里**的方向 (a->b)：补洞三角形必须反向 (b->a)，
+    # 否则相邻面共享边同向 ⇒ Open3D `is_watertight()` 仍为 False
+    # （实测：边界边已归零、edge/vertex manifold 都 True，却依然 watertight=False，
+    #  就是朝向不一致导致的）。
+    bdir: dict[tuple[int, int], tuple[int, int]] = {}
+    for a, b, c in tris:
+        for u, v in ((a, b), (b, c), (c, a)):
+            k = (min(u, v), max(u, v))
+            if cnt[k] == 1:
+                bdir[k] = (int(u), int(v))
+
+    # ---- 2) 串环 ----
+    #
+    # 用**标准边界行走**：从任一未使用的边界边出发，每步选一条**未使用**的邻接边，
+    # 直到回到起点。第一版用"跳过 prev + 查 visited"的写法，会在度数>2 的顶点处
+    # 走出**跨越两个环**的假环，于是扇面与真实面共享边成 3 个面 ⇒ 被后续清理删光
+    # （实测：面数 282088→282088，一个都没补上）。这是必须用"边"而不是"顶点"做状态的典型。
+    adj: dict[int, list[int]] = defaultdict(list)
+    for a, b in boundary:
+        adj[a].append(b)
+        adj[b].append(a)
+
+    used_edges: set[tuple[int, int]] = set()
+
+    def _ek(u: int, v: int) -> tuple[int, int]:
+        return (u, v) if u < v else (v, u)
+
+    loops: list[list[int]] = []
+    for a, b in boundary:
+        if _ek(a, b) in used_edges:
+            continue
+        loop = [a]
+        prev, cur = a, b
+        used_edges.add(_ek(a, b))
+        closed = False
+        while True:
+            if cur == a:
+                closed = True
+                break
+            loop.append(cur)
+            nxt = None
+            for cand in adj[cur]:
+                if cand == prev:
+                    continue
+                if _ek(cur, cand) in used_edges:
+                    continue
+                nxt = cand
+                break
+            if nxt is None:
+                break
+            used_edges.add(_ek(cur, nxt))
+            prev, cur = cur, nxt
+        if closed and len(loop) >= 3:
+            loops.append(loop)
+        else:
+            stats["skipped_loops"] += 1
+
+    stats["loops"] = len(loops)
+    if not loops:
+        return mesh, stats
+
+    # ---- 3) 以质心为扇心补面 ----
+    new_verts: list[np.ndarray] = []
+    new_tris: list[tuple[int, int, int]] = []
+    base = len(verts)
+    for loop in loops:
+        if len(loop) > max_loop_edges:
+            stats["skipped_loops"] += 1
+            if log:
+                log(f"跳过超长边界环（{len(loop)} 条边 > {max_loop_edges}）："
+                    f"多半是模型边界，不是孔洞")
+            continue
+        c = verts[loop].mean(axis=0)
+        ci = base + len(new_verts)
+        new_verts.append(c)
+        for k in range(len(loop)):
+            p, q = int(loop[k]), int(loop[(k + 1) % len(loop)])
+            # 反向于原面方向：原面是 p->q 则补 (ci, q, p)
+            stored = bdir.get((min(p, q), max(p, q)), (p, q))
+            if stored == (p, q):
+                new_tris.append((ci, q, p))
+            else:
+                new_tris.append((ci, p, q))
+        stats["filled_loops"] += 1
+
+    if not new_tris:
+        stats.update({"boundary_edges_after": int(topo_before["boundary_edges"]),
+                      "nonmanifold_edges_after": int(topo_before["nonmanifold_edges"]),
+                      "closed_after": bool(topo_before["closed"]),
+                      "open3d_watertight": topo_before.get("open3d_watertight"),
+                      "self_intersecting": topo_before.get("self_intersecting")})
+        return mesh, stats
+
+    all_verts = np.vstack([verts, np.asarray(new_verts, dtype=np.float64)]) if new_verts else verts
+    all_tris = np.vstack([tris, np.asarray(new_tris, dtype=np.int64)])
+    out = mesh
+    out.vertices = o3d.utility.Vector3dVector(all_verts)
+    out.triangles = o3d.utility.Vector3iVector(all_tris)
+    stats["added_triangles"] = len(new_tris)
+
+    # ---- 4) 焊接（只做安全的两种）----
+    #
+    # ⚠️ 这里**不能**调用 `remove_non_manifold_edges()`：它会把"与已有面共享同一条边"的
+    # 新面整片删掉，实测让补洞完全失效（282088 面一个没补上）。补洞的正确判据是
+    # **边界边是否归零**，而不是"强行让网格变成流形"。
+    try:
+        out.remove_duplicated_vertices()
+        out.remove_unreferenced_vertices()
+    except Exception as exc:  # noqa: BLE001
+        if log:
+            log(f"补洞后的焊接失败（{type(exc).__name__}: {exc}）")
+    try:
+        out.compute_vertex_normals()
+    except Exception:  # noqa: BLE001
+        pass
+    # 统计补洞后的残余边界（理想为 0）
+    tris2 = np.asarray(out.triangles, dtype=np.int64)
+    cnt2: dict[tuple[int, int], int] = defaultdict(int)
+    for a, b, c in tris2:
+        for e in ((a, b), (b, c), (c, a)):
+            cnt2[(min(e), max(e))] += 1
+    stats["boundary_edges_after"] = sum(1 for n in cnt2.values() if n == 1)
+    stats["nonmanifold_edges_after"] = sum(1 for n in cnt2.values() if n > 2)
+
+    # ⚠️ Open3D 的 `is_watertight()` **还要求无自交**（实测：本网格每条边都被恰好 2 个面共享、
+    # edge/vertex manifold 都为 True，只因泊松结果自交就返回 False）。泊松/TSDF 网格几乎必然自交，
+    # 所以真正可用于交付判定的是下面这个**封闭判据**：
+    #     无边界边 && 无非流形边 && 顶点流形
+    # 自交单独报告（消除它需要重网格化，属于另一项工作）。
+    try:
+        stats["closed_after"] = bool(
+            stats["boundary_edges_after"] == 0
+            and stats["nonmanifold_edges_after"] == 0
+            and out.is_vertex_manifold())
+    except Exception:  # noqa: BLE001
+        stats["closed_after"] = stats["boundary_edges_after"] == 0
+    try:
+        stats["open3d_watertight"] = bool(out.is_watertight())
+    except Exception:  # noqa: BLE001
+        stats["open3d_watertight"] = False
+    try:
+        stats["self_intersecting"] = bool(out.is_self_intersecting())
+    except Exception:  # noqa: BLE001
+        stats["self_intersecting"] = None
+    return out, stats
+
+
 def smooth_mesh(mesh, method: str = "taubin", iterations: int = 5):
     """网格平滑：去掉 TSDF/泊松产生的阶梯状噪点。
 

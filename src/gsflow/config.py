@@ -332,6 +332,11 @@ DEFAULTS: dict[str, Any] = {
         # 实测：全程施加 0.02 会把不透明度中位从 0.071 提到 1.0，
         # 但 SSIM 0.9478→0.9435 并出现亮斑 ⇒ 试退火能否两全。
         "opacity_crisp_warmup": 0.7,  # 前 70% 不施加，避免一开始压成硬块带来亮斑
+        # 不透明度**下限**正则：惩罚 relu(floor-op)，直接压掉“大量 op<0.1”的淡层。
+        # 与 op*(1-op) 的区别：后者可以靠“推到 0”满足，前者只能靠“推高”满足。
+        "opacity_floor": 0.0,
+        "opacity_floor_reg": 0.0,
+        "opacity_floor_warmup": 0.5,
         # 不透明度初值（官方 0.1）。实测收敛到中位 0.07、op<0.1 占 67%，
         # 提高初值可把优化推向“少而实”的解。
         "opacity_init": 0.1,
@@ -368,7 +373,8 @@ DEFAULTS: dict[str, Any] = {
         "lambda_lpips": 0.0,
         # 40 分钟才跑到 5000 步。40倍以上慢于普通集。
         # 每 N 步计算一次 LPIPS（VGG 前向开销不小）
-        "lpips_every": 4,
+        "lpips_every": 1,   # 社区做法：**每步**都算（稀疏施加会让梯度不一致，见 03/G152）
+        "lpips_size": 224,   # 感知损失的输入尺寸（速度适配；训练与评估一致）
         # ---- 多指标评估（用户方案第 6 项）----
         # metrics.json 同时记录 PSNR / SSIM / LPIPS，并保存"最佳检查点"的完整指标。
         "eval_metrics": True,
@@ -398,6 +404,8 @@ DEFAULTS: dict[str, Any] = {
         "lambda_depth_distortion": 0.0,
         "lambda_normal": 0.0,
         "reg_interval": 8,             # 每 N 步施加一次正则（深度正则需要额外一次渲染）
+        # 训练侧深度语义：expected=ED（Σwz/Σw，与导出一致）| accum=D（Σwz，仅对照）
+        "depth_mode": "expected",
         "depth_distortion_mode": "tv",  # tv（一阶）| lap（二阶）
         "extra_args": "",
     },
@@ -474,6 +482,8 @@ DEFAULTS: dict[str, Any] = {
         # ---- 纹理烘焙（可选，"实感"的最后一步）----
         # ⚠️ 依赖 xatlas UV 展开，而它在大网格上可能极慢（实测 10 万面级别会卡住），
         #    所以默认关闭 + 带超时保护（超时即跳过，不影响其它产物）。
+        # 水密化：写盘前补孔洞（实测 IMG5 边界边仅 2.2% 但仍不封闭）
+        "mesh_watertight": True,
         "mesh_texture": False,
         "mesh_texture_size": 2048,
         "mesh_texture_timeout": 300,    # UV 展开超时（秒）；超时跳过纹理烘焙
@@ -649,10 +659,26 @@ def _coerce(value: Any) -> Any:
 
 
 def load(overrides: dict[str, Any] | None = None, config_path: Path | None = None) -> Settings:
-    """按优先级合并出最终配置。"""
+    """按优先级合并出最终配置。
+
+    优先级（低 → 高）：
+        1. `DEFAULTS`
+        2. `config/config.toml`（本机配置）
+        3. **预设**（`overrides["preset"]`，见 `gsflow.presets`）
+        4. 显式覆盖（`--set` / GUI 表单里的具体键）
+
+    预设放在显式覆盖**之前**展开，所以"给预设又给具体键"时具体键赢 —— 这符合直觉，
+    也让预设可以当"起点"而不是"锁死的模板"。
+    """
     data = _deep_merge(DEFAULTS, load_toml(config_path or CONFIG_FILE))
     settings = Settings(data)
-    for k, v in (overrides or {}).items():
+    ov = dict(overrides or {})
+    if "preset" in ov:
+        # 延迟导入：`presets` 需要 `DEFAULTS` 做键名/类型校验，避免循环导入
+        from . import presets as _presets
+
+        ov = _presets.expand(ov, DEFAULTS)
+    for k, v in ov.items():
         settings.set(k, v)
     return settings
 
