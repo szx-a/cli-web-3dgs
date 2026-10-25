@@ -71,8 +71,8 @@
 转台（物体转、背景不动）与环绕（相机绕物体转、背景随视角变化）在数学上是**两类不同的相机模型假设**：
 转台意味着"世界坐标系随手转"，直接把背景当静态会与相机位姿矛盾。用背景的**时间稳定性**判别：
 
-$$s_b=\frac{\operatorname{median}_{u\notin M}\;\operatorname{Var}_t\big(I_t(u)\big)}
-{\operatorname{median}_{u\notin M}\;\big(I_t(u)\big)^2},$$
+$$s_b=\frac{\mathrm{median}_{u\notin M}\;\mathrm{Var}_t\big(I_t(u)\big)}
+{\mathrm{median}_{u\notin M}\;\big(I_t(u)\big)^2},$$
 
 $s_b$ 小 ⇒ 背景静止 ⇒ 转台；$s_b$ 大 ⇒ 环绕。本项目要求**判定必须在合成背景之前完成**
 （检测器输入原始帧 + 掩码，采样 12 帧成对比较），否则掩码把背景涂黑后差异被人为抹平，
@@ -111,10 +111,10 @@ $$\frac{\partial\mathcal{L}_{\text{crisp}}}{\partial o_j}
 
 **对称正则不够，还需要单边下限。** 只靠 crisp 项，`op<0.1` 的高斯仍占 85%。加上单边下限
 
-$$\mathcal{L}_{\text{floor}}=\lambda_f\,\frac1N\sum_j\operatorname{relu}\big(f-\alpha_j\big),
+$$\mathcal{L}_{\text{floor}}=\lambda_f\,\frac1N\sum_j\mathrm{relu}\big(f-\alpha_j\big),
 \qquad
 \frac{\partial \mathcal{L}_{\text{floor}}}{\partial o_j}
-=-\lambda_f\,\alpha_j(1-\alpha_j)\,\mathbb{1}[\alpha_j<f],$$
+=-\lambda_f\,\alpha_j(1-\alpha_j)\,\mathbf{1}[\alpha_j<f],$$
 
 （只能靠**抬高** $\alpha$ 来解除）后，在默认设置（30k、`cap_max` 600k）实测：
 
@@ -149,13 +149,13 @@ $$\mathbf{P}_u=z_u\,\mathbf{m}+z\,(1/f_x,0,0)^\top,\quad
 
 网格是二维复形，其边界算子 $\partial$ 作用在面集合上。**封闭**（无水密性漏洞）等价于
 
-$$\partial_2 F=\varnothing
+$$\partial_2 F=\emptyset
 \iff \#\{e:\,\deg(e)=1\}=0\;\wedge\;\#\{e:\,\deg(e)\ge3\}=0,$$
 
 $\deg(e)$ 是共享该边的面数；再要求顶点是流形（每个顶点的邻接面构成单一扇区）。
 补洞就是在边界环 $C\subset\partial_2F$ 上贴一张"帽" $H$，使
 
-$$\partial_2(F\cup H)=\varnothing,\qquad\text{且 } H \text{ 与 } F \text{ 共享的边方向相反}.$$
+$$\partial_2(F\cup H)=\emptyset,\qquad\text{且 } H \text{ 与 } F \text{ 共享的边方向相反}.$$
 
 **逆向绕序**这一步是必要的：若新面与旧面在共享边上同向，则 $\partial$ 不会抵消，
 Open3D 的 `is_watertight()` 仍返回 False（实测边界边已归零却仍判 False，正是朝向不一致）。
@@ -169,7 +169,7 @@ $$\Delta x_v=\eta\cdot\frac{1}{|\mathcal{V}(v)|}\sum_{i\in\mathcal{V}(v)}
 \big(D_i(u_v)-z_v\big)\cos\theta_{iv},$$
 
 $\cos\theta_{iv}$ 抑制掠射角放大（深度误差在掠射方向被夸大 $1/\cos\theta$）。
-每步之后若中位残差 $r^{(k)}=\operatorname{median}|\Delta|$ 变大，就**回退到最优顶点并把步长减半**：
+每步之后若中位残差 $r^{(k)}=\mathrm{median}|\Delta|$ 变大，就**回退到最优顶点并把步长减半**：
 
 $$\eta_{k+1}=\tfrac12\eta_k,\qquad x^{(k+1)}=x^{\star}\ \text{（若 } r^{(k+1)}>r^{\star}\text{）},$$
 
@@ -182,19 +182,19 @@ $$\eta_{k+1}=\tfrac12\eta_k,\qquad x^{(k+1)}=x^{\star}\ \text{（若 } r^{(k+1)}
 |---|---|---|
 | 掩码内 PSNR/SSIM | $\mathrm{PSNR}=10\log_{10}\frac{1}{\mathrm{MSE}_M}$，SSIM 同式但只在 $M$ 内统计 | 黑底模式下唯一有意义 |
 | 轮廓光晕 $\text{rim}$ | $\overline{L}_{\text{ring}(2\text{px})}-\overline{L}_{\text{interior}}$ | $>0.10$ ⇒ 可见白边 |
-| 轨道彩度 $\chi$ | $\operatorname{mean}_{u}\big(\max_c C_c-\min_c C_c\big)$（轨道视角）| $>0.12$ ⇒ 彩虹斑块 |
-| 实心度 | $\operatorname{median}_j\alpha_j$、$\#\{\alpha_j<0.1\}/N$ | 中位 $<0.1$ 且多数 $<0.1$ ⇒ 观感发雾 |
+| 轨道彩度 $\chi$ | $\mathrm{mean}_{u}\big(\max_c C_c-\min_c C_c\big)$（轨道视角）| $>0.12$ ⇒ 彩虹斑块 |
+| 实心度 | $\mathrm{median}_j\alpha_j$、$\#\{\alpha_j<0.1\}/N$ | 中位 $<0.1$ 且多数 $<0.1$ ⇒ 观感发雾 |
 | 掩码松紧 $\rho$ | $|M\setminus M_{\text{gt}}|/|M_{\text{gt}}|$ | $>0.5$ ⇒ 掩码过松（会把背景学进模型）|
-| 网格封闭 | $\partial_2F=\varnothing$（见 3.5）| 边界边 0、非流形 0、顶点流形 |
+| 网格封闭 | $\partial_2F=\emptyset$（见 3.5）| 边界边 0、非流形 0、顶点流形 |
 
 ### 3.8 实验性（本地测试中，**未纳入推荐**）：视线级不透明度下限
 
 设每条视线的累计不透明度 (u)=1-\prod_j\big(1-\alpha_j(u)\big)$，对其加单边下限
 
 \mathcal{L}_{\text{ray}}=\frac{1}{|\mathcal{M}|}\sum_{u\in\mathcal{M}}
-\operatorname{relu}\big(\tau-T(u)\big),\qquad
+\mathrm{relu}\big(\tau-T(u)\big),\qquad
 \frac{\partial\mathcal{L}_{\text{ray}}}{\partial o_j}
-=-\alpha_j\,(1-T)\,\mathbb{1}[T<\tau],
+=-\alpha_j\,(1-T)\,\mathbf{1}[T<\tau],
 
 形式上比逐高斯的 $-\alpha_j(1-\alpha_j)$ 在 $\alpha\to0$ 时强得多（$\alpha=0.01,T=0.1$ 时差约 90 倍）。
 
@@ -361,9 +361,9 @@ scripts\gsflow.cmd run --video data\x.mp4 --job-id final --preset solid
 #### ① 抽帧（frames）
 
 帧率采样：在时间轴上等间隔取 $t_k=t_0+k/f$，$f=$ `frames.fps`（默认 **2.0**），上限 `frames.count`（120）。
-清晰度筛选：$\;s(I)=\operatorname{Var}\big(\nabla^2 I\big)$，$s<$`frames.blur_threshold` 的帧丢弃（默认 **0 = 不过滤**）。
+清晰度筛选：$\;s(I)=\mathrm{Var}\big(\nabla^2 I\big)$，$s<$`frames.blur_threshold` 的帧丢弃（默认 **0 = 不过滤**）。
 分辨率：长边缩放到 `frames.long_side`（默认 **1920**）。
-自动裁边：对序列求逐像素时间方差 $\operatorname{Var}_t I_t(u)$，保留高方差行/列的包围盒
+自动裁边：对序列求逐像素时间方差 $\mathrm{Var}_t I_t(u)$，保留高方差行/列的包围盒
 （`frames.auto_crop` 逻辑见 3.1；阈值 `auto_crop_threshold` 默认 **0.75**）。
 
 #### ② 掩码与背景清理（mask）
@@ -406,7 +406,7 @@ $\mathcal{L}=(1-\lambda_{s})\|C-\tilde I\|_1+\lambda_{s}\big(1-\mathrm{SSIM}\big
 +\lambda_{\text{lpips}}\mathcal{L}_{\text{LPIPS}}
 +\lambda_{n}\mathcal{L}_{\text{normal}}
 +\lambda_{d}\mathcal{L}_{\text{dist}}
-+\lambda_{f}\frac1N\sum_j\operatorname{relu}(f-\alpha_j)
++\lambda_{f}\frac1N\sum_j\mathrm{relu}(f-\alpha_j)
 +\lambda_{\text{bg}}\frac1{|\bar M|}\sum_{\bar M}\alpha$，
 
 | 项 | 默认 | 公式/说明 |
@@ -445,7 +445,7 @@ $\eta(t)=\eta_{\min}+(\eta_0-\eta_{\min})\cdot\frac12\big(1+\cos\frac{\pi t}{T}\
 **TSDF 融合**（`mesh_method="tsdf"`，本项目推荐给薄结构）：
 
 $$f(v)=\frac{\sum_i w_i(v)\,d_i(v)}{\sum_i w_i(v)},\qquad
-d_i(v)=\operatorname{clamp}\big(D_i(u_v)-z_v,\,-\delta,\delta\big),$$
+d_i(v)=\mathrm{clamp}\big(D_i(u_v)-z_v,\,-\delta,\delta\big),$$
 
 体素 $\delta=$`scene_scale`$/$`mesh_voxel_div`（默认 400 ⇒ 实测 0.008~0.016），
 深度过滤保留率实测 98.9~99.1%，零等值面用 Marching Cubes 提取。
@@ -461,7 +461,7 @@ $\mathbf{V}=\sum_j n_j\delta_{\mu_j}$，等值面 $\chi=\tfrac12$；
 $$\Delta(v)=\bar v^\top Q\bar v,\qquad Q=\sum_{p\in\mathcal{P}(v)}K_p,\quad
 K_p=\begin{bmatrix}nn^\top & -nn^\top p\\ -p^\top nn^\top & p^\top nn^\top p\end{bmatrix}.$$
 
-**水密化**（`mesh_watertight=true`）：补洞使 $\partial_2(F\cup H)=\varnothing$ 且新面与旧面**反向共享边**（3.5）。
+**水密化**（`mesh_watertight=true`）：补洞使 $\partial_2(F\cup H)=\emptyset$ 且新面与旧面**反向共享边**（3.5）。
 
 **贴图**（`mesh_texture=false` 默认关闭）：xatlas 展开最小化
 
