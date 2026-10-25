@@ -71,7 +71,11 @@ def main() -> int:
             g["sh_degree"] = args.sh
             print(f"  forced sh_degree={args.sh}")
     xyz = np.asarray(g["xyz"], dtype=np.float64)
-    lo, hi = xyz.min(0), xyz.max(0)
+    # ⚠️ 用**分位数包围盒**而不是 min/max（2026-10-25）：
+    # 实测 img5-v1 的 min/max 对角线 **18.0 m**，而 0.1% 分位数只有 **2.35 m**
+    # —— 少数离群高斯把包围盒撑大，相机被推远 7 倍，物体在画面里小得看不清。
+    lo = np.percentile(xyz, 0.5, axis=0)
+    hi = np.percentile(xyz, 99.5, axis=0)
     center = (lo + hi) / 2
     radius = float(np.linalg.norm(hi - lo)) / 2
 

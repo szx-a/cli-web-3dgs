@@ -1035,6 +1035,22 @@ class ExportStage(Stage):
 
         from ..gsdata.mesh_export import clean_mesh, sanitize_mesh, to_largest_component
 
+        # ---- 清除退化面（2026-10-25）----
+        #
+        # 实测：TSDF 融合会留下**零面积三角形**（img4-v1 有 1 个），导致
+        # 验收项"无零面积面"失败（法线会是 NaN），Blender/Unity 导入也会报警。
+        # 放在 `_finish_mesh`（所有网格路线的唯一收尾）里，写盘前统一清掉。
+        try:
+            _n0 = len(mesh.triangles)
+            mesh.remove_degenerate_triangles()
+            mesh.remove_duplicated_vertices()
+            mesh.remove_unreferenced_vertices()
+            _n1 = len(mesh.triangles)
+            if _n1 != _n0:
+                ctx.info(f"清除退化/重复面：{_n0} → {_n1}（-{_n0 - _n1}）")
+        except Exception as exc:  # noqa: BLE001
+            ctx.warn(f"清理退化面失败：{type(exc).__name__}（不影响导出）")
+
         largest_only = ctx.cfg("mesh_largest_only", True)
         if isinstance(largest_only, str):
             largest_only = largest_only.strip().lower() in ("1", "true", "yes", "on")

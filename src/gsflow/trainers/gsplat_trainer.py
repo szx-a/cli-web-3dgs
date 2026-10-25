@@ -245,7 +245,8 @@ class TrainConfig:
     mask_erode_px: int = 0                  # 损失用掩码腐蚀像素数（修轮廓白边）
     sh_rest_reg: float = 0.003              # f_rest 的 L2 正则权重（3e-3：彩度 −19%、SSIM −0.0005）
     sh_rest_max: float = 0.0                # f_rest 逐系数幅度上限（0=关）
-    opacity_crisp_reg: float = 0.0           # 不透明度清晰度正则权重（惩罚 op*(1-op)）
+    opacity_crisp_reg: float = 0.02          # 不透明度清晰度正则（推实；实测 SSIM −0.0003）
+    opacity_crisp_warmup: float = 0.7        # 前 N% 迭代不施加清晰度正则（0~1）
     # 训练结束时的最小不透明度清理（Faster-GS: MIN_OPACITY_AFTER_TRAINING = 1/255）。
     # 不透明度低于该值的高斯在收尾时直接删掉；0 表示不清理。
     min_opacity_final: float = 0.0
@@ -985,7 +986,12 @@ def train(cfg: TrainConfig, ctx) -> dict:
              f"中位数 {float(init_dist.median()):.5f}")
     quats = torch.nn.Parameter(torch.zeros(n, 4, device=device))
     quats.data[:, 0] = 1.0
-    opac = torch.nn.Parameter(torch.logit(torch.full((n, 1), 0.1, device=device)))
+    # 不透明度初值（官方也是 0.1）。实测：训练完中位只有 0.07、
+    # op<0.1 占 67% ⇒ 模型收敛到“半透明层叠”的解，新视角就透。
+    # 初值抬高会把优化推向“少一点但更实”的解，这里开放成配置。
+    _op_init = float(getattr(cfg, "opacity_init", 0.1) or 0.1)
+    _op_init = min(max(_op_init, 0.01), 0.99)
+    opac = torch.nn.Parameter(torch.logit(torch.full((n, 1), _op_init, device=device)))
     sh_dim = (cfg.sh_degree + 1) ** 2
     shs = torch.nn.Parameter(torch.zeros(n, sh_dim, 3, device=device))
     rgb0 = torch.from_numpy(cols).float().to(device) / 255.0
@@ -1427,9 +1433,15 @@ def train(cfg: TrainConfig, ctx) -> dict:
         # 训练视角颜色对得上（29.9 dB），但换视角就"透"、屋顶显薄。
         # 而**离线剪掉**淡高斯会掉 7.5 dB（它们在承载画质）⇒ 只能在训练时把 op 推向 0/1。
         # `op*(1-op)` 在 0 和 1 处最小、在 0.5 处最大，正好惩罚"半透明堆叠"。
-        if float(getattr(cfg, "opacity_crisp_reg", 0.0) or 0.0) > 0:
-            _op_now = current_opacities().reshape(-1)
-            loss = loss + float(cfg.opacity_crisp_reg) * (_op_now * (1.0 - _op_now)).mean()
+        _crisp_w = float(getattr(cfg, "opacity_crisp_reg", 0.0) or 0.0)
+        if _crisp_w > 0:
+            # 退火（opacity_crisp_warmup）：前 N% 迭代**不施加**，
+            # 先让 L1/SSIM 把颜色和结构做对，后段再把不透明度推向 0/1，
+            # 避免一开始就把高斯压成硬块（上一轮全程施加就出现亮斑）。
+            _wu = float(getattr(cfg, "opacity_crisp_warmup", 0.0) or 0.0) * float(cfg.iterations)
+            if step >= _wu:
+                _op_now = current_opacities().reshape(-1)
+                loss = loss + _crisp_w * (_op_now * (1.0 - _op_now)).mean()
 
         # ---- 正则项（参考 Faster-GS / 3DGS-MCMC 的做法）----
         # 为什么需要：3DGS 在"背景无人约束"或"视图偏少"时会用**大量半透明浮点**
