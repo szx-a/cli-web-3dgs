@@ -142,6 +142,9 @@ function collectParams() {
   put('frames.long_side', $('p-frames-long').value);
   put('colmap.matcher', $('p-colmap-matcher').value);
   put('train.backend', $('p-train-backend').value);
+  // 训练预设：与 CLI 的 `--preset` 共用 `gsflow/presets.py` 一份定义（单一映射源）。
+  // 空值 = balanced（不覆盖任何键）；下面的具体键仍可手动覆盖（显式覆盖优先于预设）。
+  put('preset', $('p-train-preset') ? $('p-train-preset').value : '');
   put('train.iterations', $('p-train-iters').value);
   put('train.resolution', $('p-train-res').value);
   put('train.cap_max', $('p-train-cap').value);
@@ -509,7 +512,8 @@ $('btn-reload-config').onclick = loadConfig;
 $('btn-reset-config').onclick = async () => { await api('/api/config/reset', { method: 'POST' }); loadConfig(); };
 ['in-path', 'in-title', 'in-jobid', 'in-force', 'p-mask-backend', 'p-mask-mode', 'p-mask-prompt',
   'p-capture-mode',
-  'p-frames-fps', 'p-frames-long', 'p-colmap-matcher', 'p-train-backend', 'p-train-iters',
+  'p-frames-fps', 'p-frames-long', 'p-colmap-matcher', 'p-train-backend', 'p-train-preset',
+  'p-train-iters',
   'p-train-res', 'p-train-cap', 'p-train-densify', 'p-train-maskloss',
   'p-train-opacityclean', 'p-train-opacityparam',
   'p-export-formats', 'p-mesh-method', 'p-mesh-depth', 'p-mesh-tris', 'p-mesh-smooth',

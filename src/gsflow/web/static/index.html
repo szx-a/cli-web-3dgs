@@ -125,9 +125,17 @@
           </label>
         </div>
         <div class="row">
+          <label class="grow">训练预设（preset）
+            <select id="p-train-preset">
+              <option value="">balanced（当前默认）</option>
+              <option value="quality">quality（质量优先：60k + 每步 LPIPS + 2DGS 面元正则，约 45–75 分钟）</option>
+            </select>
+          </label>
           <label class="grow">迭代次数
             <input id="p-train-iters" type="number" step="1000" value="30000">
           </label>
+        </div>
+        <div class="row">
           <label class="grow">训练分辨率（长边）
             <input id="p-train-res" type="number" step="100" value="1600">
           </label>
