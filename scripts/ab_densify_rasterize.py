@@ -135,6 +135,11 @@ ARMS: dict[str, dict[str, str]] = {
     "crispB": {"train.opacity_crisp_reg": "0.05", "train.opacity_crisp_warmup": "0.7"},
     # 初值抬高 + 退火正则（看能否又实又保精度）
     "opinit5": {"train.opacity_init": "0.5"},
+    # 感知损失（直接优化观感锐度）
+    "lpips1": {"train.lambda_lpips": "0.1"},
+    "lpips2": {"train.lambda_lpips": "0.2"},
+    # 实用档：感知损失 λ=0.1，每 16 步算一次（控制开销）
+    "lpips16": {"train.lambda_lpips": "0.1", "train.lpips_every": "16"},
     "reset3k": {"train.opacity_reset_interval": "3000",
                  "train.lr_opacities": "0.05"},
     "official_rst": {"train.densify_strategy": "official",
