@@ -118,7 +118,7 @@ $$\mathcal{L}_{\text{floor}}=\lambda_f\,\frac1N\sum_j\mathrm{relu}\big(f-\alpha_
 
 （只能靠**抬高** $\alpha$ 来解除）后，在默认设置（30k、`cap_max` 600k）实测：
 
-| 指标 | 无下限 | **$f=0.10,\ \lambda_f=0.5$** |
+| 指标 | 无下限 | **下限 0.10、权重 0.5** |
 |---|---|---|
 | `op` 中位 | 0.031 | **0.101** |
 | `op<0.1` 占比 | 85.0% | **4.0%** |
@@ -128,7 +128,7 @@ $$\mathcal{L}_{\text{floor}}=\lambda_f\,\frac1N\sum_j\mathrm{relu}\big(f-\alpha_
 ⇒ **几乎免费**，因此自 2026-10-26 起**默认开启**（`train.opacity_floor=0.10`、`opacity_floor_reg=0.5`）。
 注意它与"容量"有耦合：`quality` 预设把 `cap_max` 压到 300k 时，同样的下限只能把 `op<0.1` 降到 61.8%。
 
-### 3.4 深度语义统一（ED 而非 $\Sigma w z$）
+### 3.4 深度语义统一（ED 而非Σwz）
 
 一条视线的期望深度是**归一化**的加权平均
 
@@ -189,19 +189,19 @@ $$\eta_{k+1}=\tfrac12\eta_k,\qquad x^{(k+1)}=x^{\star}\ \text{（若 } r^{(k+1)}
 
 ### 3.8 实验性（本地测试中，**未纳入推荐**）：视线级不透明度下限
 
-设每条视线的累计不透明度 (u)=1-\prod_j\big(1-\alpha_j(u)\big)$，对其加单边下限
+设每条视线的累计不透明度 $T(u)=1-\prod_j\big(1-\alpha_j(u)\big)$，对其加单边下限
 
-\mathcal{L}_{\text{ray}}=\frac{1}{|\mathcal{M}|}\sum_{u\in\mathcal{M}}
+$$\mathcal{L}_{\text{ray}}=\frac{1}{|\mathcal{M}|}\sum_{u\in\mathcal{M}}
 \mathrm{relu}\big(\tau-T(u)\big),\qquad
 \frac{\partial\mathcal{L}_{\text{ray}}}{\partial o_j}
-=-\alpha_j\,(1-T)\,\mathbf{1}[T<\tau],
+=-\alpha_j\,(1-T)\,\mathbf{1}[T<\tau].$$
 
 形式上比逐高斯的 $-\alpha_j(1-\alpha_j)$ 在 $\alpha\to0$ 时强得多（$\alpha=0.01,T=0.1$ 时差约 90 倍）。
 
-**但实测前提不成立**：本项目数据上掩码内 $ 的中位数已是 **0.9929**（均值 0.9649，仅 8.84% 像素 $<0.9$），
+**但实测前提不成立**：本项目数据上掩码内 $T$ 的中位数已是 **0.9929**（均值 0.9649，仅 8.84% 像素 $<0.9$），
 于是该惩罚几乎恒为 0 —— 训练后不透明度分布与基线逐位相同。
-机制保留为 	rain.ray_opacity_floor / ray_opacity_reg / ray_opacity_warmup（**默认 0**），
-数学与梯度性质由 	ests/test_ray_opacity_floor.py 固定；负结果记录见 docs/03 G160。
+机制保留为 `train.ray_opacity_floor` / `ray_opacity_reg` / `ray_opacity_warmup`（**默认 0**），
+数学与梯度性质由 `tests/test_ray_opacity_floor.py` 固定；负结果记录见 docs/03 G160。
 
 ---
 
@@ -401,13 +401,14 @@ D(u)=\frac{\sum_j \alpha_jT_jz_j}{\sum_j\alpha_jT_j}\ \ (\text{ED 期望深度})
 T_j=\prod_{k<j}(1-\alpha_k).$$
 
 **损失组成**（默认值）：
-$\mathcal{L}=(1-\lambda_{s})\VertC-\tilde I\Vert_1+\lambda_{s}\big(1-\mathrm{SSIM}\big)
+
+$$\mathcal{L}=(1-\lambda_{s})\Vert C-\tilde I\Vert_1+\lambda_{s}\big(1-\mathrm{SSIM}\big)
 +\lambda_{\text{sh}}\Vert\theta_{\text{rest}}\Vert_2^2
 +\lambda_{\text{lpips}}\mathcal{L}_{\text{LPIPS}}
 +\lambda_{n}\mathcal{L}_{\text{normal}}
 +\lambda_{d}\mathcal{L}_{\text{dist}}
 +\lambda_{f}\frac1N\sum_j\mathrm{relu}(f-\alpha_j)
-+\lambda_{\text{bg}}\frac1{|\bar M|}\sum_{\bar M}\alpha$，
++\lambda_{\text{bg}}\frac1{\vert\bar M\vert}\sum_{\bar M}\alpha .$$
 
 | 项 | 默认 | 公式/说明 |
 |---|---|---|
@@ -468,7 +469,7 @@ Q=\sum_{p}K_p,\ K_p=\text{由平面}\ (n_p,p)\ \text{构造的二次型}.$$
 
 **贴图**（`mesh_texture=false` 默认关闭）：xatlas 展开最小化
 
-$$E_{\text{stretch}}=\sum_t A_t\big(\VertJ_t\Vert_F^2+\VertJ_t^{-1}\Vert_F^2\big),$$
+$$E_{\text{stretch}}=\sum_t A_t\big(\Vert J_t\Vert_F^2+\Vert J_t^{-1}\Vert_F^2\big),$$
 
 再按可见性加权采样 $T(x)=\sum_i w_i(x)I_i(\pi_i(x))\big/\sum_i w_i(x)$，
 `mesh_texture_size=2048`（实测 UV 覆盖 100%、黑 texel 0.00%）。
