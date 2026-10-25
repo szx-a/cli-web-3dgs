@@ -126,7 +126,7 @@ scripts\web.cmd            :: http://127.0.0.1:8787
 | 预设 | 内容 | 适用 |
 |---|---|---|
 | `balanced` | 当前默认（30k、densify_until 4000、内置密度控制）| 快速验证 |
-| `quality` | 60k、densify_until 20000、每步 LPIPS 0.1、2DGS 面元正则 0.02、抗锯齿、SH3 | 交付质量 |
+| `quality` | 60k、`cap_max` 300k、densify_until 10000、每步 LPIPS 0.1、2DGS 面元正则 0.02、推实正则 0.05（warmup 0.4）| 交付质量 |
 
 > `train.densify_strategy=official`（gsplat 官方 `DefaultStrategy`）**目前不推荐**：
 > 实测在 step 10000 涨到 251 万高斯（我们已补上漏传的 `cap_max`，但阈值仍需重新标定）。
@@ -199,7 +199,8 @@ scripts\web.cmd            :: http://127.0.0.1:8787
 
 ```bat
 scripts\gsflow.cmd export --job img5 --json     :: 产物清单
-env\venv\Scripts\python.exe scripts\check_quality_suite.py --job img5   :: 汇总报告（规划中）
+env\venv\Scripts\python.exe scripts\check_quality_suite.py --job img5          :: 全部体检（汇总 JSON）
+env\venv\Scripts\python.exe scripts\check_quality_suite.py --job img5 --no-gpu :: 训练占卡时用
 ```
 
 | 工具 | 查什么 | 判读 |

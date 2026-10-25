@@ -321,6 +321,25 @@ def install(plan: Plan, runner: Runner) -> bool:
     # 配置与目录
     for d in ("config", "workspace", "logs", "models", "tools", "downloads"):
         (root / d).mkdir(parents=True, exist_ok=True)
+
+    # ---- 重写本机配置（2026-10-25）----
+    #
+    # 实测：装完后 config/config.toml 里的 workspace_dir 仍指向**源安装**
+    # （载荷复制把开发机的配置带过来了）—— 用户一跑作业就会写到别的目录。
+    # 用 gsflow init --force 重写，它的路径推导基于包位置（此时 src 已挂到安装目录）。
+    try:
+        runner.run([str(venv_py), "-m", "gsflow", "init", "--force"], root, env)
+        cfg = root / "config" / "config.toml"
+        if cfg.exists():
+            txt = cfg.read_text(encoding="utf-8")
+            # Windows 路径在 toml 里是双反斜杠，比较时统一成正斜杠再判断
+            norm = txt.replace("\\\\", "/").replace("\\", "/")
+            if str(root).replace("\\", "/") in norm:
+                log("配置已指向安装目录")
+            else:
+                log("⚠ 配置里的 workspace_dir 似乎不是安装目录，请检查 " + str(cfg))
+    except Exception as exc:  # noqa: BLE001
+        log(f"重写配置失败（可手动运行 gsflow init）：{type(exc).__name__}: {exc}")
     settings = root / "config" / "settings.json"
     if not settings.exists():
         settings.write_text(json.dumps({"installed_at": time.strftime("%Y-%m-%d %H:%M:%S"),

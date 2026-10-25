@@ -34,6 +34,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--jobs", required=True)
     ap.add_argument("--views", type=int, default=8)
+    ap.add_argument("--ply", default="", help="评估指定 PLY（默认取任务最新检查点）")
+    ap.add_argument("--tag", default="", help="输出里的标签")
     ap.add_argument("--data-dir", default="",
                     help="共享数据目录（对比实验的多个作业共用一份 data）")
     args = ap.parse_args()
@@ -53,7 +55,7 @@ def main() -> int:
     for job_name in [j.strip() for j in args.jobs.split(",") if j.strip()]:
         jd = ROOT / "workspace" / job_name
         data = Path(args.data_dir) if args.data_dir else (jd / "04_train" / "data")
-        ply = latest_ply(jd)
+        ply = Path(args.ply) if args.ply else latest_ply(jd)
         if ply is None or not data.exists():
             print(f"  {job_name:<26} 缺产物")
             continue
@@ -65,6 +67,7 @@ def main() -> int:
         picks = np.linspace(0, len(imgs) - 1, min(args.views, len(imgs))).astype(int).tolist()
         g = read_gaussians_full(ply)
         vals = []
+        psnrs, ssims = [], []
         for k in picks:
             im = imgs[k]
             cam = rec.cameras[im.camera_id]
@@ -83,8 +86,28 @@ def main() -> int:
                 continue
             with torch.no_grad():
                 vals.append(float(fn(col, gt)))
+            # 掩码内 PSNR/SSIM（与训练时同一口径：只在掩码内算）
+            mp = data / "masks" / (im.name.split(".")[0] + ".png")
+            if mp.exists():
+                m = np.asarray(Image.open(mp).convert("L")) > 127
+                if m.shape == gt.shape[:2] and m.any():
+                    ca = np.asarray(col.detach().cpu().numpy(), dtype=np.float64)
+                    ga = np.asarray(gt.detach().cpu().numpy(), dtype=np.float64)
+                    d = ((ca - ga) ** 2)[m].mean()
+                    psnrs.append(10 * np.log10(1.0 / max(float(d), 1e-10)))
+                    mu_a, mu_b = ca[m].mean(0), ga[m].mean(0)
+                    va, vb = ca[m].var(0), ga[m].var(0)
+                    cov = ((ca[m] - mu_a) * (ga[m] - mu_b)).mean(0)
+                    c1, c2 = 0.01 ** 2, 0.03 ** 2
+                    ssim = ((2 * mu_a * mu_b + c1) * (2 * cov + c2)) / \
+                           ((mu_a ** 2 + mu_b ** 2 + c1) * (va + vb + c2))
+                    ssims.append(float(ssim.mean()))
         if vals:
-            print(f"  {job_name:<26} LPIPS={np.mean(vals):.4f}  (n={len(vals)}, 越低越好)")
+            tag = args.tag or job_name
+            extra = ""
+            if psnrs:
+                extra = f"  PSNR(m)={np.mean(psnrs):.2f} dB  SSIM(m)={np.mean(ssims):.4f}"
+            print(f"  {tag:<26} LPIPS={np.mean(vals):.4f}  (n={len(vals)}{extra}, 越低越好)")
         else:
             print(f"  {job_name:<26} 无法评估（尺寸不一致）")
     return 0
