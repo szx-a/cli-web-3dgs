@@ -225,6 +225,23 @@ scripts\gsflow.cmd doctor
 | 内存/磁盘 | 16 GB / 建议 ≥20 GB 空闲 |
 | 实测速度 | 30k 迭代、~200 视图、1600 长边 ≈ **16 分钟**；quality 预设（60k + 每步 LPIPS）≈ **45–75 分钟** |
 
+
+### 3.8 实验性（本地测试中，**未纳入推荐**）：视线级不透明度下限
+
+设每条视线的累计不透明度 (u)=1-\prod_j\big(1-\alpha_j(u)\big)$，对其加单边下限
+
+\mathcal{L}_{\text{ray}}=\frac{1}{|\mathcal{M}|}\sum_{u\in\mathcal{M}}
+\operatorname{relu}\big(\tau-T(u)\big),\qquad
+\frac{\partial\mathcal{L}_{\text{ray}}}{\partial o_j}
+=-\alpha_j\,(1-T)\,\mathbb{1}[T<\tau],
+
+形式上比逐高斯的 $-\alpha_j(1-\alpha_j)$ 在 $\alpha\to0$ 时强得多（$\alpha=0.01,T=0.1$ 时差约 90 倍）。
+
+**但实测前提不成立**：本项目数据上掩码内 $ 的中位数已是 **0.9929**（均值 0.9649，仅 8.84% 像素 $<0.9$），
+于是该惩罚几乎恒为 0 —— 训练后不透明度分布与基线逐位相同。
+机制保留为 	rain.ray_opacity_floor / ray_opacity_reg / ray_opacity_warmup（**默认 0**），
+数学与梯度性质由 	ests/test_ray_opacity_floor.py 固定；负结果记录见 docs/03 G160。
+
 ---
 
 ## 五、跑一个作业
