@@ -334,6 +334,8 @@ scripts\gsflow.cmd run --video data\x.mp4 --job-id final --preset solid
 
 **实测（img5，8 个留出视角，同一把论文对齐的尺子）**：
 
+> 下表是 **2026-10-26 之前、下限正则尚未默认开启时** 的数据；今后 alanced 也带下限（实测 op<0.1 85%→4%、PSNR +0.01、SSIM +0.0003，见 3.3）。
+
 | 方案 | `op<0.1` 占比 | 掩码 PSNR | 掩码 SSIM | LPIPS |
 |---|---|---|---|---|
 | `balanced`（30k）| 85.0% | 29.87 | 0.9846 | 0.2370 |
