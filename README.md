@@ -59,7 +59,7 @@
    再用 ED 深度做**回溯式**顶点精修（ICP 风格阻尼，残差单调下降）。
 6. **负结果也写进文档**：LPIPS 每 16 步才算是**错的**（梯度与 L1/SSIM 打架，实测 LPIPS 反而变差），
    必须每步算；opacity_init=0.5 无效（淡高斯是目标函数的强吸引子）。
-7. **视线级不透明度下限（本项目的核心创新，见下方数学推导）**：不逐个高斯罚 $\alpha$，
+7. **视线级不透明度下限（本项目的不同与创新验证，见下方相关数学，该方法还在本地测试阶段）**：不逐个高斯罚 $\alpha$，
    而是直接约束**每条视线**的累计透射率 $T(u)=1-\prod_j(1-\alpha_j)$；
    梯度是 $-\alpha_j(1-T)$，比逐高斯的 $-\alpha_j(1-\alpha_j)$ 在 $\alpha\to0$ 时**强两个数量级**。
 
@@ -75,8 +75,7 @@ $$T(u) = 1-\prod_{j=1}^{N}\,(1-\alpha_j(u)),$$
 
 它正是光栅化器逐像素返回的 alpha。我们直接对它加**单边下限**
 
-$$\mathcal{L}_{\text{ray}} \;=\; \frac{1}{|\mathcal{M}|}\sum_{u\in\mathcal{M}}
-\operatorname{relu}\!\big(\tau - T(u)\big),\qquad \tau\approx 0.9,$$
+$$ \mathcal{L}_{\text{ray}} = \frac{1}{|\mathcal{M}|}\sum_{u\in\mathcal{M}} \mathop{\mathrm{relu}}\big(\tau - T(u)\big), \quad \tau\approx 0.9, $$
 
 $\mathcal{M}$ 为掩码内的像素集合（背景不该被推实，否则会造出"雾墙"）。
 
@@ -89,10 +88,10 @@ $$\frac{\partial T}{\partial \alpha_j}=\prod_{k\neq j}(1-\alpha_k)
 \frac{\partial \mathcal{L}_{\text{ray}}}{\partial o_j}
 =-\,\alpha_j\,(1-T)\,\mathbb{1}[T<\tau].$$
 
-对比**逐高斯**下限 $\operatorname{relu}(f-\alpha_j)$：
+对比**逐高斯**下限 $$ \mathop{\mathrm{relu}}(f-\alpha_j) $$：
 
-$$\frac{\partial}{\partial o_j}\operatorname{relu}(f-\alpha_j)
-=-\,\alpha_j(1-\alpha_j)\,\mathbb{1}[\alpha_j<f].$$
+$$ \frac{\partial}{\partial o_j}\mathop{\mathrm{relu}}(f-\alpha_j) = -,\alpha_j(1-\alpha_j),\mathbb{1}\{\alpha_j<f\}. $$
+
 
 $f=0.1,\ \alpha_j=0.01$ 时后者约为 $9.9\times10^{-3}$；而视线级在 $T=0.1$ 时是 $0.9$ —— **相差约 90 倍**，
 且差值随"还缺多少不透明度"$(1-T)$ 单调增大。换句话说：**越透的像素被推得越狠**，
