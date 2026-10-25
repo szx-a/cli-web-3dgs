@@ -59,7 +59,9 @@ PRESETS: dict[str, dict[str, Any]] = {
         "train.densify_from": 500,
         "train.densify_until": 10000,
         "train.densify_interval": 100,
-        "train.cap_max": 300000,
+        # v4 联合标定：cap 400k 比 300k 更好（PSNR 30.56 vs 29.86、SSIM 相当、
+        # 实心度 op中位 0.095 vs 0.052）⇒ 改用 400k
+        "train.cap_max": 400000,
         "train.densify_strategy": "builtin",
         "train.rasterize_mode": "classic",
         "train.lambda_lpips": 0.1,
@@ -74,7 +76,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "train.opacity_crisp_reg": 0.05,
         "train.opacity_crisp_warmup": 0.4,
         # 关键：单边下限（对称正则在 op→0 时梯度趋零，实测完全无效）
-        "train.opacity_floor": 0.12,
+        "train.opacity_floor": 0.10,
         "train.opacity_floor_reg": 0.5,
         "train.opacity_floor_warmup": 0.3,
     },
