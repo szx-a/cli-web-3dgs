@@ -245,6 +245,7 @@ class TrainConfig:
     mask_erode_px: int = 0                  # 损失用掩码腐蚀像素数（修轮廓白边）
     sh_rest_reg: float = 0.003              # f_rest 的 L2 正则权重（3e-3：彩度 −19%、SSIM −0.0005）
     sh_rest_max: float = 0.0                # f_rest 逐系数幅度上限（0=关）
+    opacity_crisp_reg: float = 0.0           # 不透明度清晰度正则权重（惩罚 op*(1-op)）
     # 训练结束时的最小不透明度清理（Faster-GS: MIN_OPACITY_AFTER_TRAINING = 1/255）。
     # 不透明度低于该值的高斯在收尾时直接删掉；0 表示不清理。
     min_opacity_final: float = 0.0
@@ -1419,6 +1420,16 @@ def train(cfg: TrainConfig, ctx) -> dict:
         if float(getattr(cfg, "sh_rest_reg", 0.0) or 0.0) > 0 and shs.shape[1] > 1:
             _rest = shs[:, 1:, :]
             loss = loss + float(cfg.sh_rest_reg) * (_rest ** 2).mean()
+
+        # ---- 不透明度"清晰度"正则（2026-10-25）----
+        #
+        # 实测：不透明度中位 0.066、op<0.1 占 67% ⇒ 表面靠**大量半透明层**叠出来，
+        # 训练视角颜色对得上（29.9 dB），但换视角就"透"、屋顶显薄。
+        # 而**离线剪掉**淡高斯会掉 7.5 dB（它们在承载画质）⇒ 只能在训练时把 op 推向 0/1。
+        # `op*(1-op)` 在 0 和 1 处最小、在 0.5 处最大，正好惩罚"半透明堆叠"。
+        if float(getattr(cfg, "opacity_crisp_reg", 0.0) or 0.0) > 0:
+            _op_now = current_opacities().reshape(-1)
+            loss = loss + float(cfg.opacity_crisp_reg) * (_op_now * (1.0 - _op_now)).mean()
 
         # ---- 正则项（参考 Faster-GS / 3DGS-MCMC 的做法）----
         # 为什么需要：3DGS 在"背景无人约束"或"视图偏少"时会用**大量半透明浮点**

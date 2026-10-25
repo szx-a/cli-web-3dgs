@@ -41,6 +41,7 @@ def main() -> int:
     ap.add_argument("--size", type=int, default=384)
     ap.add_argument("--out", default="env/tmp/orbit.png")
     ap.add_argument("--dist", type=float, default=2.2, help="相机距离（× 物体半径）")
+    ap.add_argument("--ply", default="", help="直接指定 PLY（默认取任务最新检查点）")
     ap.add_argument("--data-dir", default="",
                     help="含 sparse/ 的目录；默认 jd/04_train/data（对比实验作业在 workspace/<work>/data）")
     ap.add_argument("--sh", type=int, default=-1,
@@ -56,8 +57,11 @@ def main() -> int:
     from gsflow.gsdata.shio import read_gaussians_full, render_view
 
     jd = ROOT / "workspace" / args.job
-    ply = max((jd / "04_train" / "point_cloud").glob("*/point_cloud.ply"),
-              key=lambda p: int("".join(c for c in p.parent.name if c.isdigit()) or 0))
+    if args.ply:
+        ply = Path(args.ply)
+    else:
+        ply = max((jd / "04_train" / "point_cloud").glob("*/point_cloud.ply"),
+                  key=lambda p: int("".join(c for c in p.parent.name if c.isdigit()) or 0))
     g = read_gaussians_full(ply)
     if args.sh >= 0:
         nb = (args.sh + 1) ** 2

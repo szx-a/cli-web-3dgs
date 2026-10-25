@@ -324,6 +324,10 @@ DEFAULTS: dict[str, Any] = {
         # ⇒ 高阶 SH 在未见视角过拟合。这里给 _rest 加 L2 与幅度上限。
         "sh_rest_reg": 0.003,   # 默认 3e-3：彩度 −19%、SSIM 仅 −0.0005（docs/03 G137）
         "sh_rest_max": 0.0,
+        # 不透明度“清晰度”正则：惩罚 op*(1-op)（在 0/1 处最小）。
+        # 实测 img4：不透明度中位仅 **0.066**、op<0.1 占 **67%**、op>0.9 仅 1.1%
+        # ⇒ 表面靠大量半透明层叠出来，新视角就“透”、屋顶显薄。
+        "opacity_crisp_reg": 0.0,
         # 收尾清理：训练结束时删掉不透明度低于此值的高斯。
         # Faster-GS 用 MIN_OPACITY_AFTER_TRAINING = 1/255 ≈ 0.0039。
         "min_opacity_final": 0.0,

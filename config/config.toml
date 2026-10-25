@@ -106,6 +106,7 @@ auto_extend_densify_when_reset = true
 mask_erode_px = 0
 sh_rest_reg = 0.003
 sh_rest_max = 0.0
+opacity_crisp_reg = 0.0
 min_opacity_final = 0.0
 lr_opacities = 0.025
 lr_schedule = "cosine"

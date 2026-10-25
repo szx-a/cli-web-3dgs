@@ -128,6 +128,8 @@ ARMS: dict[str, dict[str, str]] = {
     "shreg3": {"train.sh_rest_reg": "0.003"},
     "shreg1e2": {"train.sh_rest_reg": "0.01"},
     "shmax03": {"train.sh_rest_max": "0.3"},
+    # 不透明度清晰度正则（治“透明感”）
+    "crisp2e2": {"train.opacity_crisp_reg": "0.02"},
     "reset3k": {"train.opacity_reset_interval": "3000",
                  "train.lr_opacities": "0.05"},
     "official_rst": {"train.densify_strategy": "official",
