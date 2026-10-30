@@ -53,6 +53,19 @@ def main() -> int:
                 bad += 1
                 print(f"  行 {i}: {'、'.join(probs)}   {ln.strip()[:90]}")
 
+    print("=== 2b) 表格行里不允许行内数学（GitHub 单元格内 $...$ 不稳定）===")
+    for i, ln in enumerate(lines, start=1):
+        if not ln.lstrip().startswith("|"):
+            continue
+        if "$$" in ln:
+            continue
+        # 去掉反引号代码后再看
+        masked = re.sub(r"`[^`\n]*`", "", ln)
+        if re.search(r"(?<!\$)\$(?!\$)[^$\n]*?(?<!\$)\$(?!\$)", masked):
+            bad += 1
+            print(f"  行 {i}: 表格单元格里有行内数学 → 改纯文本（如 λ_lpips）或反引号参数名")
+            print(f"         {ln.strip()[:100]}")
+
     print("=== 3) 其它高风险（KaTeX 不支持/不稳定）===")
     for name in (r"\operatorname", r"\varnothing", r"\mathbb{1}", r"\substack", r"\begin{aligned}"):
         n = text.count(name)
