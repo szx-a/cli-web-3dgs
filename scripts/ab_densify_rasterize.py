@@ -148,8 +148,14 @@ ARMS: dict[str, dict[str, str]] = {
     "rayf": {"train.ray_opacity_reg": "0.5", "train.ray_opacity_floor": "0.9"},
     # 空参数基线（当前默认）
     "base0": {},
+    # LPIPS 权重 × 容量（联合标定 2026-10-30）
+    "c200l05": {"train.cap_max": "200000", "train.lambda_lpips": "0.05", "train.lpips_every": "1"},
+    "c200l10": {"train.cap_max": "200000", "train.lambda_lpips": "0.10", "train.lpips_every": "1"},
+    "c400l05": {"train.cap_max": "400000", "train.lambda_lpips": "0.05", "train.lpips_every": "1"},
+    "c400l10": {"train.cap_max": "400000", "train.lambda_lpips": "0.10", "train.lpips_every": "1"},
     # 深度方差正则（治“朦胧”的可微手段）
     "dvarA": {"train.lambda_depth_var": "0.3", "train.depth_var_mode": "var"},
+    "dvarC": {"train.lambda_depth_var": "3.0", "train.depth_var_mode": "var"},
     "dvarB": {"train.lambda_depth_var": "1.0", "train.depth_var_mode": "var"},
     "gflr": {"train.opacity_floor": "0.10", "train.opacity_floor_reg": "0.5"},
     "floor2": {"train.opacity_floor": "0.2", "train.opacity_floor_reg": "0.5"},

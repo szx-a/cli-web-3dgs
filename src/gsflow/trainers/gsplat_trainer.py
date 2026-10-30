@@ -249,7 +249,7 @@ class TrainConfig:
     opacity_crisp_warmup: float = 0.7        # 前 N% 迭代不施加清晰度正则（0~1）
     opacity_floor: float = 0.10              # 不透明度下限（实测几乎免费：op<0.1 85%→4%）
     # 深度集中度正则（2DGS 成对失真的 L2 对应量，可微）
-    lambda_depth_var: float = 0.0            # 权重（0=关）
+    lambda_depth_var: float = 1.0            # 权重（0=关）；实测 1.0 方差 -60% 且画质无损
     depth_var_warmup: float = 0.3            # 前 N% 迭代不施加
     depth_var_mode: str = "var"              # var / std / rvar
     opacity_floor_reg: float = 0.5           # 下限正则权重：惩罚 relu(floor-op)

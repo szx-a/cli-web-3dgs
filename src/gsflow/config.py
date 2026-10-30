@@ -339,7 +339,9 @@ DEFAULTS: dict[str, Any] = {
         "opacity_floor": 0.10,
         "opacity_floor_reg": 0.5,
         "opacity_floor_warmup": 0.5,
-        "lambda_depth_var": 0.0,
+        # 实测（img5 15k）：λ=1.0 时深度方差 -60%、p90 -81%，
+        # 而 PSNR/SSIM/LPIPS 与无该项几乎相同（见 README 3.9）。
+        "lambda_depth_var": 1.0,
         "depth_var_warmup": 0.3,
         "depth_var_mode": "var",
         # 视线级不透明度下限（本项目创新）：直接约束累计透射率 T=1-∏(1-α)
