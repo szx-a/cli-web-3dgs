@@ -46,7 +46,11 @@ def test_hub_is_switched_at_every_mount_point() -> None:
     assert "ViewerHub.set('ref')" in t, "参考渲染器挂载后没有设为活动渲染器"
     assert "ViewerHub.setRefInfo" in t, "参考渲染器缺少 resetCamera 所需的取景信息"
     # 图片/预览模式没有可交互的 3D 渲染器，必须显式置空（否则按钮会打到隐藏 canvas）
-    assert t.count("ViewerHub.set(null)") >= 2, "图片/预览模式没有把活动渲染器置空"
+    # ⚠ 2026-10-30 修正：临时切开（图片/预览、服务端渲染）必须用 suspend()，
+    # 不能直接 set(null)——后者会让「返回 WebGL」时无从恢复（交互被锁）。
+    # 旧断言写的正是那个 bug，现在改成断言 suspend 的使用。
+    assert t.count("ViewerHub.suspend(") >= 2, "临时切开场景没有用 suspend()（会导致交互锁死）"
+    assert "ViewerHub.set(null)" not in t, "不应再直接 set(null)（应用 suspend）"
 
 
 def test_buttons_route_through_hub_not_directly_to_gsviewer() -> None:

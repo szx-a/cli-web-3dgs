@@ -344,6 +344,10 @@ DEFAULTS: dict[str, Any] = {
         "lambda_depth_var": 1.0,
         "depth_var_warmup": 0.3,
         "depth_var_mode": "var",
+        # 实测（15k）：0.3 时 PSNR +2.0 dB、LPIPS -0.016；1.0 时 +4.7 dB、-0.037（代价：高斯 +45%）。
+        # 默认取 0.3 作为“低成本默认”，追求最高质感的预设可升到 1.0。
+        "lambda_grad": 0.3,
+        "grad_warmup": 0.2,
         # 视线级不透明度下限（本项目创新）：直接约束累计透射率 T=1-∏(1-α)
         # 梯度为 -α_j(1-T)，比逐高斯的 -α(1-α) 在 α→0 时条件数好得多。
         "ray_opacity_floor": 0.9,

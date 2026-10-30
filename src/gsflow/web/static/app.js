@@ -738,6 +738,9 @@ const ViewerHub = (() => {
     }
   }
 
+  // 挂起前的渲染器（'server'（服务端图）/ '图片'）不属于这里，只记录 ref|gs
+  let suspended = null;
+
   function set(kind) {
     active = (kind === 'ref' || kind === 'gs') ? kind : null;
     // 指针事件隔离：只有**活动**渲染器的画布接收鼠标/触摸。
@@ -782,10 +785,53 @@ const ViewerHub = (() => {
     return window.GsViewer.getRotMode();
   }
 
+  /** 临时切走（服务端渲染 / 图片）：记住当前渲染器再置空。 */
+  function suspend(reason) {
+    if (active === 'ref' || active === 'gs') suspended = active;
+    set(null);
+    return suspended;
+  }
+
+  /**
+   * 恢复到挂起前的互动渲染器。
+   *
+   * 这里不能只恢复 ViewerHub：还要把**该显示的那一层**显示出来
+   * —— 高斯在 `.gs-ref-stage` 里画，glb/网格在 `#m-canvas` 里画。
+   * 只恢复状态不切层，会出现“状态对了但屏幕上是空的”。
+   */
+  function resume() {
+    const kind = suspended;
+    suspended = null;
+    if (kind === 'ref' && window.GsRefViewer && window.GsRefViewer.available && window.GsRefViewer.available()) {
+      const cv = document.getElementById('m-canvas');
+      const im = document.getElementById('m-image');
+      const stage = document.querySelector('#m-canvas-wrap > .gs-ref-stage');
+      if (im) { im.style.display = 'none'; im.removeAttribute('src'); }
+      if (cv) cv.style.display = 'none';
+      if (stage) stage.style.display = 'block';
+      set('ref');
+      return 'ref';
+    }
+    if (kind === 'gs' && window.GsViewer) {
+      const cv = document.getElementById('m-canvas');
+      const im = document.getElementById('m-image');
+      const stage = document.querySelector('#m-canvas-wrap > .gs-ref-stage');
+      if (im) { im.style.display = 'none'; im.removeAttribute('src'); }
+      if (stage) stage.style.display = 'none';
+      if (cv) cv.style.display = 'block';
+      set('gs');
+      try { window.GsViewer.redraw(); } catch (e) { /* 忽略 */ }
+      return 'gs';
+    }
+    set(null);
+    return null;
+  }
+
   return {
-    set, supports, reset, toggleWire, setRotMode, rotMode, syncButtons,
+    set, supports, reset, toggleWire, setRotMode, rotMode, syncButtons, suspend, resume,
     setRefInfo(info) { refInfo = info || null; },
     get active() { return active; },
+    get suspendedKind() { return suspended; },
   };
 })();
 
@@ -859,13 +905,25 @@ function initModelsPage() {
   const btnBack = $('m-back-webgl');
   if (btnBack) {
     btnBack.onclick = () => {
-      const img = $('m-image');
-      if (img) { img.style.display = 'none'; img.removeAttribute('src'); }
+      $('m-overlay').classList.add('hide');
+      // ⚠️ 必须走 resume()：它负责「显示正确的那一层 + 恢复 pointer-events + 恢复按钮状态」。
+      // 只做 display 切换（旧写法）会让交互永久停在被关掉的状态。
+      const kind = (() => { try { return ViewerHub.resume(); } catch (e) { return null; } })();
+      if (kind === 'ref') {
+        $('m-status').textContent = 'WebGL 交互模式（高斯）：拖拽旋转 / 滚轮缩放';
+        return;
+      }
+      if (kind === 'gs') {
+        $('m-status').textContent = 'WebGL 交互模式：拖拽旋转 / 滚轮缩放';
+        return;
+      }
+      // 没有可恢复对象（例如首次进入就是图片模式）：回到 canvas 并明说
       const cv = $('m-canvas');
       if (cv) cv.style.display = 'block';
-      if (window.GsViewer && window.GsViewer.redraw) window.GsViewer.redraw();
-      $('m-overlay').classList.add('hide');
-      $('m-status').textContent = 'WebGL 交互模式';
+      try { ViewerHub.set('gs'); } catch (e) { /* 忽略 */ }
+      $('m-status').textContent = window.GsViewer
+        ? 'WebGL 交互模式'
+        : '当前没有可交互的模型：先在左侧选一个 3D 产物';
     };
   }
   loadModelJobs();
@@ -963,7 +1021,9 @@ async function renderCurrentViewOnServer() {
     if (img) { img.style.display = 'block'; img.src = tmp.src; }
     if (cv) cv.style.display = 'none';
     // 服务端渲染/预览图模式：屏幕上没有可交互的 3D 渲染器
-    try { ViewerHub.set(null); } catch (e) { /* 忽略 */ }
+    // ⚠️ 用 suspend()（记住来时的渲染器），不能直接 set(null)：
+    // 否则「返回 WebGL」时无从恢复，且 pointer-events 停在 'none' 上——交互被锁死。
+    try { ViewerHub.suspend('server'); } catch (e) { /* 忽略 */ }
     $('m-overlay').classList.add('hide');
     $('m-status').textContent = `服务端渲染 yaw=${cam.yaw.toFixed(1)}° `
       + `pitch=${cam.pitch.toFixed(1)}° · gsplat 官方光栅化器`;
@@ -1091,7 +1151,7 @@ async function loadModelFile(f) {
     const cv = $('m-canvas');
     if (img) {
       img.style.display = 'block';
-    try { ViewerHub.set(null); } catch (e) { /* 忽略 */ }
+    try { ViewerHub.suspend('image'); } catch (e) { /* 忽略 */ }
       img.src = f.url;
       img.onerror = () => {
         $('m-overlay').classList.remove('hide');

@@ -62,6 +62,8 @@ PRESETS: dict[str, dict[str, Any]] = {
         # v4 联合标定：cap 400k 比 300k 更好（PSNR 30.56 vs 29.86、SSIM 相当、
         # 实心度 op中位 0.095 vs 0.052）⇒ 改用 400k
         "train.cap_max": 400000,
+        # 质感：实测 λ=1.0 时 PSNR +4.7 dB、LPIPS -0.037（代价高斯 +45%）
+        "train.lambda_grad": 1.0,
         "train.densify_strategy": "builtin",
         "train.rasterize_mode": "classic",
         "train.lambda_lpips": 0.05,

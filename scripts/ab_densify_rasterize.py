@@ -153,6 +153,10 @@ ARMS: dict[str, dict[str, str]] = {
     "c200l10": {"train.cap_max": "200000", "train.lambda_lpips": "0.10", "train.lpips_every": "1"},
     "c400l05": {"train.cap_max": "400000", "train.lambda_lpips": "0.05", "train.lpips_every": "1"},
     "c400l10": {"train.cap_max": "400000", "train.lambda_lpips": "0.10", "train.lpips_every": "1"},
+    # 细节梯度损失（质感）
+    "grad10": {"train.lambda_grad": "0.1"},
+    "grad30": {"train.lambda_grad": "0.3"},
+    "grad100": {"train.lambda_grad": "1.0"},
     # 深度方差正则（治“朦胧”的可微手段）
     "dvarA": {"train.lambda_depth_var": "0.3", "train.depth_var_mode": "var"},
     "dvarC": {"train.lambda_depth_var": "3.0", "train.depth_var_mode": "var"},
