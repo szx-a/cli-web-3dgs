@@ -73,8 +73,8 @@
 转台（物体转、背景不动）与环绕（相机绕物体转、背景随视角变化）在数学上是**两类不同的相机模型假设**：
 转台意味着"世界坐标系随手转"，直接把背景当静态会与相机位姿矛盾。用背景的**时间稳定性**判别：
 
-$$s_b=\frac{\mathrm{median}_{u\notin M}\;\mathrm{Var}_t(I_t(u))}
-{\mathrm{median}_{u\notin M}\;(I_t(u))^2},$$
+$$s_b=\frac{\mathrm{median}_{u\notin M}\ \mathrm{Var}_t(I_t(u))}
+{\mathrm{median}_{u\notin M}\ (I_t(u))^2},$$
 
 $s_b$ 小 ⇒ 背景静止 ⇒ 转台；$s_b$ 大 ⇒ 环绕。本项目要求**判定必须在合成背景之前完成**
 （检测器输入原始帧 + 掩码，采样 12 帧成对比较），否则掩码把背景涂黑后差异被人为抹平，
@@ -85,7 +85,7 @@ $s_b$ 小 ⇒ 背景静止 ⇒ 转台；$s_b$ 大 ⇒ 环绕。本项目要求**
 只在掩码内取均值时，损失量级随前景占比漂移（实测各视角前景 12%~55% ⇒ 同误差下 loss 差 4.6 倍），
 且**掩码外完全无监督**。改成先把 GT 在掩码外合成为已知背景色
 
-$$\tilde I(u)=M(u)\,I(u)+(1-M(u))\,b,$$
+$$\tilde I(u)=M(u)\ I(u)+(1-M(u))\ b,$$
 
 再在全图算损失，等价于
 
@@ -100,12 +100,12 @@ $M_\epsilon = M\ominus K_\epsilon$（`mask_erode_px`）收缩，避免把掩码�
 
 对不透明度加对称惩罚
 
-$$\mathcal{L}_{\text{crisp}}=\lambda\,\frac{1}{N}\sum_j \alpha_j\,(1-\alpha_j),$$
+$$\mathcal{L}_{\text{crisp}}=\lambda\ \frac{1}{N}\sum_j \alpha_j\ (1-\alpha_j),$$
 
 它在 $\alpha\in\lbrace 0,1\rbrace$ 处最小。其梯度
 
 $$\frac{\partial\mathcal{L}_{\text{crisp}}}{\partial o_j}
-=-\lambda\,\alpha_j(1-\alpha_j)(1-2\alpha_j)$$
+=-\lambda\ \alpha_j(1-\alpha_j)(1-2\alpha_j)$$
 
 在 $\alpha\to0$ 时**同时**被 $\alpha_j(1-\alpha_j)$ 压小 ⇒ 对"淡高斯云"几乎无推力；
 但它对"半透明堆叠（$\alpha\approx0.5$）"有效。实测：全程施加 $\lambda=0.02$ 会把 `op>0.9` 从 15% 推到 58%，
@@ -114,10 +114,10 @@ $$\frac{\partial\mathcal{L}_{\text{crisp}}}{\partial o_j}
 
 **对称正则不够，还需要单边下限。** 只靠 crisp 项，`op<0.1` 的高斯仍占 85%。加上单边下限
 
-$$\mathcal{L}_{\text{floor}}=\lambda_f\,\frac1N\sum_j\mathrm{relu}(f-\alpha_j),
+$$\mathcal{L}_{\text{floor}}=\lambda_f\ \frac1N\sum_j\mathrm{relu}(f-\alpha_j),
 \qquad
 \frac{\partial \mathcal{L}_{\text{floor}}}{\partial o_j}
-=-\lambda_f\,\alpha_j(1-\alpha_j)\,\mathbf{1}[\alpha_j\lt f],$$
+=-\lambda_f\ \alpha_j(1-\alpha_j)\ \mathbf{1}[\alpha_j\lt f],$$
 
 （只能靠**抬高** $\alpha$ 来解除）后，在默认设置（30k、`cap_max` 600k）实测：
 
@@ -141,9 +141,9 @@ $$D(u)=\frac{\sum_j w_j z_j}{\sum_j w_j},\qquad w_j=\alpha_j\prod_{k\lt j}(1-\al
 训练侧若用后者算法线/失真，而导出侧用前者反投影，两段就在优化**不同的量**。
 由 ED 求法线的切向量为
 
-$$\mathbf{P}_u=z_u\,\mathbf{m}+z\,(1/f_x,0,0)^{T}$$
+$$\mathbf{P}_u=z_u\ \mathbf{m}+z\ (1/f_x,0,0)^{T}$$
 
-$$\mathbf{P}_v=z_v\,\mathbf{m}+z\,(0,1/f_y,0)^{T}$$
+$$\mathbf{P}_v=z_v\ \mathbf{m}+z\ (0,1/f_y,0)^{T}$$
 
 $$\mathbf{n}=\frac{\mathbf{P}_u\times\mathbf{P}_v}{|\mathbf{P}_u\times\mathbf{P}_v|}$$
 
@@ -155,7 +155,7 @@ $$\mathbf{n}=\frac{\mathbf{P}_u\times\mathbf{P}_v}{|\mathbf{P}_u\times\mathbf{P}
 网格是二维复形，其边界算子 $\partial$ 作用在面集合上。**封闭**（无水密性漏洞）等价于
 
 $$\partial_2 F=\emptyset
-\iff \mathrm{card}\lbrace e:\,\deg(e)=1\rbrace=0\;\wedge\;\mathrm{card}\lbrace e:\,\deg(e)\ge3\rbrace=0,$$
+\iff \mathrm{card}\lbrace e:\ \deg(e)=1\rbrace=0\ \wedge\ \mathrm{card}\lbrace e:\ \deg(e)\ge3\rbrace=0,$$
 
 $\deg(e)$ 是共享该边的面数；再要求顶点是流形（每个顶点的邻接面构成单一扇区）。
 补洞就是在边界环 $C\subset\partial_2F$ 上贴一张"帽" $H$，使
@@ -213,7 +213,7 @@ $$\rho=\frac{|M\setminus M_{gt}|}{|M_{gt}|}$$
 $$\mathcal{L}_{\text{ray}}=\frac{1}{|\mathcal{M}|}\sum_{u\in\mathcal{M}}
 \mathrm{relu}(\tau-T(u)),\qquad
 \frac{\partial\mathcal{L}_{\text{ray}}}{\partial o_j}
-=-\alpha_j\,(1-T)\,\mathbf{1}[T\lt \tau].$$
+=-\alpha_j\ (1-T)\ \mathbf{1}[T\lt \tau].$$
 
 形式上比逐高斯的 $-\alpha_j(1-\alpha_j)$ 在 $\alpha\to0$ 时强得多（$\alpha=0.01,T=0.1$ 时差约 90 倍）。
 
@@ -229,7 +229,7 @@ $$\mathcal{L}_{\text{ray}}=\frac{1}{|\mathcal{M}|}\sum_{u\in\mathcal{M}}
 3.8 的负结果说明"朦胧"不是累计不透明度不足（$T$ 中位 0.99），而是**同一条视线上颜色的来源分布在很多不同深度**：
 表面位置不确定 ⇒ 换视角就"薄"。2DGS 用成对失真直接惩罚这种分布
 
-$$\mathcal{L}_{d}=\sum_{u}\sum_{i,j}w_iw_j\,|z_i-z_j|,$$
+$$\mathcal{L}_{d}=\sum_{u}\sum_{i,j}w_iw_j\ |z_i-z_j|,$$
 
 但它需要光栅化核里**逐像素的高斯列表**（要自己写 CUDA）。本项目给出的可微替代是沿射线的**深度方差**：
 
@@ -251,6 +251,10 @@ $$\mathcal{L}_{\text{var}}=\frac{1}{|\mathcal{M}|}\sum_{u\in\mathcal{M}}
 | 0.3 | 0.00241（−35%）| 0.0491 | 0.0109（−63%）| **29.22** | **0.9821** | 0.2410 |
 | **1.0（默认）** | **0.00150**（−60%）| **0.0387** | **0.0055**（−81%）| 29.20 | 0.9820 | 0.2408 |
 | 3.0 | **0.00089**（−76%）| 0.0298 | 0.0032（−89%）| 29.15 | 0.9818 | 0.2414 |
+
+![深度方差剂量响应](docs/figs/fig_depthvar_dose.png)
+
+> 图：λ_var 越大，深度方差与 p90 单调下降；LPIPS 几乎不变（15k，8 留出视角）。
 
 ⇒ **剂量-响应单调**：λ 越大深度越集中；而 PSNR（0.07 dB）与 LPIPS（0.0013）的变化
 **全部在噪声内**，实心度（`op` 中位 0.101）完全不变。因此默认取 **λ=1.0**：方差 **−60%**、尾部 **−81%**。
@@ -280,7 +284,7 @@ $$\mathcal{L}_{\text{var}}=\frac{1}{|\mathcal{M}|}\sum_{u\in\mathcal{M}}
 颜色损失、SSIM、LPIPS 都**奖励"平均掉高频"**的解：把纹理抹平能同时降低 L1 与 LPIPS。
 表现就是"形状对、表面发蜡/发糊"。梯度损失直接约束图像的一阶结构：
 
-$$\mathcal{L}_{\mathrm{grad}}=\lambda_g\,\frac{1}{|\mathcal{M}|}\sum_{u\in\mathcal{M}}
+$$\mathcal{L}_{\mathrm{grad}}=\lambda_g\ \frac{1}{|\mathcal{M}|}\sum_{u\in\mathcal{M}}
 \left|\nabla C(u)-\nabla\tilde I(u)\right|_1$$
 
 平坦区域梯度接近 0、几乎不贡献；边缘处差一点就被惩罚。所以它用**几乎相同的预算**换更清楚的纹理，
@@ -296,6 +300,10 @@ $$\mathcal{L}_{\mathrm{grad}}=\lambda_g\,\frac{1}{|\mathcal{M}|}\sum_{u\in\mathc
 | **1.0（`solid` 预设）** | 325,441 | **33.94** | **0.9928** | **0.2041** | **0.989** | **0.839** |
 
 16 视角复核同序（27.67 → 29.40 → 31.53 dB），不是视角偶然。
+![梯度损失剂量响应](docs/figs/fig_grad_dose.png)
+
+> 图：左=保真度（PSNR 升、LPIPS 降），右=纹理（高频相关升、高频能量比回到 1.0）。
+
 
 **60k 验证（`solid` 预设完整跑完 + TSDF 导出）**：
 
@@ -308,6 +316,11 @@ $$\mathcal{L}_{\mathrm{grad}}=\lambda_g\,\frac{1}{|\mathcal{M}|}\sum_{u\in\mathc
 ⇒ 60k 下梯度损失依然有效：相比 v4 **PSNR +4.82 dB、LPIPS −10%、高频相关 0.728→0.814**，
 且实心度与深度方差保持在 v2 的水平（此时 cap 400k 已顶满，所以在 60k 下它几乎不增加成本）。
 网格：191,274 面、边界边 0、非流形 0、**封闭=True**。
+
+![60k 三配置对比](docs/figs/fig_60k_compare.png)
+
+> 图：60k 下三种配置的 PSNR / LPIPS / 深度方差（同一探针、8 留出视角）。solid-v3 = 深度方差 1.0 + 梯度损失 1.0 + LPIPS 0.05。
+
 
 ⇒ **这是目前收益最大的一项**：$\lambda_g=1.0$ 时 PSNR **+4.75 dB**、LPIPS **−15%**、高频能量比回到 1.0、
 高频相关 0.750→0.839；代价是高斯数 **+45%**、训练时间 +26%。
@@ -458,6 +471,10 @@ scripts\gsflow.cmd run --video data\x.mp4 --job-id final --preset solid
 只给下限但容量小会让画质回落（旧版 v3：cap 300k → PSNR 29.86）；只给大容量不给下限（`quality`）则 100% 淡高斯。
 另注意：`op*(1-op)` 这种**对称**正则实测**完全无效**（op→0 时惩罚与梯度一起趋零），必须用单边下限。
 
+![LPIPS 权重 × 容量](docs/figs/fig_lpips_cap.png)
+
+> 图：λ_lpips 与 cap 的四组标定（30k）。LPIPS 对 λ 不敏感，容量主要影响 PSNR。
+
 > `train.densify_strategy=official`（gsplat 官方 `DefaultStrategy`）**目前不推荐**：
 > 实测在 step 10000 涨到 251 万高斯（我们已补上漏传的 `cap_max`，但阈值仍需重新标定）。
 
@@ -472,7 +489,7 @@ scripts\gsflow.cmd run --video data\x.mp4 --job-id final --preset solid
 #### ① 抽帧（frames）
 
 帧率采样：在时间轴上等间隔取 $t_k=t_0+k/f$，$f=$ `frames.fps`（默认 **2.0**），上限 `frames.count`（120）。
-清晰度筛选：$\;s(I)=\mathrm{Var}(\nabla^2 I)$，$s\lt $`frames.blur_threshold` 的帧丢弃（默认 **0 = 不过滤**）。
+清晰度筛选：$\ s(I)=\mathrm{Var}(\nabla^2 I)$，$s\lt$`frames.blur_threshold` 的帧丢弃（默认 **0 = 不过滤**）。
 分辨率：长边缩放到 `frames.long_side`（默认 **1920**）。
 自动裁边：对序列求逐像素时间方差 $\mathrm{Var}_t I_t(u)$，保留高方差行/列的包围盒
 （`frames.auto_crop` 逻辑见 3.1；阈值 `auto_crop_threshold` 默认 **0.75**）。
@@ -480,19 +497,19 @@ scripts\gsflow.cmd run --video data\x.mp4 --job-id final --preset solid
 #### ② 掩码与背景清理（mask）
 
 分割给出 $M(u)\in\lbrace 0,1\rbrace$（`mask.backend`：`rembg` / `fastsam` / `classical`），
-训练图按 $\;I'(u)=M(u)I(u)+(1-M(u))b\;$ 合成，$b$ 由 `mask.mode` 决定：
+训练图按 $I'(u)=M(u)I(u)+(1-M(u))b$ 合成，$b$ 由 `mask.mode` 决定：
 `black` ⇒ $b=0$（默认），`keep` ⇒ 保留原背景（转台拍摄必须用这个，见 3.1）。
 
 形态学与门限（默认值）：`mask.dilate_px=4`、`mask.feather_px=2`、`mask.erode_px=0`
 （$M_\epsilon=M\ominus K_\epsilon$）、`mask.min_area_ratio=0.002`、`mask.keep_largest=true`；
-退化保护：前景占比落在 $[2\%,\,90\%]$ 之外视为失败，按 `mask.on_failure`（默认 `keep`）降级。
+退化保护：前景占比落在 $[2\%,\ 90\%]$ 之外视为失败，按 `mask.on_failure`（默认 `keep`）降级。
 
 #### ③ COLMAP 稀疏重建（colmap）
 
 相机模型 `colmap.cameras="SIMPLE_RADIAL"`（$f,c_x,c_y,k_1$，`single_camera=true`）：
 
 $$\pi(X)=K[\tfrac{x}{z},\tfrac{y}{z},1]^\top,\quad (x,y,z)=R_iX+t_i,\qquad
-r\mapsto r\,(1+k_1 r^2).$$
+r\mapsto r\ (1+k_1 r^2).$$
 
 匹配：`colmap.matcher="auto"` —— 视频/顺序拍摄走 **sequential**（`sequential_overlap=12`），
 无序照片走 **exhaustive**；特征上限 `max_num_features=8192`、`max_num_matches=32768`、
@@ -565,8 +582,8 @@ $\eta(t)=\eta_{\min}+(\eta_0-\eta_{\min})\cdot\frac12(1+\cos\frac{\pi t}{T})$，
 
 **TSDF 融合**（`mesh_method="tsdf"`，本项目推荐给薄结构）：
 
-$$f(v)=\frac{\sum_i w_i(v)\,d_i(v)}{\sum_i w_i(v)},\qquad
-d_i(v)=\mathrm{clamp}(D_i(u_v)-z_v,\,-\delta,\delta),$$
+$$f(v)=\frac{\sum_i w_i(v)\ d_i(v)}{\sum_i w_i(v)},\qquad
+d_i(v)=\mathrm{clamp}(D_i(u_v)-z_v,\ -\delta,\delta),$$
 
 体素 $\delta=$`scene_scale`$/$`mesh_voxel_div`（默认 400 ⇒ 实测 0.008~0.016），
 深度过滤保留率实测 98.9~99.1%，零等值面用 Marching Cubes 提取。
