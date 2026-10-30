@@ -178,7 +178,7 @@ $$\Delta x_v=\eta\cdot\frac{1}{|\mathcal{V}(v)|}\sum_{i\in\mathcal{V}(v)}
 $\cos\theta_{iv}$ 抑制掠射角放大（深度误差在掠射方向被夸大 $1/\cos\theta$）。
 每步之后若中位残差 $r^{(k)}=\mathrm{median}|\Delta|$ 变大，就**回退到最优顶点并把步长减半**：
 
-$$\eta_{k+1}=\tfrac12\eta_k,\qquad x^{(k+1)}=x^{\star}$$
+$$\eta_{k+1}=\frac12\eta_k,\qquad x^{(k+1)}=x^{\star}$$
 
 仅在 $r^{(k+1)}$ 大于最优残差 $r^{\star}$ 时执行这次回退。
 
@@ -508,7 +508,7 @@ scripts\gsflow.cmd run --video data\x.mp4 --job-id final --preset solid
 
 相机模型 `colmap.cameras="SIMPLE_RADIAL"`（$f,c_x,c_y,k_1$，`single_camera=true`）：
 
-$$\pi(X)=K[\tfrac{x}{z},\tfrac{y}{z},1]^\top,\quad (x,y,z)=R_iX+t_i,\qquad
+$$\pi(X)=K[\frac{x}{z},\frac{y}{z},1]^\top,\quad (x,y,z)=R_iX+t_i,\qquad
 r\mapsto r\ (1+k_1 r^2).$$
 
 匹配：`colmap.matcher="auto"` —— 视频/顺序拍摄走 **sequential**（`sequential_overlap=12`），
@@ -589,7 +589,7 @@ d_i(v)=\mathrm{clamp}(D_i(u_v)-z_v,\ -\delta,\delta),$$
 深度过滤保留率实测 98.9~99.1%，零等值面用 Marching Cubes 提取。
 
 **泊松**（`mesh_method="poisson"|"2dgs"`）：解 $\Delta\chi=\nabla\cdot\mathbf{V}$，
-$\mathbf{V}=\sum_j n_j\delta_{\mu_j}$，等值面 $\chi=\tfrac12$；
+$\mathbf{V}=\sum_j n_j\delta_{\mu_j}$，等值面 $\chi=\frac12$；
 默认 `mesh_poisson_depth=8`（实测 8 比 9 的相邻面法线翻转率低 10 倍）。
 
 **后处理**：低密度裁剪 `mesh_density_quantile=0.001`、裁剪分位 `mesh_crop_quantile=1.0`、
