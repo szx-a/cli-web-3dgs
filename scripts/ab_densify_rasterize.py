@@ -146,6 +146,11 @@ ARMS: dict[str, dict[str, str]] = {
     "lpipsD": {"train.lambda_lpips": "0.2"},
     # 创新项对比：视线级不透明度下限 vs 逐高斯下限
     "rayf": {"train.ray_opacity_reg": "0.5", "train.ray_opacity_floor": "0.9"},
+    # 空参数基线（当前默认）
+    "base0": {},
+    # 深度方差正则（治“朦胧”的可微手段）
+    "dvarA": {"train.lambda_depth_var": "0.3", "train.depth_var_mode": "var"},
+    "dvarB": {"train.lambda_depth_var": "1.0", "train.depth_var_mode": "var"},
     "gflr": {"train.opacity_floor": "0.10", "train.opacity_floor_reg": "0.5"},
     "floor2": {"train.opacity_floor": "0.2", "train.opacity_floor_reg": "0.5"},
     "reset3k": {"train.opacity_reset_interval": "3000",

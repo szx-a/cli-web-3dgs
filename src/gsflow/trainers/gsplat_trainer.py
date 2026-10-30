@@ -248,6 +248,10 @@ class TrainConfig:
     opacity_crisp_reg: float = 0.02          # 不透明度清晰度正则（推实；实测 SSIM −0.0003）
     opacity_crisp_warmup: float = 0.7        # 前 N% 迭代不施加清晰度正则（0~1）
     opacity_floor: float = 0.10              # 不透明度下限（实测几乎免费：op<0.1 85%→4%）
+    # 深度集中度正则（2DGS 成对失真的 L2 对应量，可微）
+    lambda_depth_var: float = 0.0            # 权重（0=关）
+    depth_var_warmup: float = 0.3            # 前 N% 迭代不施加
+    depth_var_mode: str = "var"              # var / std / rvar
     opacity_floor_reg: float = 0.5           # 下限正则权重：惩罚 relu(floor-op)
     opacity_floor_warmup: float = 0.5        # 前 N% 迭代不施加
     # 训练结束时的最小不透明度清理（Faster-GS: MIN_OPACITY_AFTER_TRAINING = 1/255）。
@@ -1448,6 +1452,65 @@ def train(cfg: TrainConfig, ctx) -> dict:
         ssim_val = ssim_simple(render.permute(2, 0, 1)[None], gt.permute(2, 0, 1)[None],
                                legacy_eps=bool(getattr(cfg, "ssim_legacy_eps", False)))
         loss = (1.0 - cfg.ssim_weight) * l1 + cfg.ssim_weight * (1.0 - ssim_val)
+
+        # ---- 深度集中度正则（治“朦胧”，2026-10-30）----
+        #
+        # 2DGS 的成对失真 L_d = Σ_u Σ_{i,j} w_i w_j |z_i - z_j| 需要逐像素的高斯列表
+        # （要自己写 CUDA 核）。它的 L2 对应量——沿射线的深度方差——可以用**两次矩渲染**
+        # 在 gsplat 上精确得到：把逐高斯深度 z_j 与 z_j² 塞进颜色通道，光栅化直接返回
+        # Σ w_j z_j 与 Σ w_j z_j²，而 Σ w_j 就是返回的 alpha。于是
+        #   E[z] = Σ w z / Σ w，E[z²] = Σ w z² / Σ w，Var = E[z²] - E[z]²。
+        #
+        # 为什么是它：实测“朦胧”并非累计不透明度不足（T 中位 0.99），
+        # 而是同一条视线的颜色来自很多不同深度（表面位置不确定），
+        # 方差正是这件事的直接度量。
+        _dv_w = float(getattr(cfg, "lambda_depth_var", 0.0) or 0.0)
+        if _dv_w > 0:
+            _dv_wu = float(getattr(cfg, "depth_var_warmup", 0.0) or 0.0) * float(cfg.iterations)
+            if step >= _dv_wu:
+                try:
+                    from gsflow.trainers.depth_regularizers import (
+                        DepthMoments,
+                        camera_depths,
+                        depth_variance_loss,
+                        moment_colors,
+                    )
+
+                    _zc = camera_depths(means, vm)
+                    _cols_m, _al_m, _ = rasterization(
+                        means=means,
+                        quats=quats / (quats.norm(dim=-1, keepdim=True) + 1e-8),
+                        scales=current_scales(),
+                        opacities=torch.clamp(current_opacities().squeeze(-1), 0.0, 1.0),
+                        colors=moment_colors(_zc),
+                        viewmats=vm[None],
+                        Ks=kk[None],
+                        width=gt.shape[1],
+                        height=gt.shape[0],
+                        sh_degree=None,
+                        near_plane=0.01,
+                        far_plane=1e10,
+                        packed=False,
+                        render_mode="RGB",
+                        rasterize_mode=_raster_mode,
+                    )
+                    _mom = DepthMoments(
+                        weight=_al_m[0, ..., 0],
+                        first=_cols_m[0, ..., 0],
+                        second=_cols_m[0, ..., 1],
+                    )
+                    _dv = depth_variance_loss(
+                        _mom,
+                        mask=_mask,
+                        scale=scene_scale,
+                        mode=str(getattr(cfg, "depth_var_mode", "var") or "var"),
+                    )
+                    loss = loss + _dv_w * _dv
+                except Exception as _exc:  # noqa: BLE001
+                    # 不静默失败：告警一次，不阻断训练
+                    if not getattr(ctx, "_dv_warned", False):
+                        ctx.warn(f"深度方差正则未生效：{type(_exc).__name__}: {_exc}")
+                        setattr(ctx, "_dv_warned", True)
 
         # ---- 视线级不透明度下限（本项目创新项，2026-10-25）----
         #

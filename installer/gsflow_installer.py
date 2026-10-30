@@ -126,6 +126,11 @@ class Plan:
     reuse_from: Path | None = None
     python_exe: str = ""
     dry_run: bool = False
+    # ---- 离线包（2026-10-30）----
+    make_bundle: Path | None = None      # 装完后在这里生成离线包
+    from_bundle: Path | None = None      # 从这个离线包安装
+    bundle_mode: str = "venv"            # venv / wheels
+    wheelhouse: Path | None = None       # wheels 模式下的 wheel 目录
 
 
 class Runner:
@@ -233,6 +238,10 @@ def _materialize_payload(root: Path, source: Path, runner: Runner) -> None:
 def install(plan: Plan, runner: Runner) -> bool:
     root = plan.install_dir
     root.mkdir(parents=True, exist_ok=True)
+
+    # 离线包安装：不走联网流程
+    if plan.from_bundle is not None:
+        return install_from_bundle(plan.from_bundle, root, plan, runner)
     env = _install_env(root)
     python_exe = plan.python_exe or sys.executable
     log = runner.log
@@ -366,9 +375,188 @@ def install(plan: Plan, runner: Runner) -> bool:
     # 验证
     log("环境验证：")
     runner.run([str(venv_py), "-m", "gsflow", "doctor"], root, env)
+    if plan.make_bundle is not None:
+        ok = make_bundle(root, plan.make_bundle, plan.bundle_mode, plan.components,
+                         plan.wheelhouse, runner)
+        if not ok:
+            log("⚠ 离线包生成失败（安装本身已完成）")
     log("安装完成。运行 scripts\\web.cmd 启动 Web GUI，或 scripts\\gsflow.cmd doctor 自检。")
     return True
 
+
+
+# ---------------------------------------------------------------- 离线包
+
+BUNDLE_IGNORE = {"__pycache__", ".pytest_cache", ".mypy_cache", "uv-cache", "pip-cache", "tmp"}
+
+
+def _copy_tree_excluding(src: Path, dst: Path, runner: Runner | None = None) -> int:
+    """复制目录，跳过缓存/临时目录（这些复制会撞锁文件 WinError 5）。"""
+    n = 0
+    for item in src.rglob("*"):
+        rel = item.relative_to(src)
+        if any(part in BUNDLE_IGNORE for part in rel.parts):
+            continue
+        target = dst / rel
+        try:
+            if item.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(item, target)
+                n += 1
+        except Exception as exc:  # noqa: BLE001
+            if runner:
+                runner.log(f"  跳过 {rel}：{type(exc).__name__}")
+    return n
+
+
+def _bundle_manifest(root: Path, mode: str, components: list[str]) -> dict:
+    """离线包清单（写进 bundle.json，安装端据此选择流程并做版本核对）。"""
+    venv_py = root / "env" / "venv" / "Scripts" / "python.exe"
+    return {
+        "format": "gsflow-offline-bundle",
+        "version": 1,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "mode": mode,
+        "components": list(components),
+        "python": str(Path(sys.executable)),
+        "has_venv": (root / "env" / "venv").exists(),
+        "venv_python": str(venv_py) if venv_py.exists() else "",
+    }
+
+
+def make_bundle(root: Path, out: Path, mode: str, components: list[str],
+                wheelhouse: Path | None, runner: Runner) -> bool:
+    """把已装好的环境打成离线包。"""
+    runner.log(f"生成离线包：{out}（模式 {mode}）")
+    if out.exists() and any(out.iterdir()):
+        runner.log("目标目录非空，将覆盖其中的同名内容")
+    out.mkdir(parents=True, exist_ok=True)
+
+    # ---- 先校验模式与必需输入，再复制（快速失败，不浪费几 GB I/O）----
+    if mode not in ("venv", "wheels"):
+        runner.log(f"未知模式 {mode!r}（应为 venv 或 wheels）")
+        return False
+    wheel_src: Path | None = None
+    if mode == "wheels":
+        wheel_src = wheelhouse or (root / "wheelhouse")
+        if not wheel_src.exists() or not any(wheel_src.glob("*.whl")):
+            runner.log("wheels 模式需要在能联网的机器上准备 wheelhouse：")
+            runner.log(f"  uv pip download -r {root / 'requirements.txt'} -d {wheel_src}")
+            runner.log("（或使用 --wheelhouse 指定已有目录）")
+            return False
+    if mode == "venv" and not (root / "env" / "venv").exists():
+        runner.log("没有虚拟环境可打包（先完整安装）")
+        return False
+
+    payload = out / "payload"
+    # ❌ 曾经直接 `_copy_tree_excluding(root, payload)`：把 env/venv、workspace、tools、models
+    # 全拷进 payload，包体积翻倍（实测 4.5 GB 里有一半是重复的 venv）。
+    # 正确做法：用安装器自己的载荷复制（它已经排除了 env/workspace/tools/models 等）。
+    _materialize_payload(payload, root, runner)
+    n = sum(1 for _ in payload.rglob("*") if _.is_file())
+    runner.log(f"  项目本体：{n} 个文件")
+
+    for name in ("models", "tools"):
+        src = root / name
+        if src.exists():
+            m = _copy_tree_excluding(src, out / name, runner)
+            runner.log(f"  {name}/：{m} 个文件")
+
+    if mode == "venv":
+        venv = root / "env" / "venv"
+        runner.log("  打包虚拟环境（体积较大，耐心等待）…")
+        m = _copy_tree_excluding(venv, out / "venv", runner)
+        runner.log(f"  venv/：{m} 个文件")
+    else:
+        assert wheel_src is not None
+        runner.log(f"  打包 wheelhouse：{wheel_src}")
+        shutil.copytree(wheel_src, out / "wheels", dirs_exist_ok=True)
+
+    (out / "bundle.json").write_text(
+        json.dumps(_bundle_manifest(root, mode, components), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    runner.log("  已写 bundle.json")
+    return True
+
+
+def _rewrite_pth(venv: Path, install_root: Path) -> None:
+    """把 venv 里的 src 挂载点指向**新安装目录**（venv 复制后原 .pth 仍指旧路径）。"""
+    site = venv / "Lib" / "site-packages"
+    site.mkdir(parents=True, exist_ok=True)
+    (site / "gsflow-dev.pth").write_text(str(install_root / "src"), encoding="ascii")
+
+
+def install_from_bundle(bundle: Path, root: Path, plan: Plan, runner: Runner) -> bool:
+    """从离线包安装（不联网）。"""
+    log = runner.log
+    manifest_path = bundle / "bundle.json"
+    if not manifest_path.exists():
+        log(f"不是离线包（缺 bundle.json）：{bundle}")
+        return False
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    mode = str(manifest.get("mode", "venv"))
+    log(f"离线包：模式 {mode}，组件 {manifest.get('components')}，生成于 {manifest.get('created_at')}")
+
+    root.mkdir(parents=True, exist_ok=True)
+    env = _install_env(root)
+
+    # 1) 项目本体
+    payload = bundle / "payload"
+    if payload.exists():
+        n = _copy_tree_excluding(payload, root, runner)
+        log(f"项目本体：{n} 个文件")
+    # 2) 模型与工具
+    for name in ("models", "tools"):
+        src = bundle / name
+        if src.exists():
+            n = _copy_tree_excluding(src, root / name, runner)
+            log(f"{name}/：{n} 个文件")
+
+    venv = root / "env" / "venv"
+    venv_py = venv / "Scripts" / "python.exe"
+
+    if mode == "venv":
+        src_venv = bundle / "venv"
+        if not src_venv.exists():
+            log("离线包缺 venv/ 目录")
+            return False
+        log("复制虚拟环境…")
+        _copy_tree_excluding(src_venv, venv, runner)
+        _rewrite_pth(venv, root)
+        log("已重写 gsflow-dev.pth 指向新安装目录")
+    elif mode == "wheels":
+        uv = _ensure_uv(runner, root, env, plan.python_exe or sys.executable)
+        if not venv_py.exists():
+            if uv and Path(uv).exists():
+                runner.run([uv, "venv", str(venv), "--python", plan.python_exe or sys.executable], root, env)
+            else:
+                runner.run([plan.python_exe or sys.executable, "-m", "venv", str(venv)], root, env)
+        req = root / "requirements.txt"
+        args = ["pip", "install", "--python", str(venv_py), "--no-index",
+                "--find-links", str(bundle / "wheels")]
+        if req.exists():
+            args += ["-r", str(req)]
+        if runner.run([uv, "pip", "install", "--python", str(venv_py), "--no-index",
+                       "--find-links", str(bundle / "wheels")] + (["-r", str(req)] if req.exists() else []),
+                      root, env) != 0:
+            log("从 wheelhouse 安装失败")
+            return False
+        _rewrite_pth(venv, root)
+    else:
+        log(f"未知模式 {mode!r}")
+        return False
+
+    # 3) 配置 + 验证（与在线安装同一套收尾）
+    for d in ("config", "workspace", "logs", "models", "tools", "downloads"):
+        (root / d).mkdir(parents=True, exist_ok=True)
+    runner.run([str(venv_py), "-m", "gsflow", "init", "--force"], root, env)
+    log("环境验证：")
+    runner.run([str(venv_py), "-m", "gsflow", "doctor"], root, env)
+    log("离线安装完成。")
+    return True
 
 # ---------------------------------------------------------------- GUI
 
@@ -470,6 +658,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--reuse-from", default="", help="复用该目录的缓存与模型")
     ap.add_argument("--dry-run", action="store_true", help="只打印计划")
     ap.add_argument("--python", default="", help="用于创建 venv 的 Python 可执行文件")
+    ap.add_argument("--make-bundle", default="", help="安装完后在此目录生成离线包")
+    ap.add_argument("--from-bundle", default="", help="从该离线包安装（不联网）")
+    ap.add_argument("--bundle-mode", default="venv", choices=["venv", "wheels"], help="离线包模式")
+    ap.add_argument("--wheelhouse", default="", help="wheels 模式的 wheel 目录")
     args = ap.parse_args(argv)
 
     comps = [c.strip() for c in args.components.split(",") if c.strip()]
@@ -492,6 +684,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"GUI 不可用（{type(exc).__name__}: {exc}），退回静默安装")
     plan = Plan(install_dir=target, components=comps,
                 reuse_from=Path(args.reuse_from) if args.reuse_from else None,
+                make_bundle=Path(args.make_bundle) if args.make_bundle else None,
+                from_bundle=Path(args.from_bundle) if args.from_bundle else None,
+                bundle_mode=args.bundle_mode,
+                wheelhouse=Path(args.wheelhouse) if args.wheelhouse else None,
                 python_exe=args.python, dry_run=args.dry_run)
     return 0 if install(plan, Runner(print)) else 1
 
