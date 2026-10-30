@@ -386,7 +386,7 @@ scripts\gsflow.cmd run --video data\x.mp4 --job-id final --preset solid
 | 预设 | 内容 | 适用 |
 |---|---|---|
 | `balanced` | 当前默认（30k、densify_until 4000、内置密度控制）| 快速验证 |
-| `quality` | 60k、`cap_max` 300k、densify_until 10000、每步 LPIPS 0.1、2DGS 面元正则 0.02、推实正则 0.05（warmup 0.4）| **画质优先** |
+| `quality` | 60k、`cap_max` 300k、densify_until 10000、每步 LPIPS 0.05、2DGS 面元正则 0.02、推实正则 0.05（warmup 0.4）| **画质优先** |
 | `solid` | 在 `quality` 基础上加**单边不透明度下限**（`opacity_floor=0.10`，reg 0.5，warmup 0.3）+ `cap_max` 400k | **推荐**：画质与实心度同时更好 |
 
 **实测（img5，8 个留出视角，同一把论文对齐的尺子）**：
