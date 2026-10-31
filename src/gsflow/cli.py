@@ -79,7 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
                     choices=["", "auto", "turntable", "orbit"],
                     help="拍摄模式（与 GUI 下拉框等价）：auto/turntable/orbit")
     sp.add_argument("--preset", default="",
-                    choices=["", "balanced", "quality", "solid", "q", "hq"],
+                    choices=["", "balanced", "quality", "solid", "official", "q", "hq"],
                     help="训练预设（与 GUI 下拉框等价）：balanced（默认）/ quality（画质优先）/ solid（实心优先，"
                          "官方密度控制+AbsGS+每步 LPIPS+2DGS 面元正则，约 60~75 分钟/作业）")
     sp.add_argument("--opacity-cleanup", default="",

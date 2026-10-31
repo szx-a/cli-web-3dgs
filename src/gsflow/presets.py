@@ -83,6 +83,40 @@ PRESETS: dict[str, dict[str, Any]] = {
         "train.opacity_floor_warmup": 0.3,
     },
 
+    # ---- 官方对齐 + 高容量（2026-10-31）----
+    #
+    # 依据 docs/09 的逐项对照与实测：
+    #   * 405k 高斯在 3× 放大下清晰度只剩 26%，600k 能保持 70% ⇒ 容量优先；
+    #   * `opacity_floor=0.10` 把 92% 的高斯钉在下限（p50=0.101），表面成了多层半透明
+    #     ⇒ 降到 0.02，把"实心化"交给**不透明度重置**（官方 3000 步）；
+    #   * 致密化窗口拉到 14000（官方 15000 量级）；
+    #   * `absgrad=True`（AbsGS）：用绝对梯度和做致密化判据；
+    #   * `sh_degree_interval=1000`：先学几何再学视角相关颜色（官方同款）。
+    "official": {
+        "train.iterations": 60000,
+        "train.densify_from": 500,
+        "train.densify_until": 14000,
+        "train.densify_interval": 100,
+        "train.cap_max": 900000,
+        "train.densify_strategy": "builtin",
+        "train.absgrad": True,
+        "train.lambda_grad": 1.0,
+        "train.lambda_lpips": 0.05,
+        "train.lpips_every": 1,
+        "train.lpips_size": 224,
+        "train.rasterize_mode": "classic",
+        "train.sh_degree": 3,
+        "train.sh_degree_interval": 1000,
+        "train.opacity_reset_interval": 3000,
+        "train.prune_opacity": 0.02,
+        "train.opacity_floor": 0.02,
+        "train.opacity_floor_reg": 0.2,
+        "train.lambda_normal": 0.02,
+        "train.lambda_depth_distortion": 0.02,
+        "train.depth_mode": "expected",
+        "train.eval_metrics": True,
+    },
+
     "quality": {
         "train.iterations": 60000,
         "train.densify_from": 500,
