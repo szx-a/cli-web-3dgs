@@ -1235,6 +1235,33 @@ class ExportStage(Stage):
                     ctx.info(
                         "非流形修复：合并近邻顶点 + 重新补洞 → 面 %d，流形=%s"
                         % (len(mesh.triangles), mesh.is_edge_manifold()))
+                # ---- 仍非流形：最后手段 remove_non_manifold_edges（有损，带阈值保护）----
+                if not bool(mesh.is_edge_manifold()):
+                    _n_before = len(mesh.triangles)
+                    _trial = o3d.geometry.TriangleMesh(mesh)   # 深拷贝，失败可回滚
+                    _trial.remove_non_manifold_edges()
+                    _trial.remove_degenerate_triangles()
+                    _trial.remove_duplicated_vertices()
+                    _trial.remove_unreferenced_vertices()
+                    _lost = _n_before - len(_trial.triangles)
+                    if _lost <= max(4, int(_n_before * 0.005)):
+                        from ..gsdata.mesh_export import fill_holes as _fill2
+
+                        _trial, _h3 = _fill2(_trial, log=None)
+                        mesh = _trial
+                        info["mesh_nonmanifold_edges_removed"] = {
+                            "removed_faces": int(_lost),
+                            "manifold_after": bool(mesh.is_edge_manifold()),
+                            "watertight_after": bool(mesh.is_watertight()),
+                        }
+                        ctx.info(
+                            "非流形边清理：删 %d 面（%.3f%%），流形=%s，封闭=%s"
+                            % (_lost, 100.0 * _lost / max(_n_before, 1),
+                               mesh.is_edge_manifold(), mesh.is_watertight()))
+                    else:
+                        ctx.warn(
+                            "非流形边清理被跳过：需删 %d 面（%.2f%% > 0.5%%），硬删会破坏结构"
+                            % (_lost, 100.0 * _lost / max(_n_before, 1)))
             except Exception as exc:  # noqa: BLE001
                 ctx.warn(f"非流形修复失败（{type(exc).__name__}: {exc}），继续用原网格")
 

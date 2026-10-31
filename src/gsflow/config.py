@@ -208,6 +208,8 @@ DEFAULTS: dict[str, Any] = {
         #   official —— 直接复用 gsplat `DefaultStrategy`（含 AbsGS 的 absgrad 支持）。
         # 注意：`absgrad` 只有配合 official 才有意义；走 builtin 时它会被忽略。
         "densify_strategy": "builtin",
+        # MCMC 策略的 SGLD 噪声幅度（官方默认 5e5）。
+        "mcmc_noise_lr": 500000.0,
         # ---- 2DGS 参数化（压平高斯）----
         # 把高斯压平成 2D 圆盘（只钳最短轴），"最短轴 = 表面法线"这一语义才成立。
         # 这是 2DGS(SIGGRAPH'24) 与 3DGS 的**根本差别**；只搬损失项而不改参数化

@@ -212,6 +212,9 @@ class TrainConfig:
     # （13~17 / 23.9 / 9.4 dB）—— 因为官方那套是**整体自洽**的机制，
     # 拆一半移植比不移植更糟。所以正确做法是**直接复用官方类**。
     densify_strategy: str = "builtin"
+    # MCMC 策略（3DGS-MCMC, NeurIPS 2024）：SGLD 噪声幅度。
+    # 官方默认 5e5，乘以当前位置学习率得到每步噪声标准差。
+    mcmc_noise_lr: float = 500000.0
     eval: bool = True
     # 相机轴约束：默认 False = 不翻转，与官方 gsplat 的 COLMAP 加载器一致。
     # 只保留用于对照实验；正常流程不要打开。
@@ -1175,7 +1178,33 @@ def train(cfg: TrainConfig, ctx) -> dict:
     # 我试过零散移植三次都失败（见 docs/03 G31），根因就是机制的整体性。
     gs_strategy = None
     gs_state: dict = {}
-    if str(cfg.densify_strategy).lower() == "official":
+    _is_mcmc = False
+    if str(cfg.densify_strategy).lower() in ("mcmc", "3dgs-mcmc"):
+        try:
+            from gsplat.strategy import MCMCStrategy
+
+            gs_strategy = MCMCStrategy(
+                cap_max=int(cfg.cap_max),
+                noise_lr=float(cfg.mcmc_noise_lr),
+                refine_start_iter=cfg.densify_from,
+                refine_stop_iter=cfg.densify_until,
+                refine_every=cfg.densify_interval,
+                min_opacity=float(cfg.prune_opacity),
+                verbose=False,
+            )
+            gs_strategy.check_sanity(params, optimizers)
+            gs_state = gs_strategy.initialize_state()
+            _is_mcmc = True
+            ctx.info(
+                "密度控制：**MCMC 策略**（3DGS-MCMC）"
+                f"cap_max={cfg.cap_max}，noise_lr={cfg.mcmc_noise_lr:g}，"
+                f"relocate {cfg.densify_from}~{cfg.densify_until} 每 {cfg.densify_interval} 步，"
+                f"min_opacity={cfg.prune_opacity}")
+        except Exception as exc:  # noqa: BLE001
+            gs_strategy = None
+            _is_mcmc = False
+            ctx.warn(f"MCMC 策略初始化失败，退回内置密度控制：{type(exc).__name__}: {exc}")
+    elif str(cfg.densify_strategy).lower() == "official":
         try:
             from gsplat import DefaultStrategy
 
@@ -1932,8 +1961,15 @@ def train(cfg: TrainConfig, ctx) -> dict:
         if gs_strategy is not None:
             # 官方整套：grow -> prune -> 清统计量 ->（按周期）重置不透明度
             n_before = int(params["means"].shape[0])
-            gs_strategy.step_post_backward(params, optimizers, gs_state, step,
-                                           meta or {}, packed=False)
+            if _is_mcmc:
+                # MCMC 必须传 lr（位置学习率），且不接受 packed。
+                # 噪声幅度 = noise_lr * lr_means，这就是 SGLD 的温度项。
+                _lr_means = float(optimizers["means"].param_groups[0]["lr"])
+                gs_strategy.step_post_backward(params, optimizers, gs_state, step,
+                                               meta or {}, lr=_lr_means)
+            else:
+                gs_strategy.step_post_backward(params, optimizers, gs_state, step,
+                                               meta or {}, packed=False)
             n_after = int(params["means"].shape[0])
             if n_after != n_before:
                 refresh_params()
