@@ -1512,6 +1512,7 @@ class ExportStage(Stage):
             return len(accessors) - 1
 
         a_pos = add(xyz, "VEC3")
+        a_dc = add(shs[:, 0, :].copy(), "VEC3")   # 原始 DC 系数（float32，无损）
         a_scale = add(scales, "VEC3")
         a_rot = add(quats, "VEC4")
         a_opac = add(opac, "SCALAR")
@@ -1521,6 +1522,7 @@ class ExportStage(Stage):
         attributes = {
             "POSITION": a_pos,
             "COLOR_0": a_color,
+            "_GS_SH_DC": a_dc,
             "_GS_SCALE": a_scale,
             "_GS_ROTATION": a_rot,
             "_GS_OPACITY": a_opac,
@@ -1537,7 +1539,8 @@ class ExportStage(Stage):
                 "shDegree": int(gauss.get("sh_degree") or 0),
                 "shRestVec4": n_vec4,
                 "attributes": {"scale": "_GS_SCALE", "rotation": "_GS_ROTATION",
-                               "opacity": "_GS_OPACITY", "shRest": "_GS_SH_*"},
+                               "opacity": "_GS_OPACITY",
+                               "shDC": "_GS_SH_DC", "shRest": "_GS_SH_*"},
                 "note": "rotation is (w,x,y,z); shRest are the SH coefficients of bands 1..3, "
                         "flattened 4-per-accessor (K*3 values, zero padded).",
             }},
