@@ -98,7 +98,8 @@ def read_gaussians_full(ply, max_points: int = 0) -> dict:
 
 
 def render_view(g: dict, viewmat, K, width: int, height: int,
-                device: str = "cuda", render_mode: str = "RGB"):
+                device: str = "cuda", render_mode: str = "RGB",
+                rasterize_mode: str = "classic", keep_min_opacity: float = 0.0):
     """用 gsplat 以**完整 SH** 渲染一帧。返回 (colors[H,W,C], alphas[H,W,1])。
 
     `viewmat`/`K` 可以是 numpy 或 torch；内部统一转 torch。
@@ -111,13 +112,22 @@ def render_view(g: dict, viewmat, K, width: int, height: int,
             return x.to(device=device, dtype=torch.float32)
         return torch.as_tensor(np.asarray(x), dtype=torch.float32, device=device)
 
+    opac = T(g["opacity"]).reshape(-1).clamp(0, 1)
+    means, quats, scales, colors = T(g["xyz"]), T(g["quats"]), T(g["scales"]), T(g["shs"])
+    # 与预览一致：过滤掉几乎不可见的高斯（远处浮点会把画面弄脏）
+    if keep_min_opacity and float(keep_min_opacity) > 0:
+        keep = opac > float(keep_min_opacity)
+        if int(keep.sum()) >= 16:
+            means, quats, scales, colors, opac = (means[keep], quats[keep], scales[keep],
+                                                  colors[keep], opac[keep])
     out = rasterization(
-        means=T(g["xyz"]), quats=T(g["quats"]), scales=T(g["scales"]),
-        opacities=T(g["opacity"]).reshape(-1).clamp(0, 1),
-        colors=T(g["shs"]),
+        means=means, quats=quats, scales=scales,
+        opacities=opac,
+        colors=colors,
         viewmats=T(viewmat)[None], Ks=T(K)[None],
         width=int(width), height=int(height),
         sh_degree=int(g.get("sh_degree", 0)),
         near_plane=0.01, far_plane=1e10, packed=False, render_mode=render_mode,
+        rasterize_mode=rasterize_mode,
     )
     return out[0][0], out[1][0]

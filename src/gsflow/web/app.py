@@ -33,6 +33,39 @@ paths.apply_runtime_env()
 STATIC_DIR = Path(__file__).parent / "static"
 
 
+def _job_fov_deg(job_id: str) -> float:
+    """从该作业的 COLMAP 内参估计水平 FOV（度）。失败返回 0（调用方退回 45°）。"""
+    import math
+
+    import numpy as np
+
+    root = Path(str(load_settings().get("project.workspace_dir"))) / job_id
+    try:
+        from ..gsdata.colmap_io import read_model
+
+        cands = sorted({p.parent for p in (root / "03_colmap" / "sparse").rglob("cameras.bin")})
+        if not cands:
+            return 0.0
+        rec = read_model(max(cands, key=lambda c: len(read_model(c).images)))
+        if not rec.cameras:
+            return 0.0
+        ratios = []
+        for cam in rec.cameras.values():
+            K = np.asarray(cam.intrinsics(), dtype=np.float64)
+            w = float(getattr(cam, "width", 0) or 0)
+            if w > 0 and K[0, 0] > 0:
+                ratios.append(K[0, 0] / w)
+        if not ratios:
+            return 0.0
+        r = float(np.median(ratios))          # fx / width
+        if r <= 0:
+            return 0.0
+        # 水平 FOV：width/(2 f) = tan(fov/2) ⇒ fov = 2*atan(1/(2r))
+        return float(math.degrees(2.0 * math.atan(1.0 / (2.0 * r))))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 def create_app():
     try:
         from fastapi import Body, FastAPI, HTTPException, Query
@@ -473,7 +506,8 @@ def create_app():
 
     @app.get("/api/render/{job_id}")
     def render(job_id: str, yaw: float = 0.0, pitch: float = 0.0,
-               dist: float = 0.0, width: int = 720, height: int = 720):
+               dist: float = 0.0, width: int = 720, height: int = 720,
+               ss: int = 2, aa: int = 1, fov: float = 0.0, minop: float = 0.02):
         """用 gsplat 渲染一帧，返回 PNG。
 
         `yaw`/`pitch` 为角度（度），`dist` 为相机到物体中心的距离
@@ -515,11 +549,23 @@ def create_app():
         right /= max(np.linalg.norm(right), 1e-12)
         up = np.cross(right, fwd)
         w2c = np.eye(4, dtype=np.float64)
-        w2c[0, :3], w2c[1, :3], w2c[2, :3] = right, up, -fwd
+        # ⚠ 2026-10-31 修：第三行必须是 **+fwd**（相机朝 +Z 看，COLMAP/gsplat 约定）。
+        # 旧写法 `-fwd` 使旋转矩阵行列式为 -1（非正交旋转），所有高斯被剔成负 z，
+        # 整帧空白（实测 alpha 均值 0.000）—— 这正是"交互式服务端渲染比 preview 糊/黑"的元凶。
+        w2c[0, :3], w2c[1, :3], w2c[2, :3] = right, up, fwd
         w2c[:3, 3] = -w2c[:3, :3] @ eye
 
-        fov = math.radians(45.0)
-        f = 0.5 * height / math.tan(fov / 2.0)
+        # ---- FOV：优先用**训练内参**（与 preview_*.png 同一透视）----
+        fov_deg = float(fov) if fov and fov > 0 else 0.0
+        if fov_deg <= 0:
+            try:
+                fov_deg = _job_fov_deg(job_id)
+            except Exception:
+                fov_deg = 0.0
+        if fov_deg <= 0:
+            fov_deg = 45.0
+        fov = math.radians(min(max(fov_deg, 10.0), 120.0))
+        f = 0.5 * height / math.tan(fov / 2.0)   # ← 焦距（像素）；漏了这行会 NameError
         K = np.array([[f, 0, width / 2.0],
                       [0, f, height / 2.0],
                       [0, 0, 1]], dtype=np.float64)
@@ -527,9 +573,22 @@ def create_app():
         try:
             from ..gsdata.shio import render_view
 
+            # ---- 超采样 + 抗锯齿（2026-10-31）----
+            #
+            # 交互式渲染以前直接用客户端画布尺寸（常常 640×480）出图，再被 CSS 放大
+            # ⇒ 看起来比 512² 的 preview_*.png 糊。这里先按 ss 倍渲染再缩小，
+            # 并启用 antialiased 光栅化（Mip-Splatting 的 2D 低通），两者叠加能明显减少锯齿与糊感。
+            ss_i = max(1, min(int(ss), 4))
+            rw, rh = width * ss_i, height * ss_i
+            Ks = K.copy()
+            Ks[0, :] *= ss_i
+            Ks[1, :] *= ss_i
             # GPU 同一时刻只跑一个渲染：训练在跑时排队，而不是抢显存
             with _RENDER_LOCK:
-                colors, alphas = render_view(g, w2c, K, width, height)
+                colors, alphas = render_view(
+                    g, w2c, Ks, rw, rh,
+                    rasterize_mode=("antialiased" if int(aa) else "classic"),
+                    keep_min_opacity=float(minop or 0.0))
             img = np.asarray(colors.detach().cpu().numpy()
                              if hasattr(colors, "detach") else colors)
             a = np.asarray(alphas.detach().cpu().numpy()
@@ -541,6 +600,10 @@ def create_app():
             # 与 canvas 背景同色，便于对比
             bg = np.array([0.02, 0.03, 0.045], dtype=np.float32)
             comp = img * a[..., None] + bg * (1.0 - a[..., None])
+            if ss_i > 1:
+                from PIL import Image as _Im
+                comp = np.asarray(_Im.fromarray((np.clip(comp, 0, 1) * 255).astype(np.uint8))
+                                  .resize((width, height), _Im.LANCZOS), dtype=np.float32) / 255.0
             u8 = np.clip(comp * 255.0, 0, 255).astype(np.uint8)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(

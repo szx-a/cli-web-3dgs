@@ -212,10 +212,20 @@ def _scene_extent(c2ws: np.ndarray, points: np.ndarray | None = None) -> tuple[n
     centers = c2ws[:, :3, 3]
     center = centers.mean(axis=0)
     if points is not None and len(points) > 0:
-        # 用稀疏点云的范围更贴近"物体"本身（相机中心可能离物体较远）
-        lo, hi = points.min(axis=0), points.max(axis=0)
+        # 用稀疏点云的范围更贴近"物体"本身（相机中心可能离物体较远）。
+        #
+        # ⚠️ 2026-10-31：**不能用 min/max** —— 高斯越多，越容易有远处的离群高斯（浮点/雾气），
+        # 它们把包围盒撑大 ⇒ `voxel = extent/div` 变粗 ⇒ TSDF 分辨率下降 ⇒ 网格变粗。
+        # 实测（同一份数据）：60k（40.6 万高斯）extent≈4.71；100k（60.7 万高斯）≈7.99（+70%），
+        # 体素 0.00904 → 0.01586，网格面数 191,274 → 59,310 —— 看起来像"加轮数把网格变粗"。
+        lo = np.percentile(points, 0.5, axis=0)
+        hi = np.percentile(points, 99.5, axis=0)
+        # ⚠️ 不要把相机中心的跨度并进来：相机在物体外绕一圈，跨度通常是物体的数倍，
+        # 一并进来会把 extent 抬到 14+（体素 0.036，网格糊成一块）。分位数本身已经够稳。
         center = (lo + hi) / 2.0
         extent = float(np.linalg.norm(hi - lo))
+        # 保底：点云极集中时不要细到不可用
+        extent = max(extent, 0.05 * float(np.linalg.norm(centers.max(axis=0) - centers.min(axis=0))))
     else:
         extent = float(np.linalg.norm(centers.max(axis=0) - centers.min(axis=0)))
     extent = max(extent, 1e-6)
