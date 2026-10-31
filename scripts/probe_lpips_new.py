@@ -67,7 +67,7 @@ def main() -> int:
         picks = np.linspace(0, len(imgs) - 1, min(args.views, len(imgs))).astype(int).tolist()
         g = read_gaussians_full(ply)
         vals = []
-        psnrs, ssims = [], []
+        psnrs, psnrs_nb, ssims = [], [], []
         for k in picks:
             im = imgs[k]
             cam = rec.cameras[im.camera_id]
@@ -95,6 +95,12 @@ def main() -> int:
                     ga = np.asarray(gt.detach().cpu().numpy(), dtype=np.float64)
                     d = ((ca - ga) ** 2)[m].mean()
                     psnrs.append(10 * np.log10(1.0 / max(float(d), 1e-10)))
+                    # 同步算"gt 非黑掩码"口径：两者差 4% 的像素却能差 17 dB（都在轮廓过渡带），
+                    # 只报一个数会让人误以为模型质量变了。见 docs/03 G174。
+                    m2 = ga.max(axis=2) > (6.0 / 255.0)
+                    if m2.any():
+                        psnrs_nb.append(10 * np.log10(
+                            1.0 / max(float(((ca - ga) ** 2)[m2].mean()), 1e-10)))
                     mu_a, mu_b = ca[m].mean(0), ga[m].mean(0)
                     va, vb = ca[m].var(0), ga[m].var(0)
                     cov = ((ca[m] - mu_a) * (ga[m] - mu_b)).mean(0)
@@ -106,7 +112,8 @@ def main() -> int:
             tag = args.tag or job_name
             extra = ""
             if psnrs:
-                extra = f"  PSNR(m)={np.mean(psnrs):.2f} dB  SSIM(m)={np.mean(ssims):.4f}"
+                extra = (f"  PSNR(m)={np.mean(psnrs):.2f} dB  SSIM(m)={np.mean(ssims):.4f}"
+                         + (f"  PSNR(非黑)={np.mean(psnrs_nb):.2f} dB" if psnrs_nb else ""))
             print(f"  {tag:<26} LPIPS={np.mean(vals):.4f}  (n={len(vals)}{extra}, 越低越好)")
         else:
             print(f"  {job_name:<26} 无法评估（尺寸不一致）")

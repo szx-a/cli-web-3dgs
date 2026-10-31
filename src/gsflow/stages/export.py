@@ -1211,6 +1211,33 @@ class ExportStage(Stage):
             except Exception as exc:  # noqa: BLE001
                 ctx.warn(f"补孔洞失败（{type(exc).__name__}: {exc}），继续用未补洞网格")
 
+            # ---- 补洞后仍非流形：合并近邻顶点再补一次（2026-10-31）----
+            #
+            # 实测：robust extent 让 100k 的体素从 0.0159 细到 0.0077，面数 59,310 → 251,592，
+            # 但出现 2 条非流形边（`封闭=False`）。原因是 TSDF 在薄结构处把同一位置的顶点
+            # 拆成多份（差 1e-7 量级），`remove_duplicated_vertices()` 合不上。
+            try:
+                if not bool(mesh.is_edge_manifold()):
+                    _before = len(mesh.triangles)
+                    mesh.merge_close_vertices(1e-6)
+                    mesh.remove_degenerate_triangles()
+                    mesh.remove_duplicated_vertices()
+                    mesh.remove_unreferenced_vertices()
+                    from ..gsdata.mesh_export import fill_holes as _fill
+
+                    mesh, _h2 = _fill(mesh, log=None)
+                    info["mesh_nonmanifold_fix"] = {
+                        "before_triangles": _before,
+                        "after_triangles": len(mesh.triangles),
+                        "manifold_after": bool(mesh.is_edge_manifold()),
+                        "refilled": int(_h2.get("filled_loops") or 0),
+                    }
+                    ctx.info(
+                        "非流形修复：合并近邻顶点 + 重新补洞 → 面 %d，流形=%s"
+                        % (len(mesh.triangles), mesh.is_edge_manifold()))
+            except Exception as exc:  # noqa: BLE001
+                ctx.warn(f"非流形修复失败（{type(exc).__name__}: {exc}），继续用原网格")
+
         # ---- 法线统一朝外（必须在**任何写盘之前**）----
         #
         # 踩过的坑（两次）：
