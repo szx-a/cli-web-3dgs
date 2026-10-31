@@ -1304,7 +1304,10 @@ def bake_texture_from_views(mesh, uv_tris, uv, images, c2ws, ks, src_whs,
                             tex_size: int = 2048, batch: int = 200,
                             margin_px: int = 2, max_views: int = 60,
                             bake_reject_black: bool = True,
-                            masks: list | None = None):
+                            masks: list | None = None,
+                            depths: list | None = None,
+                            depth_tol_ratio: float = 0.12,
+                            depth_min_alpha: float = 0.5):
     """从多视角图像给网格烘焙一张漫反射贴图。
 
     做法（社区常用思路，不依赖可微渲染器）：
@@ -1313,6 +1316,10 @@ def bake_texture_from_views(mesh, uv_tris, uv, images, c2ws, ks, src_whs,
       3. 每个像素用重心坐标反推到三维点，投影到**所有视角**，
          在"可见且拍摄方向与法线夹角最小"的视角上采样颜色（最接近正对表面）
       4. 边缘膨胀几次（dilate），避免采样时出现黑缝
+
+    ⚠️ **遮挡测试**（2026-10-31 加）：只按"朝向最好"选视角时，被遮挡的表面点会采到
+    遮挡物的颜色（用户反馈的"不同部位纹理杂糅"）。传入 `depths`（每视角一张 ED 深度图）
+    后，会额外要求 `z <= d*(1+tol)` —— 即该点不要落在观测表面之后。
 
     ⚠️ 性能坑：一开始写成"逐三角形 + 逐视角"两层 Python 循环，
     8 万面 × 29 视角要跑十几分钟。现在改成**按批处理**：
@@ -1336,17 +1343,38 @@ def bake_texture_from_views(mesh, uv_tris, uv, images, c2ws, ks, src_whs,
         idx = np.arange(len(c2ws))
 
     cams = []
+    dep_views: list = []
+    dep_alpha_views: list = []
     for i in idx:
         c2w = np.asarray(c2ws[i], dtype=np.float64)
         cams.append((np.linalg.inv(c2w), c2w[:3, 3],
                      np.asarray(ks[i], dtype=np.float64),
                      src_whs[i][0], src_whs[i][1],
                      images[i].astype(np.float32) / 255.0))
+        # 深度图可以是 (H,W) 或 (H,W,2)=为(depth, alpha)，也可以是 None
+        _d = depths[i] if (depths is not None and i < len(depths)) else None
+        if _d is None:
+            dep_views.append(None)
+            dep_alpha_views.append(None)
+        else:
+            _arr = np.asarray(_d, dtype=np.float32)
+            if _arr.ndim == 3 and _arr.shape[-1] >= 2:
+                dep_views.append(_arr[..., 0])
+                dep_alpha_views.append(_arr[..., 1])
+            else:
+                dep_views.append(_arr)
+                dep_alpha_views.append(None)
+    depths_used = any(d is not None for d in dep_views)
 
     tex = np.zeros((tex_size, tex_size, 3), dtype=np.float32)
     filled = np.zeros((tex_size, tex_size), dtype=bool)
     # 因采到黑背景而被拒绝的采样数（写进统计，避免行为变化被静默吞掉）
     n_rejected = 0
+    # 因**遮挡**被拒绝的采样数（2026-10-31）：只数其它条件都过、仅因遮挡被拒的点
+    n_occluded = 0
+    # 拆开统计：缺深度/低 alpha 的像素 vs 真正被挡住
+    n_occ_missing = 0
+    n_occ_behind = 0
 
     # 大三角形优先（小碎面容易被覆盖，且大面贡献的像素多）
     area = np.abs(
@@ -1398,6 +1426,8 @@ def bake_texture_from_views(mesh, uv_tris, uv, images, c2ws, ks, src_whs,
         best = np.full(len(P), -1.0)
         col = np.zeros((len(P), 3), dtype=np.float32)
         for ci, (w2c, ctr, K, iw, ih, img) in enumerate(cams):
+            dep = dep_views[ci]
+            dep_alpha = dep_alpha_views[ci]
             vc = P @ w2c[:3, :3].T + w2c[:3, 3]
             z = vc[:, 2]
             ok = z > 1e-6
@@ -1410,6 +1440,24 @@ def bake_texture_from_views(mesh, uv_tris, uv, images, c2ws, ks, src_whs,
             vd /= np.maximum(np.linalg.norm(vd, axis=1, keepdims=True), 1e-9)
             facing = -(N * vd).sum(axis=1)
             ok &= facing > 0.15
+            ok_before_occ = ok.copy()
+            # ---- 遮挡测试：点不能落在该视角观测表面的**后面** ----
+            if dep is not None and depths_used:
+                dh, dw = dep.shape[:2]
+                du = np.clip((u / max(float(iw), 1.0) * dw).astype(np.int32), 0, dw - 1)
+                dv = np.clip((v / max(float(ih), 1.0) * dh).astype(np.int32), 0, dh - 1)
+                dz = dep[dv, du].astype(np.float64)
+                has_surface = dz > 1e-6
+                if dep_alpha is not None:
+                    da = dep_alpha[dv, du].astype(np.float64)
+                    has_surface &= da >= float(depth_min_alpha)
+                behind = has_surface & (z > dz * (1.0 + float(depth_tol_ratio)) + 1e-4)
+                # 只拒"确实被挡住"的点；没有表面信息时不拒绝（否则会因模型覆盖不全而大面积拒采）
+                ok &= ~behind
+                sel0 = ok_before_occ & ~ok
+                n_occ_missing += int((sel0 & ~has_surface).sum())  # 理论上为 0，留作监控
+                n_occ_behind += int((sel0 & has_surface).sum())
+                n_occluded += int(sel0.sum())
             if not ok.any():
                 continue
             sc = np.where(ok, facing, -1.0)
@@ -1534,6 +1582,9 @@ def bake_texture_from_views(mesh, uv_tris, uv, images, c2ws, ks, src_whs,
             {"tex_size": tex_size, "coverage": float(filled.mean()),
              "views_used": len(cams),
              "samples_rejected_black": int(n_rejected),
+        "samples_rejected_occlusion": int(n_occluded),
+             "samples_rejected_occlusion_missing": int(n_occ_missing),
+             "samples_rejected_occlusion_behind": int(n_occ_behind),
              "mask_used": bool(masks is not None)})
 
 

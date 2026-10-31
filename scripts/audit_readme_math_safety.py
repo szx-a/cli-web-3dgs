@@ -64,10 +64,22 @@ def main() -> int:
                 print(f"  [FAIL] 行 {no}: 数学里有 {mac} → 换成稳妥写法")
                 print(f"         {seg.strip()[:110]}")
 
-    # 3) 正文裸 < >
+    # 3) 正文裸 < >（跳过跨行 $$ 块、代码围栏、引用块）
+    in_fence = False
+    in_block = False
     for no, ln in enumerate(text.splitlines(), start=1):
         s = ln.strip()
-        if s.startswith("```") or s.startswith(">") or "$$" in ln:
+        if s.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if ln.count("$$") % 2 == 1:
+            in_block = not in_block
+            continue
+        if in_block:
+            continue
+        if s.startswith(">"):
             continue
         no_math = re.sub(r"\$[^$\n]+?\$", "", ln)
         no_code = re.sub(r"`[^`]*`", "", no_math)

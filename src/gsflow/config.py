@@ -510,6 +510,12 @@ DEFAULTS: dict[str, Any] = {
         # （实测 final-v1 黑色 texel 35.99%）。转台模式（mask.mode=keep）本来就没有背景，
         # 该选项对它是无害的空操作。若素材本身是深色物体、担心误杀，可设为 False。
         "mesh_texture_reject_black": True,
+        # 遮挡测试（治“不同部位纹理杂柔”，2026-10-31）：焙焙时比较点的深度与该视角的 ED 深度，
+        # 只接受 z <= d*(1+tol) 的采样。tol 默认 3%（网格与高斯表面本来就有少量偏差）。
+        "mesh_texture_occlusion": True,
+        "mesh_texture_depth_tol": 0.12,
+        "mesh_texture_depth_width": 1024,
+
         # 按"到输入点距离"裁掉泊松桥接出来的面（阈值 = 输入点间距 × 该值；0=关闭）
         "mesh_trim_sigma": 2.5,
         # 删除"从未被任何相机看到"的网格面（泊松重建的内部垃圾几何）。

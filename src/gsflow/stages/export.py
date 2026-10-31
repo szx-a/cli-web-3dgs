@@ -904,7 +904,7 @@ class ExportStage(Stage):
                 ctx.info("网格后处理：法线已统一朝外")
             except Exception as exc:  # noqa: BLE001
                 ctx.warn(f"法线定向失败（{type(exc).__name__}: {exc}）")
-            return self._finish_mesh(ctx, mesh, info, out_dir, cams=cams)
+            return self._finish_mesh(ctx, mesh, info, out_dir, cams=cams, gauss=gauss)
 
         # ---------------- 路线二：TSDF 融合 ----------------
         # ⚠️ 必须在这里**单独 import** `select_views_by_distance`（2026-10-25 实测）：
@@ -999,7 +999,51 @@ class ExportStage(Stage):
         # 不需要 GPU、失败也不影响后续导出（外层 try 包住并降级为"用未精修网格"）。
         mesh = self._maybe_refine_mesh(ctx, mesh, cams, rendered, used_idx, ks, src_wh)
 
-        return self._finish_mesh(ctx, mesh, info, out_dir, cams=cams)
+        return self._finish_mesh(ctx, mesh, info, out_dir, cams=cams, gauss=gauss)
+
+    def _render_bake_depths(self, ctx: StageContext, gauss: dict,
+                            c2ws, ks, whs, width: int = 512, max_views: int = 60):
+        """为烘焙渲染逐视角 (depth, alpha)，与 `bake_texture_from_views` 的抽稀规则一致。
+
+        返回与 `c2ws` 等长的 list，未参与烘焙的视角为 None。
+        """
+        import numpy as np
+        import torch
+        from gsplat import rasterization
+
+        from ..gsdata.mesh_export import scale_intrinsics
+
+        n = len(c2ws)
+        if max_views and n > max_views:
+            idx = np.linspace(0, n - 1, max_views).round().astype(int)
+        else:
+            idx = np.arange(n)
+
+        means = torch.as_tensor(gauss["xyz"], dtype=torch.float32, device="cuda")
+        quats = torch.as_tensor(gauss["quats"], dtype=torch.float32, device="cuda")
+        scales = torch.as_tensor(gauss["scales"], dtype=torch.float32, device="cuda")
+        opac = torch.as_tensor(gauss["opacity"], dtype=torch.float32, device="cuda").reshape(-1).clamp(0, 1)
+        shs, sh_deg = _sh_tensors(gauss, device="cuda")
+
+        out: list = [None] * n
+        with torch.no_grad():
+            for i in idx:
+                K = scale_intrinsics(np.asarray(ks[i], dtype=np.float64), whs[i], (width, width))
+                viewmat = torch.linalg.inv(
+                    torch.as_tensor(np.asarray(c2ws[i], dtype=np.float32), device="cuda"))
+                colors, alphas, _ = rasterization(
+                    means=means, quats=quats, scales=scales, opacities=opac, colors=shs,
+                    viewmats=viewmat[None],
+                    Ks=torch.as_tensor(np.asarray(K, dtype=np.float32), device="cuda")[None],
+                    width=width, height=width, sh_degree=sh_deg,
+                    near_plane=0.01, far_plane=1e10, packed=False, render_mode="RGB+ED",
+                )
+                img = colors[0]
+                out[int(i)] = (img[..., 3].cpu().numpy().astype(np.float32),
+                               alphas[0, ..., 0].cpu().numpy().astype(np.float32))
+        used = int(sum(1 for v in out if v is not None))
+        ctx.info(f"   遮挡测试：渲染 {used} 个视角的深度/alpha @ {width}px")
+        return out
 
     def _load_bake_inputs(self, ctx: StageContext, cams):
         """纹理烘焙要用的原图与相机参数（与 cams 同序）。
@@ -1060,7 +1104,7 @@ class ExportStage(Stage):
             return mesh
 
     def _finish_mesh(self, ctx: StageContext, mesh, info: dict, out_dir: Path,
-                     cams=None) -> list[dict]:
+                     cams=None, gauss: dict | None = None) -> list[dict]:
         """网格后处理与落盘：去离群 -> 写 obj/ply/glb -> 可选纹理烘焙 -> 预览 -> 统计。
 
         cams：训练相机位姿列表 [(c2w, K, w, h, name)]，给了才做纹理烘焙
@@ -1299,17 +1343,39 @@ class ExportStage(Stage):
                 except Exception as exc:  # noqa: BLE001
                     ctx.warn(f"掩码查找失败（{type(exc).__name__}: {exc}），"
                              f"退回黑像素判据")
+                # ---- 遮挡测试用的逐视角深度（2026-10-31）----
+                #
+                # 只按"朝向最好"选视角时，被遮挡的表面点会采到遮挡物的颜色
+                # （用户反馈的"不同部位纹理杂糅"）。这里渲染一套与烘焙**完全对齐**的
+                # ED 深度，烘焙内部用 z <= d*(1+tol) 剔掉不可见的采样。
+                bake_depths = None
+                if bool(ctx.cfg("mesh_texture_occlusion", True)) and gauss is not None:
+                    try:
+                        bake_depths = self._render_bake_depths(
+                            ctx, gauss, c2ws, ks, whs,
+                            width=int(ctx.cfg("mesh_texture_depth_width", 512) or 512),
+                            max_views=int(ctx.cfg("mesh_texture_max_views", 60) or 60))
+                    except Exception as exc:  # noqa: BLE001
+                        ctx.warn(f"遮挡深度渲染失败（{type(exc).__name__}: {exc}），退回无遮挡采样")
+
                 tex, tinfo = bake_texture_from_views(
                     uv_mesh, uv_tris, uv, images, c2ws, ks, whs, tex_size=tex_size,
+                    depths=bake_depths,
+                    depth_tol_ratio=float(ctx.cfg("mesh_texture_depth_tol", 0.03) or 0.03),
                     # 拒绝采到"黑背景"的像素：`mask.mode=black` 的训练图背景是纯黑
                     # （实测 final-v1 训练图 85.4% 像素为黑），轮廓边缘的采样点会采到
                     # (0,0,0) ⇒ 纹理黑斑（实测黑色 texel 35.99%）。
                     bake_reject_black=bool(ctx.cfg("mesh_texture_reject_black", True)),
                     # 有掩码时**以掩码为准**（原理正确），黑像素判据作为兜底。
                     masks=bake_masks)
+                _occ = int(tinfo.get("samples_rejected_occlusion", 0) or 0)
+                _occ_miss = int(tinfo.get("samples_rejected_occlusion_missing", 0) or 0)
+                _occ_behind = int(tinfo.get("samples_rejected_occlusion_behind", 0) or 0)
                 ctx.info(f"   贴图覆盖 UV 图集 {tinfo['coverage']*100:.1f}%"
                          f"，采样判据={'掩码内' if tinfo.get('mask_used') else '黑像素'}，"
-                         f"拒绝 {tinfo.get('samples_rejected_black', 0):,} 次")
+                         f"拒绝 {tinfo.get('samples_rejected_black', 0):,} 次"
+                         + (f"；遮挡拒绝 {_occ:,} 次（无深度 {_occ_miss:,} / 被挡住 {_occ_behind:,}）"
+                            if _occ else "；遮挡测试未启用"))
 
                 o3d.io.write_triangle_mesh(str(out_dir / "model_mesh_uv.obj"), uv_mesh,
                                            write_vertex_colors=True, write_triangle_uvs=True)
