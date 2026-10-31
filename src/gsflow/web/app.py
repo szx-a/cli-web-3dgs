@@ -33,6 +33,35 @@ paths.apply_runtime_env()
 STATIC_DIR = Path(__file__).parent / "static"
 
 
+def _job_sparse_dir(root: Path) -> Path | None:
+    """优先返回去畸变后的稀疏模型（04_train/data/sparse），否则退回 03_colmap/sparse。
+
+    导出预览用的是去畸变模型（K 与图像严格一致）；用原始带畸变模型会差几个像素，
+    实测使 `/api/render` 与 `preview_*.png` 只到 38.5 dB（本应接近无损）。
+    """
+    from ..gsdata.colmap_io import read_model
+
+    for rel in (("04_train", "data", "sparse"), ("03_colmap", "sparse")):
+        base = root.joinpath(*rel)
+        if not base.exists():
+            continue
+        cands = sorted({p.parent for p in base.rglob("cameras.bin")})
+        if not cands:
+            continue
+        # 有多套时取图像最多的那套
+        best, best_n = None, -1
+        for c in cands:
+            try:
+                n = len(read_model(c).images)
+            except Exception:
+                continue
+            if n > best_n:
+                best, best_n = c, n
+        if best is not None:
+            return best
+    return None
+
+
 def _job_fov_deg(job_id: str) -> float:
     """从该作业的 COLMAP 内参估计水平 FOV（度）。失败返回 0（调用方退回 45°）。"""
     import math
@@ -41,12 +70,12 @@ def _job_fov_deg(job_id: str) -> float:
 
     root = Path(str(load_settings().get("project.workspace_dir"))) / job_id
     try:
-        from ..gsdata.colmap_io import read_model
+        from ..gsdata.colmap_io import read_model  # noqa: F401  (供上方帮助函数复用)
 
-        cands = sorted({p.parent for p in (root / "03_colmap" / "sparse").rglob("cameras.bin")})
-        if not cands:
+        sp = _job_sparse_dir(root)
+        if sp is None:
             return 0.0
-        rec = read_model(max(cands, key=lambda c: len(read_model(c).images)))
+        rec = read_model(sp)
         if not rec.cameras:
             return 0.0
         ratios = []
@@ -507,7 +536,8 @@ def create_app():
     @app.get("/api/render/{job_id}")
     def render(job_id: str, yaw: float = 0.0, pitch: float = 0.0,
                dist: float = 0.0, width: int = 720, height: int = 720,
-               ss: int = 1, aa: int = 0, fov: float = 0.0, minop: float = 0.02):
+               ss: int = 1, aa: int = 0, fov: float = 0.0, minop: float = 0.02,
+               camera: str = "orbit", index: int = 0, bg: str = "dark"):
         """用 gsplat 渲染一帧，返回 PNG。
 
         `yaw`/`pitch` 为角度（度），`dist` 为相机到物体中心的距离
@@ -564,11 +594,37 @@ def create_app():
                 fov_deg = 0.0
         if fov_deg <= 0:
             fov_deg = 45.0
-        fov = math.radians(min(max(fov_deg, 10.0), 120.0))
-        f = 0.5 * height / math.tan(fov / 2.0)   # ← 焦距（像素）；漏了这行会 NameError
-        K = np.array([[f, 0, width / 2.0],
-                      [0, f, height / 2.0],
-                      [0, 0, 1]], dtype=np.float64)
+        use_train = str(camera).strip().lower() in ("train", "training", "pose")
+
+        if use_train:
+            # ---- 用训练相机（与 preview_*.png 完全同视角，便于逐像素对照）----
+            from ..gsdata.colmap_io import read_model as _read_model
+            from ..gsdata.mesh_export import scale_intrinsics as _scale_intrinsics
+
+            root = Path(str(load_settings().get("project.workspace_dir"))) / job_id
+            sp_dir = _job_sparse_dir(root)
+            if sp_dir is None:
+                raise HTTPException(404, "找不到 COLMAP 相机（04_train/data/sparse 或 03_colmap/sparse）")
+            rec = _read_model(sp_dir)
+            imgs = sorted(rec.images, key=lambda im: im.name)
+            if not imgs:
+                raise HTTPException(404, "COLMAP 模型没有图像")
+            im = imgs[max(0, min(int(index), len(imgs) - 1))]
+            cam = rec.cameras[im.camera_id]
+            R, ctr = im.cam_to_world()
+            R = np.asarray(R, dtype=np.float64)
+            ctr = np.asarray(ctr, dtype=np.float64)
+            w2c = np.eye(4, dtype=np.float64)
+            w2c[:3, :3] = R.T
+            w2c[:3, 3] = -R.T @ ctr
+            K = _scale_intrinsics(np.asarray(cam.intrinsics(), dtype=np.float64),
+                                  (int(cam.width), int(cam.height)), (width, height))
+        else:
+            fov = math.radians(min(max(fov_deg, 10.0), 120.0))
+            f = 0.5 * height / math.tan(fov / 2.0)   # ← 焦距（像素）
+            K = np.array([[f, 0, width / 2.0],
+                          [0, f, height / 2.0],
+                          [0, 0, 1]], dtype=np.float64)
 
         try:
             from ..gsdata.shio import render_view
@@ -604,9 +660,16 @@ def create_app():
                 img = img[..., :3]
             if a.ndim == 3:
                 a = a[..., 0]
-            # 与 canvas 背景同色，便于对比
-            bg = np.array([0.02, 0.03, 0.045], dtype=np.float32)
-            comp = img * a[..., None] + bg * (1.0 - a[..., None])
+            # 背景色：dark = 与画布一致（默认）；white = 与 preview_*.png 的合成一致；black
+            _bgn = str(bg or "dark").strip().lower()
+            if _bgn == "white":
+                bg_color = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+            elif _bgn == "black":
+                bg_color = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            else:
+                bg_color = np.array([0.02, 0.03, 0.045], dtype=np.float32)
+            # ⚠ img 是**预乘**颜色（gsplat RGB 模式），这里不能再乘 alpha，否则边缘发暗。
+            comp = img + bg_color * (1.0 - a[..., None])
             if ss_i > 1:
                 from PIL import Image as _Im
                 comp = np.asarray(_Im.fromarray((np.clip(comp, 0, 1) * 255).astype(np.uint8))
