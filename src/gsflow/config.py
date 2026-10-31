@@ -432,7 +432,7 @@ DEFAULTS: dict[str, Any] = {
         #   viewer_html 单文件离线查看器
         #   spz / splat 需额外依赖；obj 为点云 OBJ
         # 默认给出用户要求的三种查看产物：点云(ply/glb) + 网格 + （可选）带贴图网格
-        "formats": ["glb_points", "mesh", "viewer_html", "splat"],
+        "formats": ["glb_points", "glb_gauss", "splat", "mesh", "viewer_html"],
         "glb_max_points": 800000,
         "glb_shrink": 1.0,
         "viewer_cdn": "",         # 留空则用本地静态查看器

@@ -330,6 +330,23 @@ class ExportStage(Stage):
                              "desc": "点云式 glTF，通用查看器可直接打开"})
             ctx.success(f"已导出 {glb_path.name}（{produced[-1]['size_mb']} MB）")
 
+        # ---- 完整高斯 glb（`glb_gauss`）：质量优先，保留全部 59 维参数 ----
+        #
+        # 用户指出"glb 只有几 MB 是质量问题，不是压缩"：旧实现只写 POSITION+COLOR_0，
+        # 丢了协方差/不透明度/球谐 ⇒ 只能是稀疏点阵。这里写成 glTF 私有属性（诚实、通用、
+        # 不需要插件也能被通用查看器当点云打开），并把语义写进 extensions/extras。
+        if "glb_gauss" in formats or "glb_full" in formats:
+            try:
+                gp = out_dir / "model_gauss.glb"
+                self._write_glb_gaussians(gp, gauss)
+                produced.append({"kind": "glb_gauss", "path": gp.name,
+                                 "size_mb": round(gp.stat().st_size / 1024 / 1024, 2),
+                                 "gaussians": int(len(gauss["xyz"])),
+                                 "desc": "完整高斯 glTF（位置/尺度/旋转/不透明度/48 个 SH，236 B/高斯）"})
+                ctx.success(f"已导出 {gp.name}（{gp.stat().st_size/1024/1024:.1f} MB，含完整高斯参数）")
+            except Exception as exc:  # noqa: BLE001
+                ctx.warn(f"完整高斯 glb 导出失败（不影响其它产物）：{type(exc).__name__}: {exc}")
+
         # ---- `.splat`（32 字节/高斯）：让查看器能渲染**真正的高斯** ----
         #
         # 用户反馈"GUI 查看器里的模型比 preview_front.png 差很多"。查清原因：
@@ -1446,6 +1463,125 @@ class ExportStage(Stage):
         return out
 
     # ------------------------------------------------------------------ GLB
+    def _write_glb_gaussians(self, path: Path, gauss: dict) -> Path:
+        """把**完整** 3DGS 参数写进 glTF 2.0（POINTS + 私有属性 + 扩展声明）。"""
+        import numpy as np
+
+        n = int(gauss.get("n") or len(gauss["xyz"]))
+        xyz = np.asarray(gauss["xyz"], dtype=np.float32).reshape(n, 3).copy()
+        xyz[:, 1] *= -1.0
+        xyz[:, 2] *= -1.0
+
+        scales = np.asarray(gauss["scales"], dtype=np.float32).reshape(n, 3)
+        quats = np.asarray(gauss["quats"], dtype=np.float32).reshape(n, 4)
+        opac = np.asarray(gauss["opacity"], dtype=np.float32).reshape(n, 1)
+        shs = np.asarray(gauss["shs"], dtype=np.float32).reshape(n, -1, 3)
+        # f_rest 在训练侧存的是激活后的残差；这里直接存**原始 SH 系数**
+        # （shio 已把 f_dc/f_rest 还原成 SH 值），下游按标准 3DGS 公式渲染。
+        sh_rest = shs[:, 1:, :]                      # [N, K, 3]
+        n_rest = int(sh_rest.shape[1])
+        rest_flat = sh_rest.reshape(n, n_rest * 3)    # [N, K*3]
+        n_vec4 = (n_rest * 3 + 3) // 4
+        pad = n_vec4 * 4 - n_rest * 3
+        if pad:
+            rest_flat = np.concatenate(
+                [rest_flat, np.zeros((n, pad), dtype=np.float32)], axis=1)
+        rest_vec4 = rest_flat.reshape(n, n_vec4, 4)
+        base_color = (shs[:, 0, :] * 0.28209479177387814 + 0.5).clip(0, 1)  # SH DC → RGB
+
+        blobs: list[bytes] = []
+        views: list[dict] = []
+        accessors: list[dict] = []
+        offset = 0
+
+        def add(data: np.ndarray, kind: str, comp_type: int = 5126) -> int:
+            nonlocal offset
+            raw = np.ascontiguousarray(data).tobytes()
+            pad4 = (-len(raw)) % 4
+            views.append({"buffer": 0, "byteOffset": offset, "byteLength": len(raw),
+                          "target": 34962})
+            blobs.append(raw + b"\x00" * pad4)
+            offset += len(raw) + pad4
+            acc = {"bufferView": len(views) - 1, "componentType": comp_type,
+                   "count": n, "type": kind}
+            if kind == "VEC3":
+                flat = np.asarray(data).reshape(n, -1)
+                acc["min"] = [float(flat[:, i].min()) for i in range(flat.shape[1])]
+                acc["max"] = [float(flat[:, i].max()) for i in range(flat.shape[1])]
+            accessors.append(acc)
+            return len(accessors) - 1
+
+        a_pos = add(xyz, "VEC3")
+        a_scale = add(scales, "VEC3")
+        a_rot = add(quats, "VEC4")
+        a_opac = add(opac, "SCALAR")
+        a_sh = [add(rest_vec4[:, i, :], "VEC4") for i in range(n_vec4)]
+        a_color = add((base_color * 255).astype(np.uint8), "VEC3", 5121)
+
+        attributes = {
+            "POSITION": a_pos,
+            "COLOR_0": a_color,
+            "_GS_SCALE": a_scale,
+            "_GS_ROTATION": a_rot,
+            "_GS_OPACITY": a_opac,
+        }
+        for i, acc in enumerate(a_sh):
+            attributes[f"_GS_SH_{i:02d}"] = acc
+
+        gltf = {
+            "asset": {"version": "2.0", "generator": "gsflow (gaussian splatting)"},
+            "extensionsUsed": ["KHR_materials_unlit", "GSFLOW_gaussian_splatting"],
+            "extensions": {"GSFLOW_gaussian_splatting": {
+                "version": 1,
+                "gaussianCount": n,
+                "shDegree": int(gauss.get("sh_degree") or 0),
+                "shRestVec4": n_vec4,
+                "attributes": {"scale": "_GS_SCALE", "rotation": "_GS_ROTATION",
+                               "opacity": "_GS_OPACITY", "shRest": "_GS_SH_*"},
+                "note": "rotation is (w,x,y,z); shRest are the SH coefficients of bands 1..3, "
+                        "flattened 4-per-accessor (K*3 values, zero padded).",
+            }},
+            "scene": 0,
+            "scenes": [{"nodes": [0]}],
+            "nodes": [{"mesh": 0, "name": "gaussians"}],
+            "meshes": [{
+                "name": "gaussians",
+                "primitives": [{
+                    "attributes": attributes,
+                    "mode": 0,
+                    "material": 0,
+                    "extensions": {"GSFLOW_gaussian_splatting": {}},
+                }],
+            }],
+            "materials": [{
+                "name": "splat",
+                "pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1],
+                                         "metallicFactor": 0.0, "roughnessFactor": 0.6},
+                "extensions": {"KHR_materials_unlit": {}},
+            }],
+            "buffers": [{"byteLength": offset}],
+            "bufferViews": views,
+            "accessors": accessors,
+            "extras": {"gaussian_count": n, "source": "3dgs-ply",
+                       "bytes_per_gaussian": 236,
+                       "note": "full 3DGS parameters included; generic viewers fall back to POINTS+COLOR_0"},
+        }
+
+        import json
+        import struct
+
+        bin_blob = b"".join(blobs)
+        json_bytes = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
+        json_bytes += b" " * ((-len(json_bytes)) % 4)
+        total = 12 + 8 + len(json_bytes) + 8 + len(bin_blob)
+        with path.open("wb") as fh:
+            fh.write(struct.pack("<III", GLB_MAGIC, 2, total))
+            fh.write(struct.pack("<II", len(json_bytes), JSON_CHUNK))
+            fh.write(json_bytes)
+            fh.write(struct.pack("<II", len(bin_blob), BIN_CHUNK))
+            fh.write(bin_blob)
+        return path
+
     def _write_glb(self, path: Path, gauss: dict, shrink: float = 1.0) -> Path:
         """写最小可用的 glTF 2.0（POINTS 图元 + 顶点色 + 可选缩放）。"""
         xyz = gauss["xyz"] * float(shrink)
