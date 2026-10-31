@@ -30,8 +30,11 @@ W = H = 512
 
 
 def latest_ply(jd: Path) -> Path:
-    return sorted((jd / "04_train" / "point_cloud").glob("*/point_cloud.ply"),
-                  key=lambda p: int("".join(c for c in p.parent.name if c.isdigit()) or 0))[-1]
+    # ⚠ 必须按**修改时间**取最新：实验作业是从旧作业整目录复制的，
+    # 里面带着旧的 iteration_60000；按序号排会拿到那个旧检查点
+    # （实测 img5-dense 曾因此评出与 solid-v3 完全相同的数字）。
+    return max((jd / "04_train" / "point_cloud").glob("*/point_cloud.ply"),
+               key=lambda p: p.stat().st_mtime)
 
 
 def sharp(x: np.ndarray) -> float:
