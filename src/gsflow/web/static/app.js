@@ -1006,8 +1006,15 @@ async function renderCurrentViewOnServer() {
     return;
   }
   const cam = window.GsViewer.getCamera();
-  const w = Math.max(320, Math.min(1200, ($('m-canvas') ? $('m-canvas').width : 720) || 720));
-  const h = Math.max(320, Math.min(1200, ($('m-canvas') ? $('m-canvas').height : 720) || 720));
+  // 必须按**屏幕实际像素**请求（2026-10-31）：
+  // 旧写法夹在 320~1200 且用 canvas.width（设备像素）与 CSS 尺寸不一致时会被拉伸
+  // ⇒ 看起来比 512² 的 preview_*.png 糊。这里用布局尺寸 × devicePixelRatio，下限 768。
+  const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  const cvEl = $('m-canvas');
+  const cw = cvEl ? (cvEl.clientWidth || cvEl.width || 720) : 720;
+  const ch = cvEl ? (cvEl.clientHeight || cvEl.height || 720) : 720;
+  const w = Math.round(Math.max(768, Math.min(1600, cw * dpr)));
+  const h = Math.round(Math.max(768, Math.min(1600, ch * dpr)));
   const url = `/api/render/${encodeURIComponent(job)}`
     + `?yaw=${cam.yaw.toFixed(3)}&pitch=${cam.pitch.toFixed(3)}`
     + `&dist=${cam.dist.toFixed(4)}&width=${w}&height=${h}`;

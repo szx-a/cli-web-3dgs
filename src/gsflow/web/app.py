@@ -507,7 +507,7 @@ def create_app():
     @app.get("/api/render/{job_id}")
     def render(job_id: str, yaw: float = 0.0, pitch: float = 0.0,
                dist: float = 0.0, width: int = 720, height: int = 720,
-               ss: int = 2, aa: int = 1, fov: float = 0.0, minop: float = 0.02):
+               ss: int = 1, aa: int = 0, fov: float = 0.0, minop: float = 0.02):
         """用 gsplat 渲染一帧，返回 PNG。
 
         `yaw`/`pitch` 为角度（度），`dist` 为相机到物体中心的距离
@@ -578,6 +578,13 @@ def create_app():
             # 交互式渲染以前直接用客户端画布尺寸（常常 640×480）出图，再被 CSS 放大
             # ⇒ 看起来比 512² 的 preview_*.png 糊。这里先按 ss 倍渲染再缩小，
             # 并启用 antialiased 光栅化（Mip-Splatting 的 2D 低通），两者叠加能明显减少锯齿与糊感。
+            # ⚠ 实测（2026-10-31，512² 同一训练相机，黑底合成）：
+            #   A 1× classic        与真值 PSNR 17.26 dB（最优）
+            #   B 2× classic        16.65 dB
+            #   C 2× antialiased    16.20 dB
+            #   D 1× antialiased    16.25 dB
+            # ⇒ 模型是用 classic 训练的，额外的超采样/低通**只会变糊**，不提升保真度。
+            # 因此默认 ss=1 / aa=0（与 preview_*.png 完全一致），想要柔化效果可显式传 ss/aa。
             ss_i = max(1, min(int(ss), 4))
             rw, rh = width * ss_i, height * ss_i
             Ks = K.copy()
