@@ -454,6 +454,19 @@ class ExportStage(Stage):
         # （docs/03 G108/G116）。正确做法是用社区验证过的渲染器
         # `@mkkellogg/gaussian-splats-3d`（MIT，three.js，原生支持 3DGS PLY 59 维含 SH），
         # 并把依赖一起复制到导出目录，使产物**自包含、可离线双击打开**。
+        # ---- 紧凑 PLY（只含 DC，约 23% 体积）：回答"PLY 太大"的实用选项 ----
+        if "ply_compact" in formats:
+            try:
+                cp = out_dir / "model_compact.ply"
+                nbytes = self._write_compact_ply(cp, gauss)
+                produced.append({"kind": "ply_compact", "path": cp.name,
+                                 "size_mb": round(nbytes / 1024 / 1024, 2),
+                                 "gaussians": int(len(gauss["xyz"])),
+                                 "desc": "紧凑 PLY（无高阶 SH，颜色不随视角变化；体积约为完整 PLY 的 23%）"})
+                ctx.success(f"已导出 {cp.name}（{nbytes/1024/1024:.1f} MB，无高阶 SH）")
+            except Exception as exc:  # noqa: BLE001
+                ctx.warn(f"紧凑 PLY 导出失败（不影响其它产物）：{type(exc).__name__}: {exc}")
+
         if "splat" in formats or "ply_full" in formats:
             try:
                 ref = self._write_viewer_splat(ctx, gauss, out_dir)
@@ -2040,6 +2053,46 @@ class ExportStage(Stage):
         return out
 
     # ------------------------------------------------------------------ 查看器
+    def _write_compact_ply(self, path: Path, gauss: dict) -> int:
+        """写"只含 DC 颜色"的紧凑 PLY（无高阶 SH），返回字节数。
+
+        注意：不能用 `plyfile` 直接复制原文件再删属性（会保留原始头部字节），
+        这里显式构造 17 列。
+        """
+        import numpy as np
+        from plyfile import PlyData, PlyElement
+
+        xyz = np.asarray(gauss["xyz"], dtype=np.float32).reshape(-1, 3)
+        n = len(xyz)
+        nrm = gauss.get("normals")
+        nrm = (np.asarray(nrm, dtype=np.float32).reshape(-1, 3)
+               if nrm is not None else np.zeros((n, 3), dtype=np.float32))
+        rgb = gauss.get("rgb")
+        if rgb is not None:
+            dc = np.asarray(rgb, dtype=np.float32).reshape(-1, 3) / 255.0
+        else:
+            dc = np.asarray(gauss["shs"], dtype=np.float32).reshape(n, -1, 3)[:, 0, :]
+        op = np.asarray(gauss["opacity"], dtype=np.float32).reshape(-1, 1)
+        sc = np.asarray(gauss["scales"], dtype=np.float32).reshape(-1, 3)
+        ro = np.asarray(gauss["quats"], dtype=np.float32).reshape(-1, 4)
+
+        fields = ([(f"x{i}", "f4") for i in "xyz"] and
+                  [("x", "f4"), ("y", "f4"), ("z", "f4"),
+                   ("nx", "f4"), ("ny", "f4"), ("nz", "f4"),
+                   ("f_dc_0", "f4"), ("f_dc_1", "f4"), ("f_dc_2", "f4"),
+                   ("opacity", "f4"),
+                   ("scale_0", "f4"), ("scale_1", "f4"), ("scale_2", "f4"),
+                   ("rot_0", "f4"), ("rot_1", "f4"), ("rot_2", "f4"), ("rot_3", "f4")])
+        arr = np.zeros(n, dtype=fields)
+        arr["x"], arr["y"], arr["z"] = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+        arr["nx"], arr["ny"], arr["nz"] = nrm[:, 0], nrm[:, 1], nrm[:, 2]
+        arr["f_dc_0"], arr["f_dc_1"], arr["f_dc_2"] = dc[:, 0], dc[:, 1], dc[:, 2]
+        arr["opacity"] = op[:, 0]
+        arr["scale_0"], arr["scale_1"], arr["scale_2"] = sc[:, 0], sc[:, 1], sc[:, 2]
+        arr["rot_0"], arr["rot_1"], arr["rot_2"], arr["rot_3"] = ro[:, 0], ro[:, 1], ro[:, 2], ro[:, 3]
+        PlyData([PlyElement.describe(arr, "vertex")], text=False).write(str(path))
+        return path.stat().st_size
+
     def _write_viewer_splat(self, ctx: StageContext, gauss: dict, out_dir: Path) -> dict | None:
         """生成**自包含**的 3D 高斯查看器（用社区参考实现渲染）。
 

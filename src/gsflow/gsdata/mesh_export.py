@@ -1578,6 +1578,29 @@ def bake_texture_from_views(mesh, uv_tris, uv, images, c2ws, ks, src_whs,
         tex[fill_now] = acc[fill_now] / cnt[fill_now][:, None]
         filled[fill_now] = True
 
+    # ---- 第三步：向 UV 岛**外侧**膨胀若干圈（gutter padding，2026-10-31）----
+    #
+    # 只填三角形内部不够：岛与岛之间的缝隙仍是纯黑，渲染器做双线性采样时，
+    # 边缘 texel 会掺进缝隙（发暗）或掺进**相邻岛**的颜色（不同部位颜色被混在一起）。
+    # 这里把未填充像素向外染 MARGIN 圈；已采样的 texel 不会被覆盖，所以不会跨岛污染。
+    pad_px = max(2, int(margin_px) * 2)
+    for _ in range(pad_px):
+        acc = np.zeros_like(tex)
+        cnt = np.zeros(filled.shape, dtype=np.float32)
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                sh_t = np.roll(np.roll(tex, dy, axis=0), dx, axis=1)
+                sh_f = np.roll(np.roll(filled, dy, axis=0), dx, axis=1)
+                acc += sh_t * sh_f[..., None]
+                cnt += sh_f
+        fill_now = (~filled) & (cnt > 0)
+        if not fill_now.any():
+            break
+        tex[fill_now] = acc[fill_now] / cnt[fill_now][:, None]
+        filled[fill_now] = True
+
     return ((np.clip(tex, 0, 1) * 255).astype(np.uint8),
             {"tex_size": tex_size, "coverage": float(filled.mean()),
              "views_used": len(cams),
@@ -1585,6 +1608,7 @@ def bake_texture_from_views(mesh, uv_tris, uv, images, c2ws, ks, src_whs,
         "samples_rejected_occlusion": int(n_occluded),
              "samples_rejected_occlusion_missing": int(n_occ_missing),
              "samples_rejected_occlusion_behind": int(n_occ_behind),
+             "coverage_with_gutter": float(filled.mean()),
              "mask_used": bool(masks is not None)})
 
 
