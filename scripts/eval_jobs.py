@@ -56,7 +56,11 @@ def main() -> int:
         op = np.asarray(g["opacity"], np.float64).reshape(-1)
         if op.max() > 1.5:
             op = 1.0 / (1.0 + np.exp(-op))
-        center = (xyz.min(0) + xyz.max(0)) / 2.0
+        # ⚠ 用 1%/99% 分位数估中心：MCMC 的噪声会留下远处浮点，
+        # min/max 中心会被拉偏 ⇒ 近距离相机看到空处（实测 img5-mcmc 全黑）。
+        lo = np.percentile(xyz, 1.0, axis=0)
+        hi = np.percentile(xyz, 99.0, axis=0)
+        center = (lo + hi) / 2.0
 
         # ---- \u8fd1\u8ddd\u79bb\u6e05\u6670\u5ea6\uff08\u540c\u4e00\u76f8\u673a\uff09----
         sp = jd / "04_train" / "data" / "sparse"

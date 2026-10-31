@@ -1974,7 +1974,8 @@ def train(cfg: TrainConfig, ctx) -> dict:
             if n_after != n_before:
                 refresh_params()
                 if step % 500 == 0 or abs(n_after - n_before) > 5000:
-                    ctx.info(f"step {step} 官方密度控制：{n_before} -> {n_after} 个高斯")
+                    _label = "MCMC 重定位" if _is_mcmc else "官方密度控制"
+                    ctx.info(f"step {step} {_label}：{n_before} -> {n_after} 个高斯")
             else:
                 refresh_params()
         # 判据必须在这里用缓存量：zero_grad 之后 means.grad 已是 None，
