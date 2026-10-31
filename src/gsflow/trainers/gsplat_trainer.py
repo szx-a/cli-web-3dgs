@@ -41,6 +41,8 @@ class TrainConfig:
     iterations: int = 30000
     resolution: int = 1600            # 长边
     sh_degree: int = 3
+    # SH 阶数递增（官方 `sh_degree_interval=1000`）：0 = 关闭（固定用 sh_degree）。
+    sh_degree_interval: int = 1000
     data_device: str = "cuda"
     # 高斯数量上限（显存守护）。**必须与 config.DEFAULTS['train']['cap_max'] 保持一致** ——
     # 运行时以配置系统为准，dataclass 只是兜底；两处不一致会造成"改了不生效"的错觉。
@@ -1379,6 +1381,12 @@ def train(cfg: TrainConfig, ctx) -> dict:
             ctx.warn(f"未知的 rasterize_mode={_rm!r}，回退 classic")
             _rm = 'classic'
         _raster_mode = _rm
+        # SH 阶数递增：先学几何，再学视角相关颜色（官方同款）。
+        _sh_iv = int(getattr(cfg, "sh_degree_interval", 0) or 0)
+        if _sh_iv > 0:
+            _cur_sh_degree = int(min(int(cfg.sh_degree), int(step) // _sh_iv))
+        else:
+            _cur_sh_degree = int(cfg.sh_degree)
         colors, alphas, meta = rasterization(
             means=means,
             quats=quats / (quats.norm(dim=-1, keepdim=True) + 1e-8),
@@ -1389,7 +1397,7 @@ def train(cfg: TrainConfig, ctx) -> dict:
             Ks=kk[None],
             width=gt.shape[1],
             height=gt.shape[0],
-            sh_degree=cfg.sh_degree,
+            sh_degree=_cur_sh_degree,
             near_plane=0.01,
             far_plane=1e10,
             packed=False,

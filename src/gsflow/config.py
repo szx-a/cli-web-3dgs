@@ -133,6 +133,8 @@ DEFAULTS: dict[str, Any] = {
         "iterations": 30000,
         "resolution": 1600,       # 长边；0 = 原图
         "sh_degree": 3,
+        # SH 阶数递增（官方 gsplat 默认 1000）；0 = 关闭（固定阶数）。
+        "sh_degree_interval": 1000,
         "data_device": "cuda",
         # 高斯数量上限（显存守护）。实测：8GB 卡上 557k 高斯训练正常，
         # 1.5M 会明显吃紧；真实大场景可上调，小场景可下调。
