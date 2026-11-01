@@ -10,6 +10,49 @@
 
 ---
 
+<!-- TOC -->
+## 目录
+
+- [一、这是什么](#sec-1)
+- [二、实测数据（同一套代码，三份素材）](#sec-2)
+- [三、创新与关键取舍（都是实测结论，不是论文口号）](#sec-3)
+  - [3.1 确定性拍摄模式判定（mask-aware）](#sec-3-1)
+  - [3.2 背景合成监督（全图损失分解）](#sec-3-2)
+  - [3.3 退火式"推实"正则（crispness）](#sec-3-3)
+  - [3.4 深度语义统一（ED 而非Σwz）](#sec-3-4)
+  - [3.5 网格封闭性：一条**可证明**的判据](#sec-3-5)
+  - [3.6 期望深度精修：带回溯的单调下降](#sec-3-6)
+  - [3.7 指标族：把"观感"拆成可计算的量](#sec-3-7)
+  - [3.8 实验性（本地测试中，**未纳入推荐**）：视线级不透明度下限](#sec-3-8)
+  - [3.9 深度集中度正则：把"朦胧"变成可优化的量](#sec-3-9)
+  - [3.10 细节梯度损失：让高斯"有质感"](#sec-3-10)
+  - [3.11 贴图烘焙的遮挡测试：治"不同部位纹理杂糅"](#sec-3-11)
+  - [3.12 为什么 `model.glb` 那么小 —— 那是**丢质量**，现在默认导出完整高斯 glb](#sec-3-12)
+  - [关键更正：小的 glb 是**有损**的](#sec-glb)
+  - [3.13 加轮数值得吗：60k → 100k 的实测](#sec-3-13)
+  - [3.14 按目标选配置：最好 PSNR / 最好 LPIPS / LPIPS 极限（2026-11-01 实测）](#sec-3-14)
+  - [3.15 新测数据与取舍趋势（2026-11-01）](#sec-3-15)
+- [四、安装](#sec-4)
+  - [方式 A：可视化安装器（推荐）](#sec-A)
+  - [方式 B：脚本](#sec-B)
+  - [硬件与约束（本机实测基线）](#sec-ha2ac30)
+- [五、跑一个作业](#sec-5)
+  - [5.1 CLI 全流程（推荐先跑一遍这个）](#sec-5-1)
+  - [5.2 Web GUI 全流程（同一套流程核心，等价于上面的命令）](#sec-5-2)
+  - [5.3 两种常见用法](#sec-5-3)
+  - [5.4 流程逻辑（数学）：每一步的公式与默认值](#sec-5-4)
+- [五之二、参数速查（关键项）](#sec-5-5)
+- [六、数据怎么拍（决定上限的第一因素）](#sec-6)
+- [七、质量体检工具（本项目最实用的部分）](#sec-7)
+- [八、架构](#sec-8)
+- [九、迭代路径（为什么现在是这个样子）](#sec-9)
+- [十、已知限制（不粉饰）](#sec-10)
+- [十一、测试与闸门](#sec-10-2)
+- [十二、许可](#sec-10-3)
+
+<!-- /TOC -->
+
+<a id="sec-1"></a>
 ## 一、这是什么
 
 把"拍一段物体视频 → 得到一个能看的 3D 模型"这件事**工程化**：
@@ -28,6 +71,7 @@
 
 ---
 
+<a id="sec-2"></a>
 ## 二、实测数据（同一套代码，三份素材）
 
 | 素材 | 帧数 | COLMAP | 稀疏点 | 重投影 | 掩码内 PSNR | 掩码内 SSIM | 全图 PSNR | 白边 | 彩度 |
@@ -45,6 +89,7 @@
 
 ---
 
+<a id="sec-3"></a>
 ## 三、创新与关键取舍（都是实测结论，不是论文口号）
 
 1. **确定性拍摄模式判定**：同一素材两次跑出不同掩码模式（orbit vs turntable）曾导致 SSIM 0.9267 vs 0.9485。
@@ -68,6 +113,7 @@
 
 ---
 
+<a id="sec-3-1"></a>
 ### 3.1 确定性拍摄模式判定（mask-aware）
 
 转台（物体转、背景不动）与环绕（相机绕物体转、背景随视角变化）在数学上是**两类不同的相机模型假设**：
@@ -80,6 +126,7 @@ $s_b$ 小 ⇒ 背景静止 ⇒ 转台；$s_b$ 大 ⇒ 环绕。本项目要求**
 （检测器输入原始帧 + 掩码，采样 12 帧成对比较），否则掩码把背景涂黑后差异被人为抹平，
 同一素材两次运行可能给出不同模式（实测 SSIM 0.9267 vs 0.9485）。
 
+<a id="sec-3-2"></a>
 ### 3.2 背景合成监督（全图损失分解）
 
 只在掩码内取均值时，损失量级随前景占比漂移（实测各视角前景 12%~55% ⇒ 同误差下 loss 差 4.6 倍），
@@ -96,6 +143,7 @@ $$\mathcal{L}=\frac{1}{|\Omega|}\left[\sum_{M}\ell(C,I)+\sum_{\bar M}\ell(C,b)\r
 第二项正是"物体外不许生成高斯"的软约束（$\ell$ 取 L1）。配套地，掩码用形态学腐蚀
 $M_\epsilon = M\ominus K_\epsilon$（`mask_erode_px`）收缩，避免把掩码外沿的亮背景学成轮廓高光。
 
+<a id="sec-3-3"></a>
 ### 3.3 退火式"推实"正则（crispness）
 
 对不透明度加对称惩罚
@@ -131,6 +179,7 @@ $$\mathcal{L}_{\text{floor}}=\lambda_f\ \frac1N\sum_j\mathrm{relu}(f-\alpha_j),
 ⇒ **几乎免费**，因此自 2026-10-26 起**默认开启**（`train.opacity_floor=0.10`、`opacity_floor_reg=0.5`）。
 注意它与"容量"有耦合：`quality` 预设把 `cap_max` 压到 300k 时，同样的下限只能把 `op<0.1` 降到 61.8%。
 
+<a id="sec-3-4"></a>
 ### 3.4 深度语义统一（ED 而非Σwz）
 
 一条视线的期望深度是**归一化**的加权平均
@@ -150,6 +199,7 @@ $$\mathbf{n}=\frac{\mathbf{P}_u\times\mathbf{P}_v}{|\mathbf{P}_u\times\mathbf{P}
 其中 $\mathbf{m}=K^{-1}[u,v,1]^{T}$。用未归一化深度时，$z_u$ 被 $w$ 的梯度污染，
 正对相机的平面会算出偏离 $26.6^\circ$ 的法线（实测）；用 ED 则给出 $[0,0,-1]$（偏差小于 1°，有单测）。
 
+<a id="sec-3-5"></a>
 ### 3.5 网格封闭性：一条**可证明**的判据
 
 网格是二维复形，其边界算子 $\partial$ 作用在面集合上。**封闭**（无水密性漏洞）等价于
@@ -168,6 +218,7 @@ $$\partial_2(F\cup H)=\emptyset$$
 Open3D 的 `is_watertight()` 仍返回 False（实测边界边已归零却仍判 False，正是朝向不一致）。
 实测 img5：边界边 $3278\to0$、面数 $278{,}810\to282{,}088$、`closed=True`。
 
+<a id="sec-3-6"></a>
 ### 3.6 期望深度精修：带回溯的单调下降
 
 把网格顶点 $x_v$ 投影到视角 $i$，比较其深度 $z_v$ 与 ED 深度 $D_i(u_v)$，沿法线做**阻尼**位移
@@ -185,6 +236,7 @@ $$\eta_{k+1}=\frac12\eta_k,\qquad x^{(k+1)}=x^{\star}$$
 这是 ICP 的标准 backtracking，保证 $r^{(k)}$ 单调不增。实测：不加回溯时残差 $0.0643\to0.0789$（越修越糟），
 加上之后 $0.0643\to0.0551$（−14%，6 轮收敛）。
 
+<a id="sec-3-7"></a>
 ### 3.7 指标族：把"观感"拆成可计算的量
 
 | 指标 | 判读 |
@@ -206,6 +258,7 @@ $$\chi=\mathrm{mean}_{u}\left(\max_c C_c-\min_c C_c\right)$$
 
 $$\rho=\frac{|M\setminus M_{gt}|}{|M_{gt}|}$$
 
+<a id="sec-3-8"></a>
 ### 3.8 实验性（本地测试中，**未纳入推荐**）：视线级不透明度下限
 
 设每条视线的累计不透明度 $T(u)=1-\prod_j(1-\alpha_j(u))$，对其加单边下限
@@ -224,6 +277,7 @@ $$\mathcal{L}_{\text{ray}}=\frac{1}{|\mathcal{M}|}\sum_{u\in\mathcal{M}}
 
 ---
 
+<a id="sec-3-9"></a>
 ### 3.9 深度集中度正则：把"朦胧"变成可优化的量
 
 3.8 的负结果说明"朦胧"不是累计不透明度不足（$T$ 中位 0.99），而是**同一条视线上颜色的来源分布在很多不同深度**：
@@ -279,6 +333,7 @@ $$\mathcal{L}_{\text{var}}=\frac{1}{|\mathcal{M}|}\sum_{u\in\mathcal{M}}
 > 与 2DGS 原式的差别：那边是 $L_1$ 型成对差、需自定义核；这里是二阶矩（$L_2$ 型），
 > 两者都压"深度分散"，但不相等。实测证据见 `scripts/probe_depth_variance.py`。
 
+<a id="sec-3-10"></a>
 ### 3.10 细节梯度损失：让高斯"有质感"
 
 颜色损失、SSIM、LPIPS 都**奖励"平均掉高频"**的解：把纹理抹平能同时降低 L1 与 LPIPS。
@@ -329,6 +384,7 @@ $$\mathcal{L}_{\mathrm{grad}}=\lambda_g\ \frac{1}{|\mathcal{M}|}\sum_{u\in\mathc
 > 配置：`train.lambda_grad`（默认 **0.3**；`solid` 预设 1.0）、`train.grad_warmup`（0.2，前 20% 不施加）。
 > 指标：`scripts/probe_texture_quality.py`（梯度能量比 / 高频能量比 / 高频相关）。
 
+<a id="sec-3-11"></a>
 ### 3.11 贴图烘焙的遮挡测试：治"不同部位纹理杂糅"
 
 原来的烘焙只按**朝向最好**挑视角（`facing = -(N·vd) > 0.15`），没有任何遮挡判断。
@@ -375,6 +431,7 @@ $$
 渲染器双线性采样时会掺进缝隙（发暗）或掺进相邻岛（另一种"杂糅"）。现在向外膨胀若干圈，
 且只写未填充像素，不会覆盖已采样 texel、也不会跨岛污染。
 
+<a id="sec-3-12"></a>
 ### 3.12 为什么 `model.glb` 那么小 —— 那是**丢质量**，现在默认导出完整高斯 glb
 
 因为两者存的**不是同一件东西**：PLY 是完整的 3DGS 参数（训练格式），glb/贴图是渲染用的精简表示。
@@ -407,6 +464,7 @@ $$
 * 想保留视角相关效果（金属、玻璃、湿瓦）→ 用 `.ply` 或 `.splat`；
 * 想进 Blender/Unity/网页、体积小 → 用贴图网格（代价是失去视角相关高光）。
 
+<a id="sec-glb"></a>
 ### 关键更正：小的 glb 是**有损**的
 
 旧的 `model.glb` 只有 `POSITION + COLOR_0`（约 15 B/高斯）——**尺度、旋转、不透明度、48 个球谐全丢了**，
@@ -426,6 +484,7 @@ $$
 > 想要"更小且不掉太多质量"：用 `model.splat`（12.4 MB，保留协方差与不透明度，只丢高阶 SH）；
 > 想要"绝对质量"：用 `model_gauss.glb` 或 `.ply`。`export.formats` 可自选组合。
 
+<a id="sec-3-13"></a>
 ### 3.13 加轮数值得吗：60k → 100k 的实测
 
 用户问"能不能加训练轮数、提高细节、减少模糊"。同一份数据、同一 `solid` 预设，只改
@@ -448,6 +507,7 @@ $$
 **建议**：要 LPIPS/观感就留在 60k，把预算花在 `lambda_lpips` 与细节梯度（3.10）上；
 要像素保真/深度一致性再用 100k，并接受 2.4 倍时间。
 
+<a id="sec-3-14"></a>
 ### 3.14 按目标选配置：最好 PSNR / 最好 LPIPS / LPIPS 极限（2026-11-01 实测）
 
 三条命令，同一份数据（img5，8 个留出视角，论文对齐的 LPIPS 实现）：
@@ -483,13 +543,71 @@ GUI 里同样可选：训练表单的**密度控制算法**下拉框（`builtin`
 
 端到端验收（img5-off）：网格 295,092 面（边界边 0/非流形 0）、贴图一致性中位误差 0.0430（无遮挡 0.1642，-74%）、`model_gauss.glb` 111.4 MB 无损。
 
+<a id="sec-3-15"></a>
+### 3.15 新测数据与取舍趋势（2026-11-01）
+
+![配置取舍](docs/figs/fig_tradeoff.png)
+
+同一份数据（img5、8 个留出视角、论文对齐 LPIPS 实现）的六个配置：
+
+| 配置 | 命令要点 | LPIPS | 掩码 PSNR | 高斯数 | 用时 |
+|---|---|---|---|---|---|
+| `solid` 60k（旧预设）| `--preset solid` | 0.2116 | 35.38 | 405,629 | 77 min |
+| `official` 60k（builtin）| `--preset official --set train.densify_strategy=builtin` | **0.2076** | 34.93 | 465,388 | 63 min |
+| `official` 60k（AbsGS）| `--preset official` | 0.2095 | **35.65** | 600,000 | 73 min |
+| `mcmc` 60k（SGLD 5e5）| `--preset official --set train.densify_strategy=mcmc` | **0.2053** | 32.32 | 600,000 | 73 min |
+| `mcmc` 60k（noise 1e5）| 同上 + `--set train.mcmc_noise_lr=1e5` | 0.2074 | 32.33 | 600,000 | 76 min |
+| 100k 步（builtin）| `--preset official --set train.iterations=100000` | 0.2131 | **36.06** | 600,412 | 145 min |
+
+**怎么读这张图**
+
+* 三个方向是**互相冲突**的：感知（LPIPS）最好的 `mcmc` 逐像素最差（−3 dB）；
+  像素最好的 100k 步反而 LPIPS 最差；`official`（AbsGS）落在中间偏上——**PSNR/时长最均衡**。
+* 加轮数（60k→100k）**提 PSNR、降 LPIPS 表现**：+0.68 dB 换来 LPIPS +0.0015、时间 2.4×。
+* 提高 LPIPS 权重（λ 0.05→0.10）实测**更差**（0.2116→0.2158），不要靠调这个。
+* 真正把 LPIPS 拉下来的是**算法替换**（MCMC）与**细节梯度损失**（`lambda_grad` 0.3→1.0，已设为默认）。
+
+> 数据来源：`workspace/img5-{solid-v3,off,absgs4,mcmc,mcmc2,long}`；
+> 复现：`scripts\gpu_python.cmd scripts\eval_jobs.py img5-off img5-absgs4 img5-mcmc`。
+
+<a id="sec-4"></a>
 ## 四、安装
 
+<a id="sec-A"></a>
 ### 方式 A：可视化安装器（推荐）
 
 ```bat
 python installer\gsflow_installer.py
 ```
+
+**具体步骤（Windows，全新机器）**
+
+1. 装 **Python 3.11–3.13**（勾选 *Add python.exe to PATH*），并确认 `python -V` 可用；
+2. 下载/解压本仓库到**非中文、非空格**路径（例如 `D:\gsflow`），至少预留 **12 GB**；
+3. 双击或在仓库根目录执行上面的命令，安装器会依次做：
+   * 用 **uv** 建虚拟环境 `env\venv`（不污染系统 Python）；
+   * 把 `src` 通过 `.pth` 挂进环境（无需 `pip install -e .`）；
+   * 安装依赖（`requirements.txt`）与 **torch cu128 + gsplat 1.5.3**（约 2.6 GB）；
+   * 下载外部工具与权重（ffmpeg/COLMAP/VGG16 等，可跳过）；
+   * 生成 `config\config.toml` 并把 `workspace_dir` 指向本机；
+   * 最后自动跑一次 `gsflow doctor` 自检。
+4. 安装完成后校验（三条都应成功）：
+
+```bat
+env\venv\Scripts\python.exe -m gsflow doctor
+scripts\gsflow.cmd doctor
+scripts\web.cmd            & rem 打开 http://127.0.0.1:8787
+```
+
+5. 跑第一条训练（GUI：选预设 **official** 后点运行；CLI 如下）：
+
+```bat
+scripts\gsflow.cmd run --video data\x.mp4 --job-id first --preset official
+```
+
+> 安装器细节：`installer\gsflow_installer.py`（编排 + 进度可视化）、
+> `installer\bundle.py`（打包离线轮子）。`gsplat` **锁 1.5.3**——
+> 我们的密度控制代码依赖它的策略 API（`DefaultStrategy` 无 `cap_max`、`MCMCStrategy` 签名差异）。
 
 三页向导：**环境检测**（Python / uv / Tkinter / GPU / 磁盘 / 写权限）→ **安装路径 + 组件勾选**
 （core / gpu / segment / tools / weights，可勾"复用已有安装"省数 GB 流量）→ **安装**（实时日志）。
@@ -505,6 +623,7 @@ python installer\gsflow_installer.py --check-only          :: 只检测，不安
 
 安装器**不含测试内容**（不复制 `tests/`、不预置实验产物），可安装到任意目录。
 
+<a id="sec-B"></a>
 ### 方式 B：脚本
 
 ```powershell
@@ -512,6 +631,7 @@ powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1 -All
 scripts\gsflow.cmd doctor
 ```
 
+<a id="sec-ha2ac30"></a>
 ### 硬件与约束（本机实测基线）
 
 | 项 | 值 |
@@ -522,11 +642,13 @@ scripts\gsflow.cmd doctor
 | 实测速度 | 30k 迭代、~200 视图、1600 长边 ≈ **16 分钟**；quality 预设（60k + 每步 LPIPS）≈ **45–75 分钟** |
 
 
+<a id="sec-5"></a>
 ## 五、跑一个作业
 
 > 这一节是**照做就能跑通**的操作流程。原理与参数见 [`docs/05-训练框架.md`](docs/05-训练框架.md)，
 > 完整参数速查见本文件「五之二」。
 
+<a id="sec-5-1"></a>
 ### 5.1 CLI 全流程（推荐先跑一遍这个）
 
 ```bat
@@ -572,6 +694,7 @@ workspace\img5\
   logs\events.jsonl     全部事件（进度、告警、失败原因）
 ```
 
+<a id="sec-5-2"></a>
 ### 5.2 Web GUI 全流程（同一套流程核心，等价于上面的命令）
 
 ```bat
@@ -592,6 +715,7 @@ scripts\web.cmd            :: 启动后打开 http://127.0.0.1:8787
 > **GUI 与 CLI 完全等价**：界面提交的参数会拍平成 `--set a.b=c`，等价命令显示在「新建作业」下方，
 > 可以直接复制到终端执行或写进脚本。
 
+<a id="sec-5-3"></a>
 ### 5.3 两种常见用法
 
 ```bat
@@ -637,6 +761,7 @@ scripts\gsflow.cmd run --video data\x.mp4 --job-id final --preset solid
 
 ---
 
+<a id="sec-5-4"></a>
 ### 5.4 流程逻辑（数学）：每一步的公式与默认值
 
 > 这一节把五个阶段的**核心公式 + 代码里的默认值**逐条列出，便于核对实现、也便于改参数时知道自己在动哪个量。
@@ -769,6 +894,7 @@ $$E_{\text{stretch}}=\sum_t A_t(| J_t|_F^2+| J_t^{-1}|_F^2),$$
 再按可见性加权采样 $T(x)=\sum_i w_i(x)I_i(\pi_i(x))/\sum_i w_i(x)$，
 `mesh_texture_size=2048`（实测 UV 覆盖 100%、黑 texel 0.00%）。
 
+<a id="sec-5-5"></a>
 ## 五之二、参数速查（关键项）
 
 > 完整默认值见 src/gsflow/config.py:DEFAULTS；这里只列**直接影响质量**的项。
@@ -813,6 +939,7 @@ $$E_{\text{stretch}}=\sum_t A_t(| J_t|_F^2+| J_t^{-1}|_F^2),$$
 
 > **为什么看掩码内指标**：psnr_masked / ssim_masked 只在掩码内计算，是黑底模式下唯一有意义的画质指标；全图 PSNR 会把“背景是否合成正确”混进来。
 
+<a id="sec-6"></a>
 ## 六、数据怎么拍（决定上限的第一因素）
 
 | 要点 | 原因（实测） |
@@ -826,6 +953,7 @@ $$E_{\text{stretch}}=\sum_t A_t(| J_t|_F^2+| J_t^{-1}|_F^2),$$
 
 ---
 
+<a id="sec-7"></a>
 ## 七、质量体检工具（本项目最实用的部分）
 
 一条命令跑全部：
@@ -852,6 +980,7 @@ env\venv\Scripts\python.exe scripts\check_quality_suite.py --job img5 --no-gpu :
 
 ---
 
+<a id="sec-8"></a>
 ## 八、架构
 
 ```
@@ -885,6 +1014,7 @@ workspace/作业目录/
 
 ---
 
+<a id="sec-9"></a>
 ## 九、迭代路径（为什么现在是这个样子）
 
 这个项目是**用实测把每个"看起来对"的做法推翻**长出来的，完整记录在
@@ -906,6 +1036,7 @@ workspace/作业目录/
 
 ---
 
+<a id="sec-10"></a>
 ## 十、已知限制（不粉饰）
 
 * **薄壳结构**（屋檐、瓦片、栏杆）在网格化时仍会被并成一片；本项目的办法是水密化 + ED 精修，
@@ -917,6 +1048,7 @@ workspace/作业目录/
 
 ---
 
+<a id="sec-10-2"></a>
 ## 十一、测试与闸门
 
 ```bat
@@ -928,6 +1060,7 @@ env\venv\Scripts\python.exe scripts\final_acceptance.py --job img5
 
 ---
 
+<a id="sec-10-3"></a>
 ## 十二、许可
 
 [MIT](LICENSE)。第三方组件：gsplat（Apache-2.0）、COLMAP（BSD）、FFmpeg（LGPL/GPL）、

@@ -322,9 +322,15 @@ def install(plan: Plan, runner: Runner) -> bool:
                  "torch", "torchvision"]) != 0:
             log("torch 安装失败（可稍后重试）")
             return False
-        if pipi(["gsplat"]) != 0:
-            log("gsplat 安装失败")
-            return False
+        # ⚠ 必须锁版本（2026-11-01）：密度控制代码依赖 gsplat 1.5.x 的策略 API。
+        #   * 1.5.3 的 DefaultStrategy 没有 cap_max 参数（改为在训练循环里强制上限）；
+        #   * MCMCStrategy.step_post_backward 要求传 lr、且不接受 packed。
+        # 不锁版本会出现「安装成功但训练行为变了」这种最难排查的故障。
+        if pipi(["gsplat==1.5.3"]) != 0:
+            log("gsplat==1.5.3 安装失败，回退为不锁版本（可能影响密度控制行为）")
+            if pipi(["gsplat"]) != 0:
+                log("gsplat 安装失败")
+                return False
 
     if "segment" in plan.components:
         log("安装分割后端...")

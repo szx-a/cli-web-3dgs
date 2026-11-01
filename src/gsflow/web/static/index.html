@@ -119,7 +119,7 @@
           <label class="grow">训练后端
             <select id="p-train-backend">
               <option value="gsplat">gsplat（默认，免编译）</option>
-              <option value="official">official（原版，需自编译）</option>
+              <option value="official" selected>official（原版，需自编译）</option>
               <option value="external">external（自备脚本）</option>
             </select>
           </label>
@@ -127,7 +127,7 @@
         <div class="row">
           <label class="grow">训练预设（preset）
             <select id="p-train-preset">
-              <option value="">balanced（当前默认）</option>
+              <option value="">balanced（快速验证：30k、无 LPIPS）</option>
               <option value="quality">quality（质量优先：60k + 每步 LPIPS + 2DGS 面元正则，约 45–75 分钟）</option>
               <option value="solid">solid（实心优先：加不透明度下限正则，观感更“实”，画质略降）</option>
               <option value="official">official（官方对齐：不透明度重置 + absgrad + SH 递增 + 高容量，实测 LPIPS 最优）</option>

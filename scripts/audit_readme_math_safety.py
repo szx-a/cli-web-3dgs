@@ -81,6 +81,12 @@ def main() -> int:
             continue
         if s.startswith(">"):
             continue
+        # HTML 注释与显式锚点（目录用）里的 `<` / `>` 是合法标记，不是正文裸尖括号。
+        # 2026-11-01 加：README 目录用 `<!-- TOC -->` + `<a id="sec-*"></a>` 实现。
+        if s.startswith("<!--") or s.endswith("-->"):
+            continue
+        if s.startswith("<a id=") and s.endswith("</a>"):
+            continue
         no_math = re.sub(r"\$[^$\n]+?\$", "", ln)
         no_code = re.sub(r"`[^`]*`", "", no_math)
         for ch in "<>":

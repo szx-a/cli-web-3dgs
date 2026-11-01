@@ -256,7 +256,7 @@ class TrainConfig:
     # 深度集中度正则（2DGS 成对失真的 L2 对应量，可微）
     lambda_depth_var: float = 1.0            # 权重（0=关）；实测 1.0 方差 -60% 且画质无损
     # 细节梯度损失（质感）
-    lambda_grad: float = 0.3                # 0 = 关闭；实测 0.3 时 PSNR +2.0 dB
+    lambda_grad: float = 1.0                # 0 = 关闭；实测 0.3 时 PSNR +2.0 dB
     grad_warmup: float = 0.2                # 前 N% 迭代不施加
     depth_var_warmup: float = 0.3            # 前 N% 迭代不施加
     depth_var_mode: str = "var"              # var / std / rvar

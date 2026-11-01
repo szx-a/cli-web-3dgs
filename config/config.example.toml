@@ -1,5 +1,8 @@
 # gsflow 示例配置：复制为 config.toml 后按本机情况修改。
 # 注意：config.toml 不入库（它含本机绝对路径）。
+# 本文件由 config.toml 同步生成（scripts/sync_example_config.py），
+# 所以训练默认值（不透明度重置 3000、densify_until 14000、opacity_floor 0.02、
+# SH 递增 1000、lpips_backend 等）与代码保持一致。
 
 [project]
 name = "gsflow"
@@ -59,13 +62,14 @@ backend = "gsplat"
 iterations = 30000
 resolution = 1600
 sh_degree = 3
+sh_degree_interval = 1000
 data_device = "cuda"
 cap_max = 600000
 eval = true
 fp16 = false
 seed = 42
 densify_from = 500
-densify_until = 4000
+densify_until = 14000
 densify_interval = 100
 densify_quantile = 0.0
 auto_crop = true
@@ -78,6 +82,7 @@ densify_criterion = "grad2d"
 densify_grad2d_threshold = 0.0002
 densify_grad_max = 0.005
 densify_strategy = "builtin"
+mcmc_noise_lr = 500000.0
 flatten_2dgs = false
 flatten_log_scale = -6.0
 grow_scale3d = 0.01
@@ -85,7 +90,7 @@ prune_scale3d = 0.1
 prune_scale_after_reset = true
 revised_opacity = 0.1
 prune_opacity = 0.005
-opacity_reset_interval = 0
+opacity_reset_interval = 3000
 opacity_decay = 1.0
 opacity_decay_interval = 50
 utilization_prune_interval = 0
@@ -111,9 +116,17 @@ sh_rest_reg = 0.003
 sh_rest_max = 0.0
 opacity_crisp_reg = 0.02
 opacity_crisp_warmup = 0.7
-opacity_floor = 0.0
-opacity_floor_reg = 0.0
+opacity_floor = 0.02
+opacity_floor_reg = 0.2
 opacity_floor_warmup = 0.5
+lambda_depth_var = 1.0
+depth_var_warmup = 0.3
+depth_var_mode = "var"
+lambda_grad = 1.0
+grad_warmup = 0.2
+ray_opacity_floor = 0.9
+ray_opacity_reg = 0.0
+ray_opacity_warmup = 0.3
 opacity_init = 0.1
 min_opacity_final = 0.0
 lr_opacities = 0.025
@@ -124,6 +137,7 @@ lr_quats = 0.001
 lambda_lpips = 0.0
 lpips_every = 1
 lpips_size = 224
+lpips_backend = "vgg16"
 eval_metrics = true
 best_metric = "psnr"
 lambda_depth_distortion = 0.0
@@ -134,7 +148,7 @@ depth_distortion_mode = "tv"
 extra_args = ""
 
 [export]
-formats = ["glb_points", "mesh", "viewer_html", "splat"]
+formats = ["glb_points", "glb_gauss", "splat", "mesh", "viewer_html"]
 glb_max_points = 800000
 glb_shrink = 1.0
 viewer_cdn = ""
@@ -155,6 +169,9 @@ mesh_texture = false
 mesh_texture_size = 2048
 mesh_texture_timeout = 300
 mesh_texture_reject_black = true
+mesh_texture_occlusion = true
+mesh_texture_depth_tol = 0.12
+mesh_texture_depth_width = 1024
 mesh_drop_unseen = true
 mesh_min_views = 1
 mesh_consistency_min_views = 2
