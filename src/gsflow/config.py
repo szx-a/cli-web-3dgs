@@ -648,7 +648,16 @@ class Settings:
                 nxt = {}
                 cur[part] = nxt
             cur = nxt
-        cur[parts[-1]] = _coerce(value)
+        # ⚠ 类型感知地解释字面量（2026-11-01）：
+        # `_coerce` 会把 "off"/"on" 当成布尔（对 `--set train.xxx=true` 很方便），
+        # 但**字符串型配置**（如 `train.lpips_backend` 取 `off`）就会变成 False，
+        # 于是 `LPIPS(backend=False)` 抛 ValueError、GUI 传 `off` 静默失效。
+        # 这里：若该键已存在且当前值是字符串，则保留原始字符串（只剥引号）。
+        _cur = cur.get(parts[-1], None)
+        if isinstance(_cur, str) and isinstance(value, str):
+            cur[parts[-1]] = value.strip().strip("'\"")
+        else:
+            cur[parts[-1]] = _coerce(value)
 
     def save(self, path: Path | None = None) -> Path:
         target = path or CONFIG_FILE

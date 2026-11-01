@@ -119,3 +119,20 @@ def test_preset_official_resolves() -> None:
     assert float(s.get("train.lambda_lpips")) > 0
     assert float(s.get("train.opacity_floor")) <= 0.05
     assert int(s.get("train.cap_max")) >= 600000
+
+
+def test_new_gui_params_reach_config() -> None:
+    """GUI 提交的嵌套 params 拍平后必须真正落到配置（否则"界面能选但不生效"）。"""
+    from gsflow.web.app import _flatten_params
+
+    flat = _flatten_params({"train": {
+        "densify_strategy": "mcmc",
+        "lpips_backend": "off",
+        "mcmc_noise_lr": 1e5,
+        "lpips_size": 320,
+    }})
+    s = load(flat)
+    assert s.get("train.densify_strategy") == "mcmc"
+    assert s.get("train.lpips_backend") == "off"
+    assert float(s.get("train.mcmc_noise_lr")) == 1e5
+    assert int(s.get("train.lpips_size")) == 320
