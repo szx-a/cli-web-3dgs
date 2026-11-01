@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import sys
+import sys
 import tomllib
 from dataclasses import fields
 from pathlib import Path
@@ -30,6 +31,7 @@ def main() -> int:
         on_disk = tomllib.load(f)
 
     bad = 0
+    drift = 0
     for section, defaults in DEFAULTS.items():
         if not isinstance(defaults, dict):
             continue
@@ -43,9 +45,10 @@ def main() -> int:
         diff = {k: (defaults[k], disk[k]) for k in defaults
                 if k in disk and disk[k] != defaults[k]}
         if diff:
-            print(f"\n[{section}] 默认值不一致：")
+            print(f"\n[{section}] 默认值不一致（config.toml 会**覆盖**代码默认）：")
             for k, (a, b) in diff.items():
                 print(f"    {k}: 代码={a!r}  文件={b!r}")
+            drift += len(diff)
 
     # TrainConfig dataclass 与 DEFAULTS['train'] 必须一致
     td = {f.name: f.default for f in fields(TrainConfig)}
@@ -74,6 +77,13 @@ def main() -> int:
 
     print("\n结论: " + ("配置同步一致" if bad == 0
                         else f"**{bad} 项不一致，需处理**"))
+    if drift:
+        # ⚠️ 2026-11-01：以前值漂移**打印了却仍说"一致"**，导致 GUI 显示 absgrad=true
+        # 而代码默认 false 时被误判为没有问题。现在必须显式说明。
+        print(f"     另有 **{drift} 项值偏离代码默认**"
+              f"（config.toml 会覆盖代码默认，GUI 上看到的不一定是代码默认值）")
+    if drift and any(a == '--strict' for a in sys.argv[1:]):
+        return 2
     return 0 if bad == 0 else 1
 
 

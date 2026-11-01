@@ -1994,11 +1994,32 @@ def train(cfg: TrainConfig, ctx) -> dict:
                     _keep_idx = torch.topk(_op, _cap, largest=True).indices
                     _keep = torch.zeros_like(_op, dtype=torch.bool)
                     _keep[_keep_idx] = True
+                    _n_before = _n_now
                     _apply_keep(params, optimizers, _keep)
                     refresh_params()
-                    n_over = _n_now - _cap
-                if step % 500 == 0:
-                    ctx.info(f"step {step} 上限强制：{_n_now} -> {_cap}（剪掉 {n_over} 个最低不透明度）")
+                    n_over = _n_before - _cap
+                    # ⚠ 关键：把策略 state 里"每高斯一条"的张量**按存活索引切片**。
+                    # 不能重建（initialize_state 会把累积量清零 ⇒ 下一步 grad2d/count 虚高
+                    # ⇒ 又疯狂克隆，实测每 100 步反弹 2.2–2.6 万，形成反复增删）。
+                    # 也不能不管（会 `size of tensor a (607867) vs b (600000)` 崩）。
+                    try:
+                        for _k, _v in list(gs_state.items()):
+                            if torch.is_tensor(_v) and _v.dim() >= 1 and int(_v.shape[0]) == _n_before:
+                                gs_state[_k] = _v[_keep]
+                    except Exception as _exc:  # noqa: BLE001
+                        ctx.warn(f"策略统计量切片失败（{type(_exc).__name__}），下一步可能尺寸不一致")
+                # ---- 预算已满：剪一次后**提前结束致密化**，避免"克隆-剪枝"反复 ----
+                if not _is_mcmc:
+                    try:
+                        _stop = int(getattr(gs_strategy, "refine_stop_iter", 10 ** 9))
+                        if int(step) < _stop:
+                            gs_strategy.refine_stop_iter = int(step)
+                            ctx.info(f"step {step} 预算已满（{_cap}）：提前结束致密化"
+                                     f"（refine_stop_iter { _stop } -> {step}）")
+                    except Exception as _exc:  # noqa: BLE001
+                        ctx.warn(f"提前结束致密化失败（{type(_exc).__name__}）")
+                ctx.info(f"step {step} 上限强制：{_n_now} -> {_cap}"
+                         f"（剪掉 {n_over} 个最低不透明度，统计量按存活索引切片）")
             n_after = int(params["means"].shape[0])
             if n_after != n_before:
                 refresh_params()
