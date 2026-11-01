@@ -448,23 +448,40 @@ $$
 **建议**：要 LPIPS/观感就留在 60k，把预算花在 `lambda_lpips` 与细节梯度（3.10）上；
 要像素保真/深度一致性再用 100k，并接受 2.4 倍时间。
 
-### 3.14 预设 `official`：当前画质最好的组合（2026-10-31 实测）
+### 3.14 按目标选配置：最好 PSNR / 最好 LPIPS / LPIPS 极限（2026-11-01 实测）
 
-| 指标 | `solid`（旧）| **`official`（新）** | 提升 |
-|---|---|---|---|
-| LPIPS | 0.2116 | **0.2076** | −1.9% |
-| 掩码 PSNR | **35.38** | 34.93 | −0.45 dB |
-| 3× 放大清晰度 | 0.00535 | **0.01314** | **2.5×** |
-| 3× 保持率 | 26% | **59%** | +33 pt |
-| 高斯数 / 尺度中位 | 405,629 / 0.0051 | 465,388 / 0.0043 | 更密更小 |
+三条命令，同一份数据（img5，8 个留出视角，论文对齐的 LPIPS 实现）：
 
-它对齐了官方 gsplat 的三件事：**不透明度重置（3000 步）**、**更长的致密化窗口（14k）**、
-**SH 阶数递增（每 1000 步升一阶）**；同时把 `opacity_floor` 从 0.10 降到 0.02、
-启用 AbsGS 绝对梯度（`absgrad=true`）、上限提到 900k（本次用 600k 验证）。
+| 目标 | 命令 | LPIPS | 掩码 PSNR | 高斯数 | 训练时长 |
+|---|---|---|---|---|---|
+| **最好 PSNR** | `--preset official` | 0.2095 | **35.65 dB** | 600,000 | 73 min |
+| **最好 LPIPS** | `--preset official --set train.densify_strategy=builtin` | **0.2076** | 34.93 dB | 465,388 | 63 min |
+| **LPIPS 极限** | `--preset official --set train.densify_strategy=mcmc` | **0.2053** | 32.32 dB | 600,000 | 73 min |
 
-用法：`gsflow run --preset official ...`（CLI 与 GUI 都可用）。
+对照（旧版 `solid`）：LPIPS 0.2116、PSNR 35.38、405,629 高斯 —— 三档都比它好。
 
-端到端验收（img5-off）：网格 295,092 面（边界边 0/非流形 0）、贴图一致性中位误差 0.0430（无遮挡 0.1642，−74%）、`model_gauss.glb` 111.4 MB 无损。
+```powershell
+# 1) 最好 PSNR（AbsGS：DefaultStrategy + 绝对梯度）
+scripts\gsflow.cmd run --video data\x.mp4 --job-id final --preset official
+
+# 2) 最好 LPIPS（换回内置密度控制，absgrad 不再生效）
+scripts\gsflow.cmd run --video data\x.mp4 --job-id final --preset official --set train.densify_strategy=builtin
+
+# 3) LPIPS 极限（3DGS-MCMC：SGLD 噪声 + 重定位；代价约 -3 dB PSNR）
+scripts\gsflow.cmd run --video data\x.mp4 --job-id final --preset official --set train.densify_strategy=mcmc
+```
+
+GUI 里同样可选：训练表单的**密度控制算法**下拉框（`builtin` / `official` / `mcmc`）+
+**MCMC 噪声幅度**；预设下拉框里有 `official`。
+
+`official` 预设对齐了官方 gsplat 的三件事：**不透明度重置（3000 步）**、
+**更长的致密化窗口（14000）**、**SH 阶数递增（每 1000 步升一阶）**；
+并把 `opacity_floor` 从 0.10 降到 0.02、启用 AbsGS（`absgrad=true`，走 official 策略）。
+
+> 取舍要看交付目的：`official` 的 PSNR 最好，`builtin` 变体的 LPIPS 最好，
+> `mcmc` 的感知最优但逐像素最差（32.32 dB）。三者都比旧的 `solid` 好。
+
+端到端验收（img5-off）：网格 295,092 面（边界边 0/非流形 0）、贴图一致性中位误差 0.0430（无遮挡 0.1642，-74%）、`model_gauss.glb` 111.4 MB 无损。
 
 ## 四、安装
 
@@ -589,9 +606,12 @@ scripts\gsflow.cmd run --video data\x.mp4 --job-id final --preset solid
 
 | 预设 | 内容 | 适用 |
 |---|---|---|
-| `balanced` | 当前默认（30k、densify_until 4000、内置密度控制）| 快速验证 |
-| `quality` | 60k、`cap_max` 300k、densify_until 10000、每步 LPIPS 0.05、2DGS 面元正则 0.02、推实正则 0.05（warmup 0.4）| **画质优先** |
-| `solid` | 在 `quality` 基础上加**单边不透明度下限**（`opacity_floor=0.10`，reg 0.5，warmup 0.3）+ `cap_max` 400k | **推荐**：画质与实心度同时更好 |
+| `balanced` | 当前默认（30k、densify_until 14000、不透明度重置 3000、SH 递增 1000、内置密度控制）| 快速验证 |
+| `quality` | 60k、`cap_max` 300k、densify_until 10000、每步 LPIPS 0.05、2DGS 面元正则 0.02、推实正则 0.05（warmup 0.4）| 画质优先 |
+| `solid` | 在 `quality` 基础上加**单边不透明度下限**（`opacity_floor=0.02`，reg 0.2，warmup 0.3）+ `cap_max` 400k | 实心优先（旧方案，已被 `official` 超越）|
+| `official` | 60k、`cap_max` 900k、densify_until 14000、**不透明度重置 3000**、**SH 递增 1000**、`opacity_floor=0.02`、**AbsGS（official 策略 + absgrad）** | **默认推荐**：PSNR 最好（35.65 dB），LPIPS 0.2095 |
+
+> 按目标挑配置的完整命令与三档实测对比见 **3.14**。
 
 **实测（img5，8 个留出视角，同一把论文对齐的尺子）**：
 
