@@ -501,7 +501,18 @@ class ExportStage(Stage):
             "complete": True,
         }
         (out_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        return StageResult(artifacts=[str(out_dir / "manifest.json")], metrics=manifest,
+        # ⚠ 产物必须**逐个登记**（2026-11-01）：
+        # 只登记 manifest.json 时，GUI 的产物列表（读 job.json 的 stages.artifacts）
+        # 就只显示一个清单文件，用户在界面上**看不到 model_gauss.glb**。
+        _paths: list[str] = []
+        for _a in produced:
+            _rel = _a.get("path") if isinstance(_a, dict) else None
+            if _rel:
+                _p = out_dir / str(_rel)
+                if _p.exists():
+                    _paths.append(str(_p))
+        _paths.append(str(out_dir / "manifest.json"))
+        return StageResult(artifacts=_paths, metrics=manifest,
                            message=f"导出 {len(produced)} 个产物")
 
     # ------------------------------------------------------------------ 读取

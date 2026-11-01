@@ -111,6 +111,47 @@ def create_app():
     app = FastAPI(title="gsflow", description="AI 图像清理 + 3DGS 全流程 GUI", version="0.1.0")
     manager = JobManager()
 
+    def _merge_export_manifest(root: Path, data: dict) -> None:
+        """把 `05_export/manifest.json` 里登记的产物补进 `stages.export.artifacts`。
+
+        历史作业的 job.json 只登记了 `manifest.json` 一个产物，于是 GUI 的产物列表里
+        看不到 `model_gauss.glb` / 网格 / 贴图。这里按 manifest 补齐。
+
+        ⚠ 只能追加**字符串路径**：`job_detail` 随后会调用 `_normalize_artifacts()`，
+        它对每个元素做 `str(a)` 再当路径解析 —— 追加字典会被字符串化，
+        生成 `rel = "{'path': ...}"` 这种垃圾（并导致 404）。实测踩过。
+        """
+        import json as _json
+
+        man = root / "05_export" / "manifest.json"
+        if not man.exists():
+            return
+        stages = data.get("stages")
+        if not isinstance(stages, dict):
+            return
+        ex = stages.get("export")
+        if not isinstance(ex, dict):
+            return
+        try:
+            payload = _json.loads(man.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return
+        entries = payload.get("artifacts") or []
+        arts = ex.get("artifacts")
+        if not isinstance(arts, list):
+            arts = []
+            ex["artifacts"] = arts
+        have = {Path(str(a).replace("\\", "/")).name for a in arts}
+        for e in entries:
+            rel = e.get("path") if isinstance(e, dict) else None
+            if not rel:
+                continue
+            p = root / "05_export" / str(rel)
+            if not p.exists() or p.name in have:
+                continue
+            arts.append(str(p))
+            have.add(p.name)
+
     def _normalize_artifacts(data: dict[str, Any], job_id: str) -> dict[str, Any]:
         """把每个阶段的产物路径归一化成**可下载的相对路径 + URL**。
 
@@ -689,7 +730,10 @@ def create_app():
     @app.get("/api/jobs/{job_id}")
     def job_detail(job_id: str) -> dict[str, Any]:
         try:
+            _root = Path(str(load_settings().get("project.workspace_dir"))) / job_id
             data = load_job(job_id, Path(str(load_settings().get("project.workspace_dir"))))
+            # 历史作业的 job.json 只登记了 manifest.json，这里按 manifest 补齐产物
+            _merge_export_manifest(_root, data)
         except FileNotFoundError as exc:
             raise HTTPException(404, str(exc)) from exc
         return _normalize_artifacts(data, job_id)

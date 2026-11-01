@@ -329,7 +329,11 @@ async function showJob(jobId) {
       //    端点 `/api/artifacts/...` 对目录**正确地**返回 404（它只服务文件），
       //    所以目录**不能再渲染成可点击链接** —— 否则用户一点就是
       //    "Failed to load resource: 404"。目录用无链接的样式标出即可。
-      el.innerHTML = '产物：' + arts.slice(0, 12).map((a) => {
+      // ⚠ 不能截断（旧写法 slice(0,12)）：导出产物常有 15+个，
+      // 截断后 `model_gauss.glb` / 网格 / 贴图会**被静默隐藏**（用户反馈“GUI 里没显示”）。
+      el.style.maxHeight = '9.5em';
+      el.style.overflowY = 'auto';
+      el.innerHTML = `产物（${arts.length}）：` + arts.map((a) => {
         const label = (a && (a.rel || a.name)) ? (a.rel || a.name) : String(a);
         const isDir = /\/$/.test(label) || (a && a.is_dir);
         if (isDir) return `<span class="dim" title="目录（不提供直接下载）">${label}/</span>`;
