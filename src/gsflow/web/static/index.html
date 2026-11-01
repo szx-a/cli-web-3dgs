@@ -130,6 +130,7 @@
               <option value="">balanced（当前默认）</option>
               <option value="quality">quality（质量优先：60k + 每步 LPIPS + 2DGS 面元正则，约 45–75 分钟）</option>
               <option value="solid">solid（实心优先：加不透明度下限正则，观感更“实”，画质略降）</option>
+              <option value="official">official（官方对齐：不透明度重置 + absgrad + SH 递增 + 高容量，实测 LPIPS 最优）</option>
             </select>
           </label>
           <label class="grow">迭代次数
@@ -146,10 +147,43 @@
         </div>
         <div class="row">
           <label class="grow">密度控制窗口上界（densify_until）
-            <input id="p-train-densify" type="number" step="500" value="4000">
+            <input id="p-train-densify" type="number" step="500" value="14000">
           </label>
           <label class="grow">掩码内损失占比（mask_loss_until）
             <input id="p-train-maskloss" type="number" step="0.05" min="0" max="1" value="1.0">
+          </label>
+        </div>
+        <div class="row">
+          <label class="grow">密度控制算法（densify_strategy）
+            <select id="p-densify-strategy">
+              <option value="builtin">builtin（本项目实现，已验证；absgrad 不生效）</option>
+              <option value="official">official（官方 DefaultStrategy；AbsGS 的 absgrad 只有这里生效）</option>
+              <option value="mcmc">mcmc（3DGS-MCMC：SGLD 噪声 + 重定位；实测 LPIPS 最低但 PSNR −3 dB）</option>
+            </select>
+          </label>
+          <label class="grow">MCMC 噪声幅度（noise_lr）
+            <input id="p-mcmc-noise" type="number" step="10000" min="0" value="500000"
+                   title="仅 mcmc 生效。官方默认 5e5；实测降到 1e5 不会恢复 PSNR">
+          </label>
+        </div>
+        <div class="row">
+          <label class="grow">LPIPS 算法
+            <select id="p-lpips-backend">
+              <option value="vgg16">内置 VGG16 · 论文线性权重（默认，与历史评测可比）</option>
+              <option value="vgg16_uniform">内置 VGG16 · 层等权（消融/诊断）</option>
+              <option value="off">关闭（不计算 LPIPS，等价 λ=0）</option>
+            </select>
+          </label>
+          <label class="grow">LPIPS 输入尺寸
+            <select id="p-lpips-size">
+              <option value="224">224（默认，最快，论文口径）</option>
+              <option value="320">320（更看重细粒度差异，约 +40% 耗时）</option>
+              <option value="448">448（最严格，约 +3 倍耗时）</option>
+            </select>
+          </label>
+          <label class="grow">LPIPS 权重 λ
+            <input id="p-train-lpips" type="number" step="0.01" min="0" value="0"
+                   title="0 = 不启用；solid/official 预设会覆盖为 0.05。实测 0.10 反而更差">
           </label>
         </div>
         <div class="row">
@@ -167,11 +201,12 @@
                    title="decay 方案填衰减系数（如 0.999）；剪枝方案填分位（如 0.2）">
           </label>
         </div>
-        <p class="hint" id="opacityclean-hint">选择后会在下方「等价 CLI」里生成对应参数；
-          默认 <b>none</b>。实测（同数据 8000 迭代）：官方重置会让 PSNR 掉 0.59 dB，其余方案见 docs/03 G84。</p>
+        <p class="hint" id="opacityclean-hint">选择后会在下方「等价 CLI」里生成对应参数；默认 <b>none</b>。
+          <b>注意</b>：官方「周期重置」已包含在 <b>official</b> 预设里（配合更长致密化窗口与 absgrad），
+          本项的手工方案用于消融对照；历史单开重置的对照见 docs/03 G84 与 docs/09。</p>
         <p class="hint">8GB 显存建议：150~250 张图 / 长边 1400~1600 / 迭代 15000~30000。
-          实测：<b>densify_until=4000</b> 比官方默认 15000 更省（高斯少 68%）
-          且不会过训练退化。注意 <b>resolution 只会缩小、不会放大</b>：
+          实测：<b>densify_until=14000</b>（官方量级）比 4000 的高斯更多、近距离更清晰；
+          显存紧张可回调到 8000–10000。注意 <b>resolution 只会缩小、不会放大</b>：
           若素材原生长边小于该值，会按原生尺寸训练（放大不增加信息、只会更慢）。</p>
         <details class="adv">
           <summary>高级参数（任意配置项，每行 <code>段.键=值</code>）</summary>

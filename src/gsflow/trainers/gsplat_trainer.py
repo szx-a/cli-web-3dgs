@@ -65,7 +65,7 @@ class TrainConfig:
     #     densify_until= 2500         57,174 高斯   最终 28.71 dB（不再退化）
     # 即"少一半高斯、PSNR 反而高 7.8 dB"。故默认下调到 4000，
     # 大场景请显式调大（--set train.densify_until=15000）。
-    densify_until: int = 4000
+    densify_until: int = 14000
     densify_interval: int = 100
     # 加密判据：位置梯度范数超过阈值。
     # 实测校准：某场景 step 500 时 grad_norm 均值约 2e-4、最大约 1.2e-2；
@@ -152,7 +152,7 @@ class TrainConfig:
     # ⇒ 要启用重置，必须先补上官方的"梯度累积 ÷ 可见次数"统计量
     #   （即把 gsplat 的 DefaultStrategy 完整移植过来）。
     #   在那之前，默认 0（关闭）是更稳的选择。
-    opacity_reset_interval: int = 0
+    opacity_reset_interval: int = 3000
     # ---- 不透明度重置的**替代方案**（用户方案第 5 项）----
     # 为什么需要替代：官方的周期重置是一次**不连续跳变**（把 logit 不透明度硬钳到
     # logit(0.01)）。实测后果：所有高斯的梯度突然变大 ⇒ 触发致密化 ⇒
@@ -252,7 +252,7 @@ class TrainConfig:
     sh_rest_max: float = 0.0                # f_rest 逐系数幅度上限（0=关）
     opacity_crisp_reg: float = 0.02          # 不透明度清晰度正则（推实；实测 SSIM −0.0003）
     opacity_crisp_warmup: float = 0.7        # 前 N% 迭代不施加清晰度正则（0~1）
-    opacity_floor: float = 0.10              # 不透明度下限（实测几乎免费：op<0.1 85%→4%）
+    opacity_floor: float = 0.020              # 不透明度下限（实测几乎免费：op<0.1 85%→4%）
     # 深度集中度正则（2DGS 成对失真的 L2 对应量，可微）
     lambda_depth_var: float = 1.0            # 权重（0=关）；实测 1.0 方差 -60% 且画质无损
     # 细节梯度损失（质感）
@@ -260,7 +260,7 @@ class TrainConfig:
     grad_warmup: float = 0.2                # 前 N% 迭代不施加
     depth_var_warmup: float = 0.3            # 前 N% 迭代不施加
     depth_var_mode: str = "var"              # var / std / rvar
-    opacity_floor_reg: float = 0.5           # 下限正则权重：惩罚 relu(floor-op)
+    opacity_floor_reg: float = 0.2           # 下限正则权重：惩罚 relu(floor-op)
     opacity_floor_warmup: float = 0.5        # 前 N% 迭代不施加
     # 训练结束时的最小不透明度清理（Faster-GS: MIN_OPACITY_AFTER_TRAINING = 1/255）。
     # 不透明度低于该值的高斯在收尾时直接删掉；0 表示不清理。
@@ -290,6 +290,13 @@ class TrainConfig:
     lambda_lpips: float = 0.0
     # 每 N 步计算一次（VGG 前向开销与显存都不小）
     lpips_every: int = 1                    # 社区做法：每步都算（见 03/G152）
+    # LPIPS 算法选择（2026-11-01，GUI 可选）：
+    #   "vgg16"         —— 论文线性权重（默认，与历史评测可比）
+    #   "vgg16_uniform" —— 层等权（消融/诊断）
+    #   "off"           —— 不计算（等价 λ=0，评测也跳过）
+    lpips_backend: str = "vgg16"
+    # LPIPS 输入尺寸（224 = 论文口径；320/448 更严格但更慢）
+    lpips_size: int = 224
     # ---- 多指标评估（用户方案第 6 项）----
     # 在 metrics.json 里同时记录 PSNR / SSIM / LPIPS，并额外保存 best_ssim / best_lpips
     # 的检查点。理由：PSNR 高但 SSIM/LPIPS 差的模型视觉上往往是模糊的，
@@ -1213,11 +1220,10 @@ def train(cfg: TrainConfig, ctx) -> dict:
                 grow_grad2d=cfg.densify_grad_threshold,
                 grow_scale3d=cfg.grow_scale3d,
                 prune_scale3d=cfg.prune_scale3d,
-                # ⚠️ **必须显式传 cap_max**（2026-10-25 实测）：不传时 gsplat 用自己的默认上限，
-                # 而我们的 `train.cap_max`（默认 60 万）根本没生效 ——
-                # 质量预设实测在 step 10000 就涨到 **251 万高斯**、显存 7.5GB、ETA 124 分钟，
-                # 是一次典型的"参数没接上导致致密化失控"。
-                cap_max=int(cfg.cap_max),
+                # ⚠️ 2026-11-01 更正：gsplat 1.5.3 的 `DefaultStrategy` **没有 cap_max 参数**
+                # （源码里 grep 命中 0 次），传了会 TypeError 并被 except 吞掉 ⇒ **静默退回 builtin**，
+                # 于是 `densify_strategy=official` 与 `absgrad=True` 从来没真正生效过。
+                # 上限改由训练循环强制（见下方 `_enforce_cap`）。
                 refine_start_iter=cfg.densify_from,
                 refine_stop_iter=cfg.densify_until,
                 reset_every=(cfg.opacity_reset_interval or 3000),
@@ -1726,13 +1732,19 @@ def train(cfg: TrainConfig, ctx) -> dict:
         # 也就是说：**当时那把尺子看不见优化目标**，结论是假阴性。
         # 因此现在保留开关（默认 0），并附上噪声底：同配置 PSNR 散布约 0.09 dB，
         # 小于它的差异不能作为结论。
+        _lpips_backend = str(getattr(cfg, "lpips_backend", "vgg16") or "vgg16").strip().lower()
+        if _lpips_backend in ("off", "none", "false", "0"):
+            _lpips_disabled = True
         if float(getattr(cfg, "lambda_lpips", 0.0) or 0.0) > 0 and not _lpips_disabled:
             if _lpips_fn is None:
                 try:
                     from .perceptual import get_lpips
                     _lpips_fn = get_lpips(str(device),
-                                          input_size=int(getattr(cfg, "lpips_size", 224) or 224))
+                                          input_size=int(getattr(cfg, "lpips_size", 224) or 224),
+                                          backend=_lpips_backend)
                     ctx.info(f"感知损失已启用：λ_lpips={float(cfg.lambda_lpips)} "
+                             f"backend={_lpips_backend} "
+                             f"输入={int(getattr(cfg, 'lpips_size', 224) or 224)} "
                              f"每 {int(cfg.lpips_every)} 步计算一次")
                 except Exception as exc:  # noqa: BLE001
                     _lpips_disabled = True
@@ -1970,6 +1982,23 @@ def train(cfg: TrainConfig, ctx) -> dict:
             else:
                 gs_strategy.step_post_backward(params, optimizers, gs_state, step,
                                                meta or {}, packed=False)
+
+            # ---- 上限强制（official 策略自身没有 cap_max，见构造处注释）----
+            # 按不透明度保留前 cap_max 个：不透明度最低的那批对成像贡献最小，
+            # 且与 MCMC 的"预算"语义一致。MCMC 内部已有 cap，这里只兜底。
+            _cap = int(getattr(cfg, "cap_max", 0) or 0)
+            _n_now = int(params["means"].shape[0])
+            if _cap > 0 and _n_now > _cap:
+                with torch.no_grad():
+                    _op = torch.sigmoid(params["opacities"].data.reshape(-1))
+                    _keep_idx = torch.topk(_op, _cap, largest=True).indices
+                    _keep = torch.zeros_like(_op, dtype=torch.bool)
+                    _keep[_keep_idx] = True
+                    _apply_keep(params, optimizers, _keep)
+                    refresh_params()
+                    n_over = _n_now - _cap
+                if step % 500 == 0:
+                    ctx.info(f"step {step} 上限强制：{_n_now} -> {_cap}（剪掉 {n_over} 个最低不透明度）")
             n_after = int(params["means"].shape[0])
             if n_after != n_before:
                 refresh_params()
@@ -2533,7 +2562,9 @@ def evaluate(rasterization, means, quats, scales, opacities, shs, imgs, masks, k
     if want_lpips:
         try:
             from .perceptual import get_lpips
-            lp = get_lpips(str(device))
+            lp = get_lpips(str(device),
+                           input_size=int(getattr(cfg, "lpips_size", 224) or 224),
+                           backend=str(getattr(cfg, "lpips_backend", "vgg16") or "vgg16"))
         except Exception as exc:  # noqa: BLE001
             print(f"[evaluate] LPIPS 不可用，已跳过（{type(exc).__name__}: {exc}）")
             lp = None

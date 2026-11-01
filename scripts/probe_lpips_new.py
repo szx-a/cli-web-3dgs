@@ -36,6 +36,9 @@ def main() -> int:
     ap.add_argument("--views", type=int, default=8)
     ap.add_argument("--ply", default="", help="评估指定 PLY（默认取任务最新检查点）")
     ap.add_argument("--tag", default="", help="输出里的标签")
+    ap.add_argument("--backend", default="vgg16",
+                    help="LPIPS 算法：vgg16 / vgg16_uniform（默认 vgg16，与历史可比）")
+    ap.add_argument("--size", type=int, default=224, help="LPIPS 输入尺寸")
     ap.add_argument("--data-dir", default="",
                     help="共享数据目录（对比实验的多个作业共用一份 data）")
     args = ap.parse_args()
@@ -49,7 +52,8 @@ def main() -> int:
     from gsflow.trainers.perceptual import get_lpips
 
     apply_runtime_env()
-    fn = get_lpips("cuda", input_size=224)
+    fn = get_lpips("cuda", input_size=int(args.size), backend=str(args.backend))
+    print(f"  LPIPS backend={args.backend}  input={args.size}")
 
     print("=== LPIPS 重评估（论文对齐实现，224 输入）===")
     for job_name in [j.strip() for j in args.jobs.split(",") if j.strip()]:

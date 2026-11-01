@@ -65,7 +65,8 @@ class LPIPS:
     """
 
     def __init__(self, device: str = "cuda", input_size: int = 224,
-                 weights: tuple[float, ...] | None = None):
+                 weights: tuple[float, ...] | None = None,
+                 backend: str = "vgg16"):
         import torch
         import torchvision.models as M
 
@@ -82,7 +83,19 @@ class LPIPS:
         self.features = net.features[: _LPIPS_LAYERS[-1] + 1].to(self.device).eval()
         for p in self.features.parameters():
             p.requires_grad_(False)
-        w = tuple(weights) if weights else _OFFICIAL_LINEAR
+        # ---- 层权重按 backend 选择 ----
+        _be = str(backend or "vgg16").strip().lower()
+        self.backend = _be
+        if weights:
+            w = tuple(weights)
+        elif _be in ("vgg16_uniform", "uniform", "equal"):
+            # 等权：不依赖论文那组学习权重，每层同样重要
+            w = tuple(1.0 for _ in _LPIPS_LAYERS)
+        elif _be in ("vgg16", "default", "official", ""):
+            w = tuple(_OFFICIAL_LINEAR)
+        else:
+            raise ValueError(
+                f"未知 LPIPS backend={backend!r}，可用：{', '.join(c[0] for c in BACKENDS)}")
         if len(w) != len(_LPIPS_LAYERS):
             raise ValueError(f"LPIPS 权重个数应为 {len(_LPIPS_LAYERS)}，实际 {len(w)}")
         # 记录权重向量（浮点）与"逐通道权重张量"，供注意力式加权
@@ -129,9 +142,45 @@ class LPIPS:
         return total / denom
 
 
-def get_lpips(device: str = "cuda", input_size: int = 224) -> LPIPS:
-    """带缓存的构造（同一次训练里只建一次）。"""
-    key = f"lpips:{device}:{input_size}"
+def get_lpips(device: str = "cuda", input_size: int = 224,
+              backend: str = "vgg16") -> LPIPS:
+    """带缓存的构造（同一次训练里只建一次）。
+
+    backend：`vgg16`（论文线性权重）/ `vgg16_uniform`（等权）。
+    缓存 key 包含 backend，避免不同实现共享实例。
+    """
+    key = f"lpips:{device}:{input_size}:{backend}"
     if key not in _CACHE:
-        _CACHE[key] = LPIPS(device, input_size=input_size)
+        _CACHE[key] = LPIPS(device, input_size=input_size, backend=backend)
     return _CACHE[key]  # type: ignore[return-value]
+
+
+# GUI 下拉框用的清单：(key, 中文标签, 是否可用)
+BACKENDS: tuple[tuple[str, str, str], ...] = (
+    ("vgg16", "内置 VGG16（论文线性权重）", "均衡"),
+    ("vgg16_uniform", "内置 VGG16（层等权，消融）", "层等权"),
+    ("off", "关闭（不计算 LPIPS）", "可关"),
+)
+
+
+def available_backends() -> list[dict[str, object]]:
+    """返回当前环境真正**可用**的 backend（供 GUI 展示，不做假承诺）。
+
+    依赖：`vgg16*` 需要 torchvision + 本地 VGG16 权重；缺任一则标记为不可用。
+    """
+    try:
+        import torchvision  # noqa: F401
+
+        has_tv = True
+    except Exception:
+        has_tv = False
+    has_w = bool(vgg_weights_present())
+    out: list[dict[str, object]] = []
+    for key, label, hint in BACKENDS:
+        ok = True if key == "off" else (has_tv and has_w)
+        reason = ""
+        if not ok:
+            reason = "缺 torchvision" if not has_tv else "缺 VGG16 权重"
+        out.append({"key": key, "label": label, "hint": hint,
+                    "available": ok, "reason": reason})
+    return out

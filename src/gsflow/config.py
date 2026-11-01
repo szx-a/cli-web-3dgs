@@ -149,7 +149,7 @@ DEFAULTS: dict[str, Any] = {
         # 4000 -> 28.62 dB（74k 高斯）；2500 -> 28.71 dB（57k 高斯）。
         # 官方默认 15000 面向几百~上千视图的大场景，此时后期加密不是过拟合；
         # 视图少时它纯粹在过拟合，所以默认下调。大场景请显式调回 15000。
-        "densify_until": 4000,
+        "densify_until": 14000,
         "densify_interval": 100,
         # 0 = 关闭"分位自适应阈值"，用固定绝对阈值（与 trainer 默认一致）。
         # 实测分位自适应会导致无界增长，已回退。
@@ -197,16 +197,12 @@ DEFAULTS: dict[str, Any] = {
         # **与 grad3d 的 2e-4 不同量纲，不要混用。**
         "densify_grad2d_threshold": 2e-4,
         "densify_grad_max": 5e-3,
-        # 绝对梯度致密化（AbsGS：https://ty424.github.io/AbsGS.github.io/）。
-        # 官方 `DefaultStrategy(absgrad=...)` 支持：开启后栅格化会额外产出
-        # `means2d.absgrad`，致密判据用**绝对值和**而不是"正负相消后的梯度"。
-        # 优点是能恢复更细的结构（Faster-GS README 也专门列出这一项），
-        # 代价是 backward 多一份开销。默认关闭，需实测对照后再决定。
-        "absgrad": False,
         # 密度控制实现：
-        #   builtin  —— 本项目的自定义实现（已验证、默认）。`absgrad` 在此路径**不生效**。
-        #   official —— 直接复用 gsplat `DefaultStrategy`（含 AbsGS 的 absgrad 支持）。
-        # 注意：`absgrad` 只有配合 official 才有意义；走 builtin 时它会被忽略。
+        #   builtin  —— 本项目的自定义实现（已验证）。`absgrad` 在此路径**不生效**。
+        #   official —— 直接复用 gsplat `DefaultStrategy`（**AbsGS 的 absgrad 只有走这里才生效**）。
+        #   mcmc     —— 3DGS-MCMC（NeurIPS'24）：SGLD 噪声 + 不透明度加权"重定位"替代克隆/分裂。
+        # ⚠ 2026-11-01 修正：本字典里 `absgrad` 原来写了**两次**（第 186 行 False，本段又 False），
+        #   后写覆盖前写 ⇒ 即使 DEFAULTS 改成 True 也不会生效。现在只保留第 186 行一处。
         "densify_strategy": "builtin",
         # MCMC 策略的 SGLD 噪声幅度（官方默认 5e5）。
         "mcmc_noise_lr": 500000.0,
@@ -229,7 +225,7 @@ DEFAULTS: dict[str, Any] = {
         # 训练一直每 3000 步压一次不透明度，末次重置后的状态被存成最终检查点，
         # 实测 PLY 的不透明度中位数被压到 0.012（正常应 ~0.5），渲染出一张**近乎全白**的图。
         # 教训见 docs/03 G39：默认值只能有**一处**权威来源。
-        "opacity_reset_interval": 0,
+        "opacity_reset_interval": 3000,
         # ---- 不透明度重置的**替代方案**（用户方案第 5 项）----
         # 官方周期重置是不连续跳变（硬钳 logit 到 logit(0.01)）⇒ 梯度同时变大
         # ⇒ 触发致密化失控（实测 279,534 高斯 vs 不重置 78,526），且污染末次检查点。
@@ -340,8 +336,8 @@ DEFAULTS: dict[str, Any] = {
         # 与 op*(1-op) 的区别：后者可以靠“推到 0”满足，前者只能靠“推高”满足。
         # 默认开启（2026-10-26 实测）：op<0.1 从 85.0% → **4.0%**，
         # 而掩码 PSNR 18.840→18.849、SSIM 0.9654→0.9657（几乎免费）。
-        "opacity_floor": 0.10,
-        "opacity_floor_reg": 0.5,
+        "opacity_floor": 0.02,
+        "opacity_floor_reg": 0.2,
         "opacity_floor_warmup": 0.5,
         # 实测（img5 15k）：λ=1.0 时深度方差 -60%、p90 -81%，
         # 而 PSNR/SSIM/LPIPS 与无该项几乎相同（见 README 3.9）。
@@ -394,7 +390,9 @@ DEFAULTS: dict[str, Any] = {
         # 40 分钟才跑到 5000 步。40倍以上慢于普通集。
         # 每 N 步计算一次 LPIPS（VGG 前向开销不小）
         "lpips_every": 1,   # 社区做法：**每步**都算（稀疏施加会让梯度不一致，见 03/G152）
-        "lpips_size": 224,   # 感知损失的输入尺寸（速度适配；训练与评估一致）
+        "lpips_size": 224,
+        # LPIPS 算法选择（GUI 可选）：vgg16 / vgg16_uniform / off。
+        "lpips_backend": "vgg16",   # 感知损失的输入尺寸（速度适配；训练与评估一致）
         # ---- 多指标评估（用户方案第 6 项）----
         # metrics.json 同时记录 PSNR / SSIM / LPIPS，并保存"最佳检查点"的完整指标。
         "eval_metrics": True,

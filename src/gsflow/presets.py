@@ -78,8 +78,8 @@ PRESETS: dict[str, dict[str, Any]] = {
         "train.opacity_crisp_reg": 0.05,
         "train.opacity_crisp_warmup": 0.4,
         # 关键：单边下限（对称正则在 op→0 时梯度趋零，实测完全无效）
-        "train.opacity_floor": 0.10,
-        "train.opacity_floor_reg": 0.5,
+        "train.opacity_floor": 0.02,   # 2026-11-01: 0.10 会把 92% 的高斯钉在下限
+        "train.opacity_floor_reg": 0.2,
         "train.opacity_floor_warmup": 0.3,
     },
 
@@ -98,7 +98,9 @@ PRESETS: dict[str, dict[str, Any]] = {
         "train.densify_until": 14000,
         "train.densify_interval": 100,
         "train.cap_max": 900000,
-        "train.densify_strategy": "builtin",
+        # 2026-11-01：改走官方 DefaultStrategy —— **absgrad 只有 official/mcmc 路径才生效**，
+        # 走 builtin 会被忽略（此前 "absgrad=True 却无效果" 的根因）。
+        "train.densify_strategy": "official",
         "train.absgrad": True,
         "train.lambda_grad": 1.0,
         "train.lambda_lpips": 0.05,

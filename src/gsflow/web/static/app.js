@@ -151,6 +151,15 @@ function collectParams() {
   // 实测校准过的两个训练参数（见 docs/03 G13/G17）
   put('train.densify_until', $('p-train-densify').value);
   put('train.mask_loss_until', $('p-train-maskloss').value);
+  // LPIPS 算法选择（2026-11-01）：backend / 输入尺寸 / 权重。
+  // `off` 时训练端等价于 λ=0（并跳过评测的 LPIPS 计算），不必再手动改 λ。
+  put('train.lpips_backend', $('p-lpips-backend') ? $('p-lpips-backend').value : 'vgg16');
+  put('train.lpips_size', $('p-lpips-size') ? $('p-lpips-size').value : 224);
+  put('train.lambda_lpips', $('p-train-lpips') ? $('p-train-lpips').value : 0);
+  // 密度控制算法（2026-11-01）：builtin / official（DefaultStrategy）/ mcmc（3DGS-MCMC）。
+  // ⚠ `absgrad` 只在 official / mcmc 路径生效；builtin 会忽略它（config 注释已写明）。
+  put('train.densify_strategy', $('p-densify-strategy') ? $('p-densify-strategy').value : 'builtin');
+  put('train.mcmc_noise_lr', $('p-mcmc-noise') ? $('p-mcmc-noise').value : 500000);
   // 网格导出
   put('export.formats', $('p-export-formats').value.trim());
   put('export.mesh_method', $('p-mesh-method').value);
@@ -519,6 +528,8 @@ $('btn-reset-config').onclick = async () => { await api('/api/config/reset', { m
   'p-frames-fps', 'p-frames-long', 'p-colmap-matcher', 'p-train-backend', 'p-train-preset',
   'p-train-iters',
   'p-train-res', 'p-train-cap', 'p-train-densify', 'p-train-maskloss',
+  'p-lpips-backend', 'p-lpips-size', 'p-train-lpips',
+  'p-densify-strategy', 'p-mcmc-noise',
   'p-train-opacityclean', 'p-train-opacityparam',
   'p-export-formats', 'p-mesh-method', 'p-mesh-depth', 'p-mesh-tris', 'p-mesh-smooth',
   'p-mesh-width', 'p-mesh-views', 'p-mesh-densq', 'p-mesh-texture', 'p-mesh-texsize',

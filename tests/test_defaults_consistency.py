@@ -45,19 +45,23 @@ def test_train_defaults_match_dataclass() -> None:
 
 
 def test_critical_training_defaults() -> None:
-    """把几个**必须保持关闭/开启**的关键默认值单独钉住。
+    """把几个**必须保持开启/关闭**的关键默认值单独钉住。
 
     这些值都有实测依据，改动会直接毁掉训练结果：
-      * opacity_reset_interval = 0  —— 开启会让末次检查点被重置状态污染（实测渲染近乎全白）
+      * opacity_reset_interval = 3000 —— **2026-11-01 起默认开启**（官方机制）。
+        之所以以前默认 0：重置曾把"最终检查点"污染成重置后状态（渲染近乎全白）。
+        现在 trainer 里已有两道防线：①重置整体在"保存+评估"之后；
+        ②`step != cfg.iterations` —— 最后一步跳过重置。见 test_reset_densify_coupling。
       * densify_quantile = 0        —— 分位自适应阈值会导致无界增长
       * prune_scale3d = 0.1         —— 防发散的关键约束，缺失会让尺度爆炸
       * mask_loss_until = 1.0       —— 全程约束在掩码内，模型轮廓更干净
     """
     tr = DEFAULTS["train"]
-    assert tr["opacity_reset_interval"] == 0, "不透明度重置必须默认关闭"
+    assert tr["opacity_reset_interval"] == 3000, \
+        "不透明度重置应默认开启（官方机制；最终检查点安全性由保存顺序 + 末步跳过保证）"
     assert tr["densify_quantile"] == 0, "分位自适应阈值必须默认关闭"
     assert tr["prune_scale3d"] == 0.1
-    assert tr["densify_until"] == 4000
+    assert tr["densify_until"] == 14000, "致密化窗口应接近官方量级（15000）"
     assert tr["mask_loss_until"] == 1.0
     # 网格：用户要求的三种产物默认就要产出
     ex = DEFAULTS["export"]

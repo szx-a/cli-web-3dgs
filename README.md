@@ -771,7 +771,7 @@ $$E_{\text{stretch}}=\sum_t A_t(| J_t|_F^2+| J_t^{-1}|_F^2),$$
 | `train.iterations` | 30000 | 迭代数 |
 | `train.resolution` | 1600 | 训练长边上限 |
 | `train.cap_max` | 600000 | 高斯数上限 |
-| `train.densify_until` | 4000 | 致密化截止步数 |
+| `train.densify_until` | 14000 | 致密化截止步数（2026-11 起对齐官方量级）|
 | `train.max_scale_ratio` | 0.05 | 每步尺度上限（防针状高斯） |
 | `train.bg_alpha_reg` | 0.1 | 背景 alpha 正则权重 |
 | `train.max_aspect` | 50.0 | 最大长宽比（防扁平高斯） |
